@@ -31,6 +31,14 @@ instance_group [
   }
 ]
 
+# model.py now batches every request bundled into one execute() call into
+# a single generate() call -- this is what lets that actually happen under
+# concurrent load instead of Triton dispatching one request at a time.
+dynamic_batching {
+  preferred_batch_size: [ 4, 8 ]
+  max_queue_delay_microseconds: 50000
+}
+
 parameters: {
   key: "model_dir"
   value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base" }

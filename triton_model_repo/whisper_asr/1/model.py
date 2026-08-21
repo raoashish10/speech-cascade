@@ -38,7 +38,17 @@ class TritonPythonModel:
         ).to("cuda")
 
     def execute(self, requests):
-        responses = []
+        # Batch every request in this execute() call into a single generate()
+        # call instead of looping one at a time. Whisper's feature extractor
+        # always pads/truncates each input to its fixed 30s window regardless
+        # of actual audio length, so a list of differently-sized raw audio
+        # arrays batches cleanly with no ragged-shape handling needed here --
+        # the processor does it. This is what dynamic_batching in
+        # config.pbtxt needs to actually pay off: without it, Triton could
+        # bundle N requests into one execute() call and this loop would still
+        # run N sequential generate() calls, gaining nothing (see
+        # nemotron_llm, which already batched this way).
+        audios = []
         for request in requests:
             audio_tensor = pb_utils.get_input_tensor_by_name(request, "AUDIO_SAMPLES")
             audio = audio_tensor.as_numpy().flatten().astype(np.float32)
@@ -51,13 +61,16 @@ class TritonPythonModel:
                 audio = librosa.resample(
                     audio, orig_sr=input_sample_rate, target_sr=WHISPER_SAMPLE_RATE
                 )
+            audios.append(audio)
 
-            inputs = self.processor(audio, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt")
-            inputs["input_features"] = inputs["input_features"].to("cuda")
+        inputs = self.processor(audios, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt")
+        inputs["input_features"] = inputs["input_features"].to("cuda")
 
-            generated_ids = self.model.generate(inputs["input_features"])
-            transcript = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        generated_ids = self.model.generate(inputs["input_features"])
+        transcripts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
 
+        responses = []
+        for transcript in transcripts:
             out_tensor = pb_utils.Tensor(
                 "TRANSCRIPT", np.array([transcript.encode("utf-8")], dtype=np.object_)
             )
