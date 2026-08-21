@@ -66,6 +66,40 @@ on the way in, silently wrong data — e.g. a whole audio array collapsed to
 its first sample — if you strip a batch dim on the way out that was never
 there).
 
+## Process architecture (what's actually running)
+
+`ps aux` / `nvidia-smi` show more processes than "one per model" — worth
+knowing which is which before reading GPU memory numbers. A representative
+snapshot with all four models loaded, one instance each:
+
+| Process | Typical VRAM | What it is |
+|---|---|---|
+| `./bin/tritonserver` | ~290MiB | The main Triton server. Holds its own core CUDA memory pools (`pinned_memory_manager` / `cuda_memory_manager`, sized by `--pinned-memory-pool-byte-size` etc. at startup) — no model weights. |
+| `triton_python_backend_stub` (one per model *instance*, not per model) | varies — see below | The actual Python process running a given model's `model.py`. `instance_group.count: N` means N of these per model, each a fully separate OS process (own Python interpreter, own GIL). |
+
+Where the stub's own VRAM number lands depends on the model:
+
+- **`whisper_asr` and `kokoro_tts`**: the stub process *is* where the ONNX
+  Runtime CUDA session lives — weights and the CUDA memory arena both sit
+  directly in that process (~2-2.5GB each once warmed up, more after a burst
+  of concurrent load, since onnxruntime's memory arena grows but doesn't
+  shrink back down between requests).
+- **`nemotron_llm`**: architecturally different. TensorRT-LLM's executor
+  spawns a *separate* MPI worker subprocess to actually run the engine (the
+  `MpiPoolSession` mechanism — see the "Environment quirks" section above,
+  fix #1). That worker shows up in `ps aux` as a plain
+  `/venv/main/bin/python3` process, **not** `triton_python_backend_stub`,
+  and holds essentially all of the LLM's real footprint (~7.5GB: FP8 weights
+  + KV cache pool + framework overhead). The `nemotron_llm` stub itself
+  only holds ~290MiB — it's just relaying requests to the MPI worker over
+  shared memory, not running inference itself.
+
+This split matters for capacity planning: bumping `nemotron_llm`'s
+`instance_group.count` doesn't add a cheap extra Python object the way it
+does for `voice_pipeline` — each additional instance spawns its own MPI
+worker, i.e. its own full ~7.5GB copy of the engine + KV cache. See below
+for what happened when this was actually tried.
+
 ## VRAM budget (measured)
 
 | Stage | VRAM |
@@ -233,12 +267,17 @@ way Triton is on `10100`. Query it directly:
 curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=nv_gpu_utilization'
 ```
 
-`scripts/load_test.py` fires concurrent requests at `voice_pipeline`,
-records client-side latency percentiles, and diffs Triton's own metrics
-before/after to report per-model exec counts and average compute/queue time:
+`scripts/load_test.py` fires concurrent requests via `tritonclient`'s native
+gRPC binary protocol (see "Two further optimizations" below for why not
+JSON-over-HTTP), records client-side latency percentiles, and diffs Triton's
+own metrics before/after to report per-model exec counts and average
+compute/queue time. With no `--model`, it runs `whisper_asr`, `nemotron_llm`,
+`kokoro_tts`, and `voice_pipeline` in turn (each isolated, same concurrency)
+for a clean per-stage p50 breakdown:
 
 ```bash
 python3 scripts/load_test.py --concurrency 4 --total-requests 20
+python3 scripts/load_test.py --concurrency 4 --total-requests 20 --model kokoro_tts  # just one
 ```
 
 **Two real bugs this surfaced**, both now fixed:
@@ -273,20 +312,89 @@ under concurrency (contention on their single GPU instance each), while
 handles concurrent requests internally rather than needing Triton-level
 instance queuing.
 
+**`nemotron_llm.instance_group.count: 2` was tried and reverted** — unlike
+`voice_pipeline`, the LLM's weights aren't cheap to duplicate (see "Process
+architecture" above: each instance spawns its own MPI worker holding a full
+~7.5GB copy). With the GPU already under load-test pressure (~3GB free at
+the time), the second instance's engine deserialization hit a CUDA OOM
+*during load* — and Triton fails the **whole model** when any instance
+fails, so `nemotron_llm` went fully `UNAVAILABLE`, not just running at
+reduced capacity. Reverted immediately to restore service. Worth retrying
+on a colder GPU with more headroom, but the earlier ASR/TTS finding
+generalizes here too: more instances cost real VRAM for real GPU-bound
+models, no free lunch.
+
+**Two further optimizations landed after load testing exposed where the
+time was actually going**, both about actually using capabilities that were
+either unconfigured or silently unused:
+
+1. **Switched the load-testing client (and by implication, any real client)
+   from hand-rolled JSON-over-HTTP to `tritonclient`'s native gRPC binary
+   protocol.** JSON-encoding tens of thousands of floats as text numbers,
+   both directions, was genuinely expensive — confirmed by `kokoro_tts`,
+   which had no queueing problem, only serialization: throughput went
+   4.57 → **11.96 req/s** (2.6x), p50 0.648s → **0.299s**, purely from the
+   protocol change, no server-side change at all. **Not a universal win,
+   though** — `whisper_asr`'s p50 barely moved (2.28s → 2.26s), because its
+   gap was dominated by *queue time* (1553ms, single instance, no batching),
+   not serialization. The lesson: measure the actual gap (client latency vs.
+   Triton's own `avg_compute`) before assuming which fix applies.
+2. **Enabled `dynamic_batching` on `nemotron_llm`.** Triton was dispatching
+   exactly one request per `execute()` call (no batching configured
+   anywhere), so `self.llm.generate(prompts, ...)` — despite already being
+   written to accept a full list — never received more than one prompt.
+   `dynamic_batching { preferred_batch_size: [4, 8]  max_queue_delay_microseconds: 50000 }`
+   fixed that: at concurrency=4, Triton now bundles ~4 requests per
+   `execute()` call (confirmed: 20 requests → 5 execs, not 20), and
+   TensorRT-LLM's in-flight batching scheduler — which was always
+   architecturally present, just never fed more than one sequence at a time
+   — finally does real work. Result: p50 **6.54s → 1.70s** (3.85x), throughput
+   **0.61 → 2.22 req/s** (3.6x), queue time dropped to ~0.
+
+**The full `voice_pipeline` chain barely benefited from the LLM fix**
+(p50 5.61s → 5.66s, essentially unchanged), which is itself an informative
+result: `dynamic_batching`'s 50ms window only bundles requests that arrive
+close together, and hitting `nemotron_llm` directly sends all N test
+requests simultaneously — easy to batch. Inside the real chain, each
+`voice_pipeline` instance only calls the LLM *after* its own ASR call
+finishes, and those finish at staggered times (each queued behind
+`whisper_asr`'s single instance), so LLM calls rarely arrive bunched enough
+to batch. Net effect: **`whisper_asr`'s queueing is now the dominant
+bottleneck in the full chain**, not the LLM — a distinct, not-yet-addressed
+problem (see "Not yet done").
+
 ## Not yet done
 
 - **`torch-cudagraph`/optimized compile tiers** were only explored for the
   abandoned AutoDeploy path, not revisited for the current classic-engine
   LLM (which is already fast — sub-second generation under load testing too,
   see above — so this wasn't pursued further).
-- **`whisper_asr` and `kokoro_tts` are still `instance_group.count: 1`.**
-  Load testing showed they're where the real queueing now lives once
-  `voice_pipeline` itself stopped being the bottleneck. Bumping their
-  instance counts is the natural next optimization — untested how far that
-  scales before hitting the ~5.9GB VRAM headroom or GPU compute contention
-  (unlike `voice_pipeline`, these hold real model weights, so extra
-  instances aren't free — each `kokoro_tts` instance would load its own
-  ONNX Runtime session).
+- **`whisper_asr` is the current dominant bottleneck in the full pipeline**
+  (see above) — single instance, no `dynamic_batching`, and even if
+  batching were enabled, `whisper_asr/1/model.py`'s `execute()` loops over
+  bundled requests one at a time rather than batching them into a single
+  ONNX Runtime call the way `nemotron_llm` already does. Fixing this
+  properly needs code changes, not just a config flag. Bumping its
+  `instance_group.count` was already tried for both `whisper_asr` and
+  `kokoro_tts` together and *didn't help* (GPU-compute-bound, not
+  queue-bound — see the earlier count=2 experiment above) — so more
+  instances isn't the answer here either.
+- **`whisper_asr`/`kokoro_tts` still run on ONNX Runtime's CUDA execution
+  provider, not TensorRT.** The TensorRT EP silently fails to load
+  (`libnvinfer.so.10: cannot open shared object file`) and onnxruntime falls
+  back to CUDA EP every time — never actually fixed, just tolerated. Getting
+  the TensorRT EP working could give a real speedup (same idea as the LLM's
+  compiled-engine win, applied to ASR/TTS), untested.
+- **`whisper_asr`/`kokoro_tts` still default to FP32 ONNX weights.** Smaller
+  precision variants (INT8, `q8f16`, etc.) already exist in the same HF
+  repos we downloaded from and were never tried — FP16 specifically produced
+  NaN output on this GPU/onnxruntime combination (see above), but that
+  doesn't rule out INT8/quantized variants.
+- **TensorRT-LLM engine build flags left at near-defaults.** `reduce_fusion`,
+  `multiple_profiles`, and `use_fp8_context_fmha` were all logged as
+  disabled at `trtllm-build` time. The last one needs FP8 KV cache
+  quantization too (currently only weights are FP8) — worth doing together
+  in a rebuild.
 - **No Grafana** — Prometheus is up and scraping (see above), but there's no
   dashboard on top of it, just direct PromQL queries or the Prometheus UI's
   own graph tab.
