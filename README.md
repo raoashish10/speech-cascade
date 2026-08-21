@@ -359,9 +359,36 @@ requests simultaneously — easy to batch. Inside the real chain, each
 `voice_pipeline` instance only calls the LLM *after* its own ASR call
 finishes, and those finish at staggered times (each queued behind
 `whisper_asr`'s single instance), so LLM calls rarely arrive bunched enough
-to batch. Net effect: **`whisper_asr`'s queueing is now the dominant
-bottleneck in the full chain**, not the LLM — a distinct, not-yet-addressed
-problem (see "Not yet done").
+to batch. Net effect (at the time): `whisper_asr`'s queueing was the
+dominant bottleneck in the full chain, not the LLM.
+
+**`whisper_asr` got the same treatment** — its `execute()` looped one
+request at a time even when Triton bundled several into one call, so
+`dynamic_batching` alone wouldn't have helped (unlike `nemotron_llm`, whose
+`generate(prompts, ...)` already accepted a full list). Rewrote it to
+collect every request's audio into one batched `processor(...)` +
+`generate()` call — Whisper's feature extractor already pads every input to
+its fixed 30s window regardless of actual length, so batching
+differently-sized audio arrays needed no extra padding logic, just passing
+a list instead of one array. Added the same `dynamic_batching` config as
+the LLM. Isolated result: p50 **2.26s → 0.75s** (3x), throughput
+**1.71 → 3.48 req/s** (2x), queue time **1553ms → 5.8ms**. Confirmed via
+exec count: 20 requests → 5 execs.
+
+**The full chain still barely moved** (p50 ~5.5s, unchanged) — checking
+`whisper_asr`'s own exec count *during* a chained `voice_pipeline` run
+showed only 20→17 execs (vs. 20→5 when hit directly), confirming the same
+staggering problem that limited the LLM fix's chain impact: only the first
+wave of concurrent pipeline requests arrives synchronized enough to batch;
+every wave after that drifts apart because each pipeline run takes a
+slightly different total time (dominated by the LLM's variable output
+length). Both fixes are real, validated, substantial wins when a stage is
+hit with genuine concurrent bursts (confirmed 3x/2x for ASR, 3.85x/3.6x for
+the LLM) — but that's a ceiling on what config-level batching alone can do
+for *this specific* chained, staggered-arrival workload. Going further
+would mean restructuring the pipeline itself (e.g. a genuinely
+streaming/pipelined architecture instead of strict per-request sequential
+ASR→LLM→TTS), not another batching tweak.
 
 ## Not yet done
 
@@ -369,16 +396,14 @@ problem (see "Not yet done").
   abandoned AutoDeploy path, not revisited for the current classic-engine
   LLM (which is already fast — sub-second generation under load testing too,
   see above — so this wasn't pursued further).
-- **`whisper_asr` is the current dominant bottleneck in the full pipeline**
-  (see above) — single instance, no `dynamic_batching`, and even if
-  batching were enabled, `whisper_asr/1/model.py`'s `execute()` loops over
-  bundled requests one at a time rather than batching them into a single
-  ONNX Runtime call the way `nemotron_llm` already does. Fixing this
-  properly needs code changes, not just a config flag. Bumping its
-  `instance_group.count` was already tried for both `whisper_asr` and
-  `kokoro_tts` together and *didn't help* (GPU-compute-bound, not
-  queue-bound — see the earlier count=2 experiment above) — so more
-  instances isn't the answer here either.
+- **`voice_pipeline` staggered arrivals limit config-level batching.**
+  Both `nemotron_llm` and `whisper_asr` now batch genuinely well when hit
+  directly (3.6x/3.85x, 2x/3x — see above), but the full chain barely
+  benefits because each pipeline run takes a different total time, so
+  concurrent requests drift out of sync with each other after the first
+  wave. Fixing this for real means restructuring the pipeline (e.g.
+  streaming/overlapping stages) rather than another `dynamic_batching`
+  tweak — a genuinely bigger change, not attempted.
 - **`whisper_asr`/`kokoro_tts` still run on ONNX Runtime's CUDA execution
   provider, not TensorRT.** The TensorRT EP silently fails to load
   (`libnvinfer.so.10: cannot open shared object file`) and onnxruntime falls
