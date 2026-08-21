@@ -25,6 +25,18 @@ instance_group [
   }
 ]
 
+# Without this, Triton hands execute() exactly one request at a time, so
+# self.llm.generate(prompts, ...) below never receives more than a
+# single-item list -- the engine's in-flight batching scheduler never
+# actually gets multiple concurrent sequences to batch, even though the
+# code is already written to pass a full list through. This is what turns
+# it on: wait up to 50ms to accumulate concurrent requests into one
+# execute() call, matching the engine's --max_batch_size 8 build config.
+dynamic_batching {
+  preferred_batch_size: [ 4, 8 ]
+  max_queue_delay_microseconds: 50000
+}
+
 parameters: {
   key: "engine_dir"
   value: { string_value: "/workspace/speech-cascade-inference/models/llama_nemotron_engine" }
