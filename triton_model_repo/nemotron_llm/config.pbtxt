@@ -1,0 +1,35 @@
+name: "nemotron_llm"
+backend: "python"
+max_batch_size: 8
+
+input [
+  {
+    name: "PROMPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "GENERATED_TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+parameters: {
+  key: "engine_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/llama_nemotron_engine" }
+}
+parameters: {
+  key: "tokenizer_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/Llama-3.1-Nemotron-Nano-4B-v1.1" }
+}

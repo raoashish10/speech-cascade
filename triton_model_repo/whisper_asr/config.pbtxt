@@ -1,0 +1,37 @@
+name: "whisper_asr"
+backend: "python"
+max_batch_size: 8
+
+input [
+  {
+    name: "AUDIO_SAMPLES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "TRANSCRIPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]
+
+parameters: {
+  key: "model_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base" }
+}

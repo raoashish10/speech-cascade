@@ -1,0 +1,57 @@
+name: "voice_pipeline"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {
+    name: "AUDIO_SAMPLES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "VOICE"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "TRANSCRIPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "GENERATED_TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "AUDIO_SAMPLES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 4
+    kind: KIND_CPU
+  }
+]
+
+model_transaction_policy {
+  decoupled: false
+}

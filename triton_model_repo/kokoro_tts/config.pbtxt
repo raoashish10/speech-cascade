@@ -1,0 +1,50 @@
+name: "kokoro_tts"
+backend: "python"
+max_batch_size: 8
+
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "VOICE"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "AUDIO_SAMPLES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]
+
+parameters: {
+  key: "model_path"
+  value: { string_value: "/workspace/speech-cascade-inference/models/kokoro-82m/onnx/model.onnx" }
+}
+parameters: {
+  key: "voices_path"
+  value: { string_value: "/workspace/speech-cascade-inference/models/kokoro-82m/voices-v1.0.bin" }
+}
+parameters: {
+  key: "default_voice"
+  value: { string_value: "af_heart" }
+}

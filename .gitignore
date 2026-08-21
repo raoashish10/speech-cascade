@@ -1,0 +1,19 @@
+# Model weights, checkpoints, and the extracted Triton server binary are
+# large binary artifacts, not source -- they live in S3
+# (s3://ashish-s3-coding-bucket/speech-cascade-inference/), not git.
+models/
+deprecated/
+triton_server/extracted/
+triton_server/compat_libs/
+
+# Prometheus's own time-series database -- runtime state, not source.
+prometheus_data/
+
+# Debug/test artifacts from development -- large (full audio sample arrays
+# as JSON) or purely transient, not meant to be tracked.
+scripts/*.wav
+scripts/*.json
+scripts/*.log
+
+__pycache__/
+*.pyc
