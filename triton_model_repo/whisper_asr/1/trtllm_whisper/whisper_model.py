@@ -205,7 +205,8 @@ class WhisperTRTLLM(object):
                  assets_dir=None,
                  batch_size=64,
                  use_py_session=False,
-                 num_beams=1):
+                 num_beams=1,
+                 kv_cache_free_gpu_memory_fraction=0.9):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -242,7 +243,7 @@ class WhisperTRTLLM(object):
                                  max_output_len=96,
                                  max_beam_width=num_beams,
                                  debug_mode=debug_mode,
-                                 kv_cache_free_gpu_memory_fraction=0.9,
+                                 kv_cache_free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
                                  cross_kv_cache_fraction=0.5)
             self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
         self.use_py_session = use_py_session

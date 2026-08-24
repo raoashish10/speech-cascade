@@ -43,6 +43,13 @@ class TritonPythonModel:
             batch_size=max_batch_size,
             use_py_session=False,
             num_beams=1,
+            # The example's own default (0.9) claims ~90% of whatever VRAM is
+            # free at load time for KV cache paging -- reasonable if Whisper
+            # owns the whole GPU, but this one is shared with nemotron_llm
+            # and kokoro_tts. A max_seq_len of 114 needs only a handful of KV
+            # cache blocks per sequence; measured OOM-ing kokoro_tts under
+            # concurrent voice_pipeline load at 0.9, fine at 0.05.
+            kv_cache_free_gpu_memory_fraction=0.05,
         )
 
     def execute(self, requests):
