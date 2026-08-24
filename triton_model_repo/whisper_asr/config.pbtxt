@@ -40,6 +40,10 @@ dynamic_batching {
 }
 
 parameters: {
-  key: "model_dir"
-  value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base" }
+  key: "engine_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base-trtllm" }
+}
+parameters: {
+  key: "assets_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base-trtllm/assets" }
 }
