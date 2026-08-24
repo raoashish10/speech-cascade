@@ -1,5 +1,6 @@
-"""Triton Python backend for Llama-3.1-Nemotron-Nano-4B-v1.1 (FP8), served via a
-TensorRT-LLM AOT-compiled engine (classic TensorRT backend, not AutoDeploy)."""
+"""Triton Python backend for Llama-3.1-Nemotron-Nano-4B-v1.1 (NVFP4), served by
+loading the quantized HF checkpoint directly via TensorRT-LLM's LLM API (JIT
+graph build, classic TensorRT backend, not AutoDeploy)."""
 
 import json
 import sys
@@ -41,6 +42,13 @@ class TritonPythonModel:
             # Capped so the LLM doesn't greedily claim ~all free VRAM for KV cache pool —
             # this GPU is shared with the ASR and TTS stages.
             kv_cache_config={"free_gpu_memory_fraction": 0.2},
+            # The checkpoint's config.json declares a 128K max_position_embeddings; with
+            # no explicit cap here that gets inherited as the KV-cache sizing basis
+            # (scaled further by an implicit default batch size of 8) and OOMs on this
+            # 16GB GPU. 4096/8 matches the old AOT-compiled engine's hard-coded limits —
+            # far more than a voice pipeline turn needs.
+            max_seq_len=4096,
+            max_batch_size=8,
         )
 
     def execute(self, requests):
@@ -52,7 +60,15 @@ class TritonPythonModel:
                 prompt = prompt.decode("utf-8")
             prompts.append(prompt)
 
-        outputs = self.llm.generate(prompts, self.SamplingParams(max_tokens=256, temperature=0))
+        outputs = self.llm.generate(
+            prompts,
+            # temperature=0 (exact greedy) with no repetition penalty degenerates into
+            # repeated phrases specifically under this engine's classic TensorRT backend
+            # (not reproduced on vLLM or TensorRT-LLM's PyTorch backend on the same
+            # checkpoint/settings). This keeps decoding deterministic while discouraging
+            # the loop.
+            self.SamplingParams(max_tokens=256, temperature=0, repetition_penalty=1.15),
+        )
 
         responses = []
         for output in outputs:

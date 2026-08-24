@@ -39,9 +39,9 @@ dynamic_batching {
 
 parameters: {
   key: "engine_dir"
-  value: { string_value: "/workspace/speech-cascade-inference/models/llama_nemotron_engine" }
+  value: { string_value: "/workspace/speech-cascade-inference/models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4" }
 }
 parameters: {
   key: "tokenizer_dir"
-  value: { string_value: "/workspace/speech-cascade-inference/models/Llama-3.1-Nemotron-Nano-4B-v1.1" }
+  value: { string_value: "/workspace/speech-cascade-inference/models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4" }
 }
