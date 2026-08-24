@@ -1,6 +1,10 @@
 name: "nemotron_llm"
 backend: "python"
-max_batch_size: 8
+max_batch_size: 0
+
+model_transaction_policy {
+  decoupled: true
+}
 
 input [
   {
@@ -25,17 +29,16 @@ instance_group [
   }
 ]
 
-# Without this, Triton hands execute() exactly one request at a time, so
-# self.llm.generate(prompts, ...) below never receives more than a
-# single-item list -- the engine's in-flight batching scheduler never
-# actually gets multiple concurrent sequences to batch, even though the
-# code is already written to pass a full list through. This is what turns
-# it on: wait up to 50ms to accumulate concurrent requests into one
-# execute() call, matching the engine's --max_batch_size 8 build config.
-dynamic_batching {
-  preferred_batch_size: [ 4, 8 ]
-  max_queue_delay_microseconds: 50000
-}
+# dynamic_batching intentionally removed: it only ever helped because
+# execute() used to hand Triton's whole bundled request list to one blocking
+# self.llm.generate(prompts, ...) call. generate_async() only accepts a
+# single prompt -- there's no batched streaming call left to feed. Real
+# batching now happens because TRT-LLM's own continuous-batching executor
+# sees multiple concurrent generate_async() calls in flight (one per request
+# thread), the same mechanism already observed empirically to give
+# nemotron_llm ~0 queue time. With streaming, dynamic_batching's only
+# remaining effect would be adding up to 50ms of pure time-to-first-token
+# latency for no batching benefit -- a bad tradeoff for real-time voice.
 
 parameters: {
   key: "engine_dir"
