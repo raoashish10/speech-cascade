@@ -39,6 +39,31 @@ def _run(model_name, inputs, output_names):
     }
 
 
+def _run_llm_decoupled(prompt_tensor):
+    """nemotron_llm is decoupled/streaming now (max_batch_size: 0, no batch
+    dim -- unlike _run()'s callees, don't _batched() it) so a plain exec()
+    doesn't work against it; exec(decoupled=True) returns an iterator of
+    responses instead of one. Drain and concatenate GENERATED_TEXT chunks
+    into the single string voice_pipeline's own non-streaming contract
+    still promises callers."""
+    request = pb_utils.InferenceRequest(
+        model_name="nemotron_llm",
+        requested_output_names=["GENERATED_TEXT"],
+        inputs=[prompt_tensor],
+    )
+    chunks = []
+    for response in request.exec(decoupled=True):
+        if response.has_error():
+            raise pb_utils.TritonModelException(
+                f"nemotron_llm failed: {response.error().message()}"
+            )
+        out = pb_utils.get_output_tensor_by_name(response, "GENERATED_TEXT")
+        if out is None:
+            continue
+        chunks.append(_decode_str(out.as_numpy()))
+    return "".join(chunks)
+
+
 def _decode_str(arr):
     value = arr.flatten()[0] if hasattr(arr, "flatten") else arr
     return value.decode("utf-8") if isinstance(value, bytes) else value
@@ -51,46 +76,67 @@ class TritonPythonModel:
     def execute(self, requests):
         responses = []
         for request in requests:
-            audio_tensor = pb_utils.get_input_tensor_by_name(request, "AUDIO_SAMPLES")
-
-            asr_inputs = [audio_tensor]
-            sr_tensor = pb_utils.get_input_tensor_by_name(request, "SAMPLE_RATE")
-            if sr_tensor is not None:
-                asr_inputs.append(sr_tensor)
-
-            asr_out = _run("whisper_asr", asr_inputs, ["TRANSCRIPT"])
-            transcript = _decode_str(asr_out["TRANSCRIPT"])
-
-            prompt_tensor = pb_utils.Tensor(
-                "PROMPT", np.array([transcript.encode("utf-8")], dtype=np.object_)
-            )
-            llm_out = _run("nemotron_llm", [prompt_tensor], ["GENERATED_TEXT"])
-            generated_text = _decode_str(llm_out["GENERATED_TEXT"])
-
-            text_tensor = pb_utils.Tensor(
-                "TEXT", np.array([generated_text.encode("utf-8")], dtype=np.object_)
-            )
-            tts_inputs = [text_tensor]
-            voice_tensor = pb_utils.get_input_tensor_by_name(request, "VOICE")
-            if voice_tensor is not None:
-                tts_inputs.append(voice_tensor)
-
-            tts_out = _run("kokoro_tts", tts_inputs, ["AUDIO_SAMPLES", "SAMPLE_RATE"])
-
-            responses.append(
-                pb_utils.InferenceResponse(
-                    output_tensors=[
-                        pb_utils.Tensor(
-                            "TRANSCRIPT",
-                            np.array([transcript.encode("utf-8")], dtype=np.object_),
-                        ),
-                        pb_utils.Tensor(
-                            "GENERATED_TEXT",
-                            np.array([generated_text.encode("utf-8")], dtype=np.object_),
-                        ),
-                        pb_utils.Tensor("AUDIO_SAMPLES", tts_out["AUDIO_SAMPLES"]),
-                        pb_utils.Tensor("SAMPLE_RATE", tts_out["SAMPLE_RATE"]),
-                    ]
+            # Any of the three downstream calls below can legitimately fail
+            # under load now that whisper_asr/kokoro_tts/nemotron_llm all
+            # have admission control (dynamic_batching default_queue_policy
+            # REJECT / the in-flight-request counter) -- a downstream
+            # rejection is an expected, everyday response under overload, not
+            # a bug. _run()/_run_llm_decoupled() raise
+            # pb_utils.TritonModelException on any such error; left
+            # unhandled, an exception raised out of execute() gets wrapped by
+            # Triton's python backend into a generic INTERNAL error carrying
+            # a full Python stack trace -- technically not a hang, but not
+            # the "clean, fast rejection" callers should see either.
+            # Catching it here and returning a plain InferenceResponse(error=...)
+            # for just this request gives callers the original short message
+            # (e.g. "nemotron_llm is overloaded: ...") with no traceback
+            # noise, while any other request in the same execute() batch is
+            # unaffected.
+            try:
+                responses.append(self._run_one(request))
+            except pb_utils.TritonModelException as e:
+                responses.append(
+                    pb_utils.InferenceResponse(error=pb_utils.TritonError(str(e)))
                 )
-            )
         return responses
+
+    def _run_one(self, request):
+        audio_tensor = pb_utils.get_input_tensor_by_name(request, "AUDIO_SAMPLES")
+
+        asr_inputs = [audio_tensor]
+        sr_tensor = pb_utils.get_input_tensor_by_name(request, "SAMPLE_RATE")
+        if sr_tensor is not None:
+            asr_inputs.append(sr_tensor)
+
+        asr_out = _run("whisper_asr", asr_inputs, ["TRANSCRIPT"])
+        transcript = _decode_str(asr_out["TRANSCRIPT"])
+
+        prompt_tensor = pb_utils.Tensor(
+            "PROMPT", np.array([transcript.encode("utf-8")], dtype=np.object_)
+        )
+        generated_text = _run_llm_decoupled(prompt_tensor)
+
+        text_tensor = pb_utils.Tensor(
+            "TEXT", np.array([generated_text.encode("utf-8")], dtype=np.object_)
+        )
+        tts_inputs = [text_tensor]
+        voice_tensor = pb_utils.get_input_tensor_by_name(request, "VOICE")
+        if voice_tensor is not None:
+            tts_inputs.append(voice_tensor)
+
+        tts_out = _run("kokoro_tts", tts_inputs, ["AUDIO_SAMPLES", "SAMPLE_RATE"])
+
+        return pb_utils.InferenceResponse(
+            output_tensors=[
+                pb_utils.Tensor(
+                    "TRANSCRIPT",
+                    np.array([transcript.encode("utf-8")], dtype=np.object_),
+                ),
+                pb_utils.Tensor(
+                    "GENERATED_TEXT",
+                    np.array([generated_text.encode("utf-8")], dtype=np.object_),
+                ),
+                pb_utils.Tensor("AUDIO_SAMPLES", tts_out["AUDIO_SAMPLES"]),
+                pb_utils.Tensor("SAMPLE_RATE", tts_out["SAMPLE_RATE"]),
+            ]
+        )

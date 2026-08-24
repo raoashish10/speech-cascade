@@ -34,9 +34,23 @@ instance_group [
 # model.py now batches every request bundled into one execute() call into
 # a single generate() call -- this is what lets that actually happen under
 # concurrent load instead of Triton dispatching one request at a time.
+#
+# default_queue_policy adds admission control / backpressure: previously a
+# request that arrived while whisper_asr's single instance was busy just
+# queued indefinitely. Measured single-instance p50 after the batching fix
+# is ~0.75s under load (README); a request still waiting 2.5s (~3x that) is
+# a genuine sign of overload rather than normal queuing jitter, so reject it
+# fast instead of making the caller wait. max_queue_size 32 matches the
+# highest concurrency this was load-tested at (README's load-test sweeps go
+# up to 32).
 dynamic_batching {
   preferred_batch_size: [ 4, 8 ]
   max_queue_delay_microseconds: 50000
+  default_queue_policy {
+    timeout_action: REJECT
+    default_timeout_microseconds: 2500000
+    max_queue_size: 32
+  }
 }
 
 parameters: {

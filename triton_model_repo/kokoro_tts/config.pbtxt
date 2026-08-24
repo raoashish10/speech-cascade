@@ -1,6 +1,18 @@
 name: "kokoro_tts"
 backend: "python"
-max_batch_size: 8
+# max_batch_size deliberately kept at 1 (not raised alongside dynamic_batching
+# below): kokoro_onnx has no real batched call, and model.py's execute() loop
+# would just run bundled items serially on whichever single instance picked
+# up the batch -- defeating the point of instance_group.count: 3 by pinning
+# multiple requests to one instance while the other two idle. Capping
+# max_batch_size at 1 makes the dynamic batcher a pure per-request
+# queue/dispatch + admission-control mechanism (see default_queue_policy
+# below) without ever grouping requests onto a single instance. Measured:
+# with max_batch_size 8 (no preferred_batch_size set), concurrency 8 showed
+# avg_batch_size 1.71 and p90 latency got *worse* than the ungrouped
+# single-instance baseline (0.625s -> 1.195s) from this exact serialization
+# effect; reverted to max_batch_size 1 after that measurement.
+max_batch_size: 1
 
 input [
   {
@@ -29,12 +41,46 @@ output [
   }
 ]
 
+# kokoro_onnx's public API (Kokoro.create()) synthesizes one text string per
+# call -- there's no native multi-text batched call, so this is NOT
+# request-batching. It's multi-instance parallelism: 3 independent copies of
+# the ONNX Runtime CUDA session, each able to run kokoro.create() at the same
+# time, instead of every request serializing through a single instance.
+# Measured before: concurrency 32 against count:1 -> avg_compute ~70-94ms per
+# call but avg_queue up to ~1628ms (all queueing, no compute bottleneck).
+# kokoro-82m is small (~325MB on disk), and a light warmup (a handful of
+# requests) only costs ~250MB total across all 3 instances -- but under
+# SUSTAINED heavy concurrent load (repeated bursts at concurrency 32),
+# onnxruntime's per-instance CUDA memory arena keeps growing and does not
+# shrink back (same behavior the project README already documents for a
+# single instance), and was measured reaching ~2.4GB per instance / ~7.2GB
+# total after repeated load testing -- a real chunk of this GPU's ~16GB. A
+# production deployment should watch this (e.g. periodic restarts, or an
+# onnxruntime arena size cap) rather than assume the light-load number holds
+# under sustained traffic; unloading+reloading the model resets it back down.
 instance_group [
   {
-    count: 1
+    count: 3
     kind: KIND_GPU
   }
 ]
+
+# Admission control / backpressure: Triton's dynamic batcher (needed to get
+# default_queue_policy at all) still queues+dispatches one request per
+# kokoro.create() call as before -- no preferred_batch_size is set, so this
+# doesn't change dispatch behavior, only adds a queue depth cap and a fast
+# rejection instead of an unbounded wait. Grounded in the measured numbers
+# above: normal (uncontended) compute is ~70-90ms; with 3 instances, a
+# request still waiting 750ms (~9x normal compute) is a real sign of
+# overload, not normal jitter. max_queue_size 32 matches the highest
+# concurrency this was load-tested at.
+dynamic_batching {
+  default_queue_policy {
+    timeout_action: REJECT
+    default_timeout_microseconds: 750000
+    max_queue_size: 32
+  }
+}
 
 parameters: {
   key: "model_path"
