@@ -213,11 +213,59 @@ curl -X POST http://localhost:18000/v2/repository/index   # list loaded models +
 ```
 
 **Ports:** Triton binds to `127.0.0.1` only (18000 HTTP / 18001 GRPC / 18002
-metrics) — not directly reachable from outside the container. The HTTP port
-is exposed externally through Caddy's authenticated edge, registered in
-`/etc/portal.yaml` as "Speech Cascade Triton" on external port `10100`
-(`$VAST_TCP_PORT_10100`), requiring the instance's auth token (see the
-top-level agent guide, §5).
+metrics) and stays that way — it is **not** exposed externally, deliberately.
+The streaming gateway (`streaming_gateway/`, see below) is the sanctioned
+external surface: it's what a real client actually talks to, and it already
+gives an external caller everything Triton would (transcript, LLM text, TTS
+audio) without also handing them raw access to run/reload arbitrary models,
+which is a materially bigger blast radius than a single voice endpoint.
+Exposing Triton's ports too would widen the attack surface for no added
+capability, so they stay internal-only, reachable only via `curl
+localhost:1800{0,1,2}` on the box itself or over an SSH tunnel (top-level
+agent guide, §7). See `streaming_gateway/README.md` for how the gateway
+itself is exposed, on external port `10100`.
+
+## External access
+
+The streaming gateway (`streaming_gateway/`) is reachable from outside the
+GPU box. It sits behind the instance's Caddy auth edge rather than on a bare
+open port — anyone with the URL but not the token gets rejected before the
+WebSocket upgrade even completes, whereas an unauthenticated open port would
+be reachable by literally anyone.
+
+**System-level wiring (not tracked in this repo, lives on the instance):**
+
+```yaml
+# /etc/portal.yaml — added under `applications:`
+Streaming Gateway:
+  hostname: localhost
+  external_port: 10100
+  internal_port: 18010
+  open_path: /ws/stream
+  name: Streaming Gateway
+```
+```bash
+supervisorctl restart caddy   # picks up the new portal.yaml entry
+```
+This is the only system-level change; the gateway process itself is
+unchanged (still `uvicorn ... --host 127.0.0.1 --port 18010`, run by the
+existing `speech-cascade-gateway` supervisor service). To reproduce on a
+fresh instance: add that YAML block to `/etc/portal.yaml` and restart caddy
+— see `streaming_gateway/README.md` for the exact `python3 -c` one-liner
+used to do this safely (load-modify-dump, so other portal.yaml entries are
+preserved).
+
+**Connecting from outside the box:**
+
+```bash
+python3 scripts/test_streaming_client.py --wav your_clip.wav \
+  --gateway-url ws://<PUBLIC_IPADDR>:<VAST_TCP_PORT_10100>/ws/stream \
+  --token "$OPEN_BUTTON_TOKEN"
+```
+
+Full details — auth methods, why Triton itself stays internal-only, the
+concurrent-session cap, and what deliberately wasn't added — are in
+`streaming_gateway/README.md`.
 
 ## Testing each stage
 
@@ -269,8 +317,10 @@ client-side timing.
 A standalone Prometheus server (`apt install prometheus`, not present on the
 base image) scrapes that endpoint every 2s, configured via
 `prometheus.yml`, running as another supervisor service
-(`speech-cascade-prometheus`), exposed externally on port `10200` the same
-way Triton is on `10100`. Query it directly:
+(`speech-cascade-prometheus`). *(Note: as of this PR that service and its
+external exposure aren't wired up on this instance yet — `10200` is still a
+free port; see the monitoring/Grafana workstream for the current state.)*
+Query it directly:
 
 ```bash
 curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=nv_gpu_utilization'

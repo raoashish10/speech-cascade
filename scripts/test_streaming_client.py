@@ -1,9 +1,20 @@
 """Streams a wav file's audio in real-time-simulated chunks to the streaming
 gateway over WebSocket, printing/saving LLM text and TTS audio as they arrive.
 
-Usage:
+Usage (local, gateway's internal port -- no auth needed):
     python3 test_streaming_client.py --wav test_tts_output.wav
-    python3 test_streaming_client.py --wav clip.wav --gateway-url ws://localhost:18010/ws/stream --voice af_heart
+
+Usage (from outside the box, through the Caddy-authed external port -- see
+streaming_gateway/README.md for the full external-access writeup):
+    python3 test_streaming_client.py --wav clip.wav \\
+        --gateway-url ws://<PUBLIC_IPADDR>:<VAST_TCP_PORT_10100>/ws/stream \\
+        --token "$OPEN_BUTTON_TOKEN" --voice af_heart
+
+The token is sent as a `?token=` query param by default -- that's the only
+method a browser's native WebSocket API can use (it can't set custom
+headers on the upgrade request), and it's one of the methods Caddy's edge
+accepts. Pass --auth-mode header to send `Authorization: Bearer <token>`
+instead (Caddy accepts that too; only useful for non-browser clients).
 """
 import argparse
 import asyncio
@@ -11,6 +22,7 @@ import base64
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 import numpy as np
 import soundfile as sf
@@ -82,10 +94,21 @@ async def receive_loop(ws, out_dir: Path):
 async def main(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    url = f"{args.gateway_url}?voice={args.voice}"
+
+    query = {"voice": args.voice}
+    extra_headers = {}
+    if args.token:
+        if args.auth_mode == "query":
+            query["token"] = args.token
+        else:
+            extra_headers["Authorization"] = f"Bearer {args.token}"
+    url = f"{args.gateway_url}?{urlencode(query)}"
+
     # Default 1MB WS frame limit is too small for base64-encoded float32 TTS
     # audio chunks (a several-second sentence alone can exceed it).
-    async with websockets.connect(url, max_size=20 * 1024 * 1024) as ws:
+    async with websockets.connect(
+        url, max_size=20 * 1024 * 1024, additional_headers=extra_headers or None,
+    ) as ws:
         await asyncio.gather(
             send_audio(ws, args.wav, realtime=not args.no_realtime),
             receive_loop(ws, out_dir),
@@ -100,4 +123,12 @@ if __name__ == "__main__":
     p.add_argument("--out-dir", default="./stream_test_output")
     p.add_argument("--no-realtime", action="store_true",
                     help="blast the whole file instantly instead of real-time-paced")
+    p.add_argument("--token", default=None,
+                    help="instance auth token ($OPEN_BUTTON_TOKEN / $WEB_PASSWORD), "
+                         "required when --gateway-url points at the Caddy-authed "
+                         "external port instead of localhost:18010")
+    p.add_argument("--auth-mode", choices=["query", "header"], default="query",
+                    help="how to send --token: as a ?token= query param (default, "
+                         "matches what a browser WebSocket client can do) or as an "
+                         "Authorization: Bearer header")
     asyncio.run(main(p.parse_args()))
