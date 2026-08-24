@@ -1,10 +1,15 @@
 """Triton Python backend for Llama-3.1-Nemotron-Nano-4B-v1.1 (NVFP4), served by
 loading the quantized HF checkpoint directly via TensorRT-LLM's LLM API (JIT
-graph build, classic TensorRT backend, not AutoDeploy)."""
+graph build, classic TensorRT backend, not AutoDeploy).
+
+Decoupled/streaming: each request gets its own generate_async(streaming=True)
+call on a bounded thread pool, forwarding each incremental text_diff to the
+client as it's produced instead of waiting for the full completion."""
 
 import json
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import numpy as np
@@ -23,6 +28,11 @@ except Exception as e:
     raise
 
 import triton_python_backend_utils as pb_utils
+
+# Matches the engine's --max_batch_size 8 build config -- bounds the stub
+# process's thread pool so a burst of concurrent streaming sessions can't
+# spawn unbounded threads.
+MAX_CONCURRENT_STREAMS = 8
 
 
 class TritonPythonModel:
@@ -50,35 +60,46 @@ class TritonPythonModel:
             max_seq_len=4096,
             max_batch_size=8,
         )
+        self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
 
     def execute(self, requests):
-        prompts = []
         for request in requests:
+            self._pool.submit(self._stream_one, request)
+        return None  # decoupled: no synchronous response list
+
+    def _stream_one(self, request):
+        sender = request.get_response_sender()
+        try:
             prompt_tensor = pb_utils.get_input_tensor_by_name(request, "PROMPT")
             prompt = prompt_tensor.as_numpy().flatten()[0]
             if isinstance(prompt, bytes):
                 prompt = prompt.decode("utf-8")
-            prompts.append(prompt)
 
-        outputs = self.llm.generate(
-            prompts,
-            # temperature=0 (exact greedy) with no repetition penalty degenerates into
-            # repeated phrases specifically under this engine's classic TensorRT backend
-            # (not reproduced on vLLM or TensorRT-LLM's PyTorch backend on the same
-            # checkpoint/settings). This keeps decoding deterministic while discouraging
-            # the loop.
-            self.SamplingParams(max_tokens=256, temperature=0, repetition_penalty=1.15),
-        )
-
-        responses = []
-        for output in outputs:
-            text = output.outputs[0].text
-            out_tensor = pb_utils.Tensor(
-                "GENERATED_TEXT", np.array([text.encode("utf-8")], dtype=np.object_)
+            sampling_params = self.SamplingParams(
+                max_tokens=256,
+                temperature=0,
+                # temperature=0 (exact greedy) with no repetition penalty degenerates into
+                # repeated phrases specifically under this engine's classic TensorRT backend
+                # (not reproduced on vLLM or TensorRT-LLM's PyTorch backend on the same
+                # checkpoint/settings). This keeps decoding deterministic while discouraging
+                # the loop.
+                repetition_penalty=1.15,
             )
-            responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
-
-        return responses
+            result = self.llm.generate_async(prompt, sampling_params, streaming=True)
+            for output in result:  # blocking sync iteration -- fine on a pool thread
+                diff = output.outputs[0].text_diff
+                if diff:
+                    out_tensor = pb_utils.Tensor(
+                        "GENERATED_TEXT", np.array([diff.encode("utf-8")], dtype=np.object_)
+                    )
+                    sender.send(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
+            sender.send(None, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+        except Exception as e:
+            sender.send(
+                pb_utils.InferenceResponse(error=pb_utils.TritonError(str(e))),
+                flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
+            )
 
     def finalize(self):
+        self._pool.shutdown(wait=False)
         self.llm = None
