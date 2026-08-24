@@ -130,8 +130,9 @@ Switched to `nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1` — a plain Llama
 architecture, also branded Nemotron, same ~4B size. That goes through the
 classic pipeline: HF checkpoint -> `nvidia-modelopt` FP8 calibration (32
 short calibration samples, see `scripts/quantize_fp8.py`) ->
-`export_tensorrt_llm_checkpoint` -> `trtllm-build` -> a real ahead-of-time
-compiled `.engine`. Generation latency dropped to under a second, with zero
+`export_tensorrt_llm_checkpoint` -> `trtllm-build` (see `scripts/build_engine.sh`
+for the exact flags) -> a real ahead-of-time compiled `.engine`. Generation
+latency dropped to under a second, with zero
 JIT unpredictability at serve time. This is genuinely the mature, intended
 TensorRT-LLM path — AutoDeploy exists specifically for architectures the
 classic path can't represent, and this model doesn't need it.
@@ -248,6 +249,14 @@ stage before wiring it into Triton (`test_asr.py`, `test_tts.py`,
 `quantize_fp8.py`, `measure_vram.py`, `measure_vram_classic.py`) — useful for
 isolating a problem outside Triton's stub-process environment if something
 breaks again.
+
+`scripts/build_engine.sh` runs the `trtllm-build` step against a checkpoint
+produced by `quantize_fp8.py`, with the flags this project's engine was
+actually built with (`--max_batch_size`/`--max_seq_len` overridable via env
+vars). The output `.engine` is tied to the exact GPU architecture and
+TensorRT-LLM version it was built with — copying it to different hardware
+isn't reliable, so replicating this repo elsewhere means rerunning this
+script there, not copying `models/llama_nemotron_engine/`.
 
 ## Metrics and load testing
 
