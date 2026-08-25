@@ -202,14 +202,28 @@ class TritonPythonModel:
                 # repeated phrases specifically under this engine's classic TensorRT backend
                 # (not reproduced on vLLM or TensorRT-LLM's PyTorch backend on the same
                 # checkpoint/settings). This keeps decoding deterministic while discouraging
-                # the loop.
+                # the loop. Re-verified in docs/nemotron-token-cap-investigation.md: dropping
+                # to 1.0 reintroduced the loop on 10/69 eval prompts while barely moving the
+                # 96-token cap-hit rate (67/69 -> 65/69, noise) -- not the cause of the cap
+                # problem, so left at 1.15.
                 repetition_penalty=1.15,
-                # The chat template's real end-of-turn token -- belt-and-suspenders
-                # alongside whatever EOS handling generate_async() does on its own,
-                # given this engine backend has already needed workarounds for
-                # decoding quirks the PyTorch/vLLM backends don't reproduce (see
-                # repetition_penalty above).
-                stop=["<|eot_id|>"],
+                # EXPERIMENT B (docs/nemotron-token-cap-investigation.md): the model
+                # reliably forms one short, complete first sentence (median ~16-21
+                # tokens across a 69-prompt eval, well inside the "1-2 short sentences"
+                # target) then drifts into unrelated step-by-step/meta-commentary
+                # rambling after a paragraph break, almost never producing a real EOS
+                # before the 96-token cap. "\n\n" reliably marks that transition in
+                # measured output (a single short spoken answer has no reason to contain
+                # a paragraph break at all). "</think>" additionally guards against a
+                # rarer artifact where the model hallucinates a stray, unopened </think>
+                # tag mid-response (a side effect of the forced-empty-think-block fix --
+                # see docs/nemotron-response-quality.md new artifact class section).
+                # "<|eot_id|>" is the chat template real end-of-turn token, kept as
+                # belt-and-suspenders alongside whatever EOS handling generate_async()
+                # does on its own, given this engine backend has already needed
+                # workarounds for decoding quirks the PyTorch/vLLM backends do not
+                # reproduce (see repetition_penalty above).
+                stop=["<|eot_id|>", "\n\n", "</think>"],
             )
             result = self.llm.generate_async(prompt, sampling_params, streaming=True)
             for output in result:  # blocking sync iteration -- fine on a pool thread
