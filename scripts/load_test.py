@@ -15,6 +15,18 @@ via stream_infer(), timing from request start to the final response chunk,
 so its latency numbers stay comparable to the other (unary) models' full-
 completion latency.
 
+Time-to-first-token (TTFT): measured only for nemotron_llm, the one model
+that actually streams. It's the time from request start to the first
+response chunk carrying a non-empty GENERATED_TEXT text_diff (the server
+sends one more, empty, chunk at the very end just to close the stream --
+that one is not counted as "first token"). whisper_asr, kokoro_tts, and
+voice_pipeline are unary: the whole response arrives as one atomic reply,
+so there's no meaningful sub-request granularity to time -- TTFT and total
+response time would be the same number by construction, which is not a
+real distinction. Rather than fabricate one, those three report only total
+response time; their TTFT csv columns are left blank and the console output
+says so explicitly instead of leaving it ambiguous.
+
 Usage:
     python3 load_test.py --concurrency 4 --total-requests 20
         # runs whisper_asr, nemotron_llm, kokoro_tts, voice_pipeline in turn,
@@ -28,6 +40,11 @@ Usage:
         --csv results.csv
         # appends one row of every metric below to results.csv, for building
         # a batch-size/concurrency sweep table across many separate runs.
+        # For nemotron_llm this also fills ttft_p50_s/ttft_p90_s/ttft_p99_s
+        # (time-to-first-token, seconds); those three columns are left blank
+        # for whisper_asr/kokoro_tts/voice_pipeline since those models are
+        # unary and have no sub-request first-token event to time separately
+        # from total response time (p50_s/p90_s/p99_s above).
 """
 
 import argparse
@@ -49,6 +66,7 @@ AUDIO_PATH = "/workspace/speech-cascade-inference/scripts/test_tts_output.wav"
 CSV_FIELDS = [
     "model", "concurrency", "total_requests", "successes", "failures",
     "throughput_req_s", "p50_s", "p90_s", "p99_s", "max_s",
+    "ttft_p50_s", "ttft_p90_s", "ttft_p99_s",
     "server_avg_compute_ms", "server_avg_queue_ms", "execs", "avg_batch_size",
     "gpu_mem_used_mb_before", "gpu_mem_used_mb_after", "first_failure",
 ]
@@ -135,19 +153,36 @@ def get_metric(metrics, name, label_substr=""):
     return None
 
 
-async def _stream_one_request(client, inputs, outputs, model_name):
+async def _stream_one_request(client, inputs, outputs, model_name, t0):
     """nemotron_llm is decoupled -- fire a single-request stream_infer call
-    and drain every chunk, since a plain infer() is rejected outright."""
+    and drain every chunk, since a plain infer() is rejected outright.
+
+    Also captures time-to-first-token: the model.py backend (see
+    triton_model_repo/nemotron_llm/1/model.py) sends one response per
+    non-empty generated text_diff, then a final response with no output
+    tensors at all just to close the stream (sender.send(None, flags=
+    COMPLETE_FINAL)). TTFT is measured to the first chunk that actually
+    carries GENERATED_TEXT data, not that closing chunk.
+
+    Returns ttft (seconds, float) or None if no data-bearing chunk was
+    ever seen before the stream ended.
+    """
     async def _gen():
         yield {"model_name": model_name, "inputs": inputs, "outputs": outputs}
 
     got_any = False
+    ttft = None
     async for result, error in client.stream_infer(_gen()):
         if error is not None:
             raise RuntimeError(str(error))
         got_any = True
+        if ttft is None:
+            chunk = result.as_numpy("GENERATED_TEXT")
+            if chunk is not None and chunk.size > 0:
+                ttft = time.time() - t0
     if not got_any:
         raise RuntimeError("decoupled stream produced no responses")
+    return ttft
 
 
 async def fire_request(client, model, results, sem):
@@ -156,14 +191,17 @@ async def fire_request(client, model, results, sem):
         t0 = time.time()
         try:
             if model == "nemotron_llm":
-                await asyncio.wait_for(_stream_one_request(client, inputs, outputs, model), timeout=60.0)
+                ttft = await asyncio.wait_for(
+                    _stream_one_request(client, inputs, outputs, model, t0), timeout=60.0
+                )
             else:
                 await client.infer(model_name=model, inputs=inputs, outputs=outputs, client_timeout=60.0)
+                ttft = None  # unary: no sub-request first-token event, see module docstring
             elapsed = time.time() - t0
-            results.append((elapsed, True, None))
+            results.append((elapsed, True, None, ttft))
         except Exception as e:
             elapsed = time.time() - t0
-            results.append((elapsed, False, str(e)))
+            results.append((elapsed, False, str(e), None))
 
 
 def pct(latencies, p):
@@ -197,6 +235,9 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
     latencies = sorted(r[0] for r in results)
     successes = [r for r in results if r[1]]
     failures = [r for r in results if not r[1]]
+    # TTFT only exists for nemotron_llm (streaming); r[3] is None for the
+    # three unary models and for any request that never got a data chunk.
+    ttfts = sorted(r[3] for r in successes if r[3] is not None)
 
     exec_before = get_metric(before, "nv_inference_exec_count", f'model="{model}"') or 0
     exec_after = get_metric(after, "nv_inference_exec_count", f'model="{model}"') or 0
@@ -214,6 +255,15 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
     if latencies:
         print(f"client latency  min={latencies[0]:.3f}s  p50={pct(latencies,0.50):.3f}s  "
               f"p90={pct(latencies,0.90):.3f}s  p99={pct(latencies,0.99):.3f}s  max={latencies[-1]:.3f}s")
+    if model == "nemotron_llm":
+        if ttfts:
+            print(f"TTFT (time-to-first-token, streaming)  p50={pct(ttfts,0.50):.3f}s  "
+                  f"p90={pct(ttfts,0.90):.3f}s  p99={pct(ttfts,0.99):.3f}s")
+        else:
+            print("TTFT: no data-bearing chunk observed on any request")
+    else:
+        print("TTFT: not reported separately -- unary model, whole response arrives in one "
+              "chunk (identical to total response time above by construction)")
     print(f"Triton avg_compute={avg_compute_ms:.1f}ms  avg_queue={avg_queue_ms:.1f}ms  "
           f"execs={int(d_exec)}  avg_batch_size={avg_batch_size:.2f}")
     if mem_before is not None and mem_after is not None:
@@ -230,6 +280,12 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
             "p90_s": round(pct(latencies, 0.90), 4) if latencies else "",
             "p99_s": round(pct(latencies, 0.99), 4) if latencies else "",
             "max_s": round(latencies[-1], 4) if latencies else "",
+            # Blank (not 0, not duplicated from p50_s/etc.) for the three unary
+            # models -- they have no sub-request first-token event to time
+            # separately from total response time. See module docstring.
+            "ttft_p50_s": round(pct(ttfts, 0.50), 4) if ttfts else "",
+            "ttft_p90_s": round(pct(ttfts, 0.90), 4) if ttfts else "",
+            "ttft_p99_s": round(pct(ttfts, 0.99), 4) if ttfts else "",
             "server_avg_compute_ms": round(avg_compute_ms, 2),
             "server_avg_queue_ms": round(avg_queue_ms, 2),
             "execs": int(d_exec),
