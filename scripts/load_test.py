@@ -147,10 +147,26 @@ def parse_metrics(text):
 
 
 def get_metric(metrics, name, label_substr=""):
+    # Sum every matching line rather than returning the first match. Triton
+    # exposes each GPU-instance model's counters as TWO lines in /metrics --
+    # one tagged with gpu_uuid=... (the real, incrementing value) and one
+    # without (stays 0 on this single-GPU box) -- and which one appears
+    # first varies by model: nemotron_llm/kokoro_tts have the gpu_uuid line
+    # first, but whisper_asr has it second. Returning "the first match" was
+    # silently reading the always-0 line for whisper_asr specifically,
+    # meaning every prior load_test.py run against whisper_asr (directly or
+    # via voice_pipeline's own per-model breakdown) reported avg_compute=0ms/
+    # avg_queue=0ms/execs=0 for it -- verified against raw `curl .../metrics`
+    # output while investigating voice_pipeline's queueing (see
+    # docs/voice-pipeline-queueing.md). Summing is correct under either
+    # ordering, since 0 + real == real, and stays correct even if a model
+    # genuinely spans multiple GPUs (the real per-GPU values just add up).
+    total, seen = 0.0, False
     for labels, value in metrics.get(name, []):
         if label_substr in labels:
-            return value
-    return None
+            total += value
+            seen = True
+    return total if seen else None
 
 
 async def _stream_one_request(client, inputs, outputs, model_name, t0):
