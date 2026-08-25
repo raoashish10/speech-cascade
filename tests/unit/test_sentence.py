@@ -143,3 +143,44 @@ def test_each_sentence_mark_is_a_boundary(mark):
     acc = SentenceAccumulator()
     out = acc.push(f"Sentence one{mark} Sentence two.")
     assert out[0] == f"Sentence one{mark}"
+
+
+@pytest.mark.parametrize(
+    "abbrev",
+    ["Dr.", "Mr.", "Mrs.", "Ms.", "Prof.", "Sr.", "Jr.", "St.", "vs.",
+     "e.g.", "i.e.", "etc.", "approx.", "Inc.", "Ltd.", "Co.", "No.",
+     "Fig.", "vol.", "pp."],
+)
+def test_abbreviation_does_not_split(abbrev):
+    acc = SentenceAccumulator()
+    out = acc.push(f"See {abbrev} Smith for details. That's everything. ")
+    assert out == [f"See {abbrev} Smith for details.", "That's everything."]
+
+
+def test_single_letter_initial_does_not_split():
+    acc = SentenceAccumulator()
+    out = acc.push("Ask J. Smith about it. Thanks. ")
+    assert out == ["Ask J. Smith about it.", "Thanks."]
+
+
+def test_abbreviation_at_end_of_utterance_resolves_via_flush():
+    """An abbreviation with nothing recognizable as a real sentence end
+    after it should still surface via flush() rather than being lost."""
+    acc = SentenceAccumulator()
+    assert acc.push("Please see Dr. Smith") == []
+    assert acc.flush() == "Please see Dr. Smith"
+
+
+def test_abbreviation_piecewise_arrival():
+    """The abbreviation check must still work when 'Dr.' and the following
+    word arrive in separate pushes, matching how LLM tokens actually
+    stream in."""
+    acc = SentenceAccumulator()
+    pieces = ["See Dr", ".", " Smith", " now", ". Done", "."]
+    out = []
+    for p in pieces:
+        out.extend(acc.push(p))
+    remainder = acc.flush()
+    if remainder:
+        out.append(remainder)
+    assert out == ["See Dr. Smith now.", "Done."]
