@@ -38,10 +38,16 @@ except Exception as e:
 
 import triton_python_backend_utils as pb_utils
 
-# Matches the engine's --max_batch_size 8 build config -- bounds the stub
+# Matches the engine's --max_batch_size 16 build config -- bounds the stub
 # process's thread pool so a burst of concurrent streaming sessions can't
 # spawn unbounded threads.
-MAX_CONCURRENT_STREAMS = 8
+# Raised from 8 -- measured (docs/nemotron-batch-size-scaling.md) to still
+# be within the "nearly free" flat-latency zone: p50 0.673s (concurrency 1)
+# -> 0.726s (concurrency 16), vs. max_batch_size=24/32 which already show
+# 38-46% p50 growth at their own ceiling concurrency (compute/bandwidth
+# crossover, not a VRAM limit -- free VRAM was ~1.6GiB and unchanged across
+# 8/16/24/32 with all four models loaded).
+MAX_CONCURRENT_STREAMS = 16
 
 # Admission ceiling for in-flight + queued requests, i.e. anything already
 # accepted into self._pool but not yet finished. 2x the worker count: enough
@@ -85,7 +91,7 @@ class TritonPythonModel:
             # 16GB GPU. 4096/8 matches the old AOT-compiled engine's hard-coded limits —
             # far more than a voice pipeline turn needs.
             max_seq_len=4096,
-            max_batch_size=8,
+            max_batch_size=16,  # raised from 8 -- see docs/nemotron-batch-size-scaling.md
         )
         self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
         self._admitted = 0
