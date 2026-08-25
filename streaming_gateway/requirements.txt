@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets>=13.0
+silero-vad>=6.0.0
+onnxruntime
+tritonclient[grpc]
+numpy
+soundfile

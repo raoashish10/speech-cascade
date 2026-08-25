@@ -39,6 +39,31 @@ def _run(model_name, inputs, output_names):
     }
 
 
+def _run_llm_decoupled(prompt_tensor):
+    """nemotron_llm is decoupled/streaming now (max_batch_size: 0, no batch
+    dim -- unlike _run()'s callees, don't _batched() it) so a plain exec()
+    doesn't work against it; exec(decoupled=True) returns an iterator of
+    responses instead of one. Drain and concatenate GENERATED_TEXT chunks
+    into the single string voice_pipeline's own non-streaming contract
+    still promises callers."""
+    request = pb_utils.InferenceRequest(
+        model_name="nemotron_llm",
+        requested_output_names=["GENERATED_TEXT"],
+        inputs=[prompt_tensor],
+    )
+    chunks = []
+    for response in request.exec(decoupled=True):
+        if response.has_error():
+            raise pb_utils.TritonModelException(
+                f"nemotron_llm failed: {response.error().message()}"
+            )
+        out = pb_utils.get_output_tensor_by_name(response, "GENERATED_TEXT")
+        if out is None:
+            continue
+        chunks.append(_decode_str(out.as_numpy()))
+    return "".join(chunks)
+
+
 def _decode_str(arr):
     value = arr.flatten()[0] if hasattr(arr, "flatten") else arr
     return value.decode("utf-8") if isinstance(value, bytes) else value
@@ -64,8 +89,7 @@ class TritonPythonModel:
             prompt_tensor = pb_utils.Tensor(
                 "PROMPT", np.array([transcript.encode("utf-8")], dtype=np.object_)
             )
-            llm_out = _run("nemotron_llm", [prompt_tensor], ["GENERATED_TEXT"])
-            generated_text = _decode_str(llm_out["GENERATED_TEXT"])
+            generated_text = _run_llm_decoupled(prompt_tensor)
 
             text_tensor = pb_utils.Tensor(
                 "TEXT", np.array([generated_text.encode("utf-8")], dtype=np.object_)
