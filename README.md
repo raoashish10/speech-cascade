@@ -317,14 +317,22 @@ client-side timing.
 A standalone Prometheus server (`apt install prometheus`, not present on the
 base image) scrapes that endpoint every 2s, configured via
 `prometheus.yml`, running as another supervisor service
-(`speech-cascade-prometheus`). *(Note: as of this PR that service and its
-external exposure aren't wired up on this instance yet — `10200` is still a
-free port; see the monitoring/Grafana workstream for the current state.)*
-Query it directly:
+(`speech-cascade-prometheus`). It stays `127.0.0.1`-only, like Triton itself
+— Grafana (below) is the externally-reachable surface for looking at this
+data, not Prometheus directly. Query it locally:
 
 ```bash
 curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=nv_gpu_utilization'
 ```
+
+A Grafana dashboard, Prometheus alerting rules, and a custom exporter for
+Triton's model READY/UNAVAILABLE state (not natively a Prometheus metric)
+sit on top of this — see [`docs/monitoring.md`](docs/monitoring.md) for
+URLs, what each alert means, and what to do when one fires. Grafana is
+exposed externally on port `10200` through the Caddy-authed edge (same
+pattern as the Streaming Gateway on `10100` — see
+[`streaming_gateway/README.md`](streaming_gateway/README.md)); Prometheus
+and the exporter stay internal-only.
 
 `scripts/load_test.py` fires concurrent requests via `tritonclient`'s native
 gRPC binary protocol (see "Two further optimizations" below for why not
