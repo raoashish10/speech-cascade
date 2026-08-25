@@ -449,6 +449,37 @@ would mean restructuring the pipeline itself (e.g. a genuinely
 streaming/pipelined architecture instead of strict per-request sequential
 ASR→LLM→TTS), not another batching tweak.
 
+## Tests and infrastructure as code
+
+`tests/` — automated pytest suite, two tiers:
+
+- `tests/unit/` — pure-logic tests for the streaming gateway's
+  `UtteranceVAD` and `SentenceAccumulator`, no live server or GPU needed.
+  Runs in GitHub Actions CI on every push/PR (`.github/workflows/tests.yml`).
+- `tests/integration/` — real gRPC calls against the live Triton server
+  (each of the 4 models individually, `voice_pipeline` end-to-end, and a
+  small fixed regression set). Needs a live GPU server, so it does **not**
+  run in CI — run it by hand on the instance:
+  `/venv/main/bin/python -m pytest tests/integration -v`.
+
+See `tests/README.md` for exactly which venv each tier needs and how to
+select by marker instead of directory.
+
+`deploy/` — infrastructure as code, so this deployment can be rebuilt from
+nothing instead of only existing as a terminal history on one GPU box:
+
+- `deploy/requirements-main.txt` / `deploy/requirements-gateway.txt` —
+  exact `pip freeze` of both venvs.
+- `deploy/supervisor/` — the supervisor wrapper scripts + conf.d files for
+  the streaming gateway and (new) the Triton server itself, which had been
+  running as a manually-launched process with no supervisor entry at all.
+- `deploy/REBUILD.md` — the executable runbook: fresh instance -> working
+  deployment, including where the source weights come from, how each
+  TensorRT engine was built, and which steps are fully scripted vs.
+  documented-but-manual.
+
+See `deploy/README.md` for the full breakdown.
+
 ## Not yet done
 
 - **`torch-cudagraph`/optimized compile tiers** were only explored for the
