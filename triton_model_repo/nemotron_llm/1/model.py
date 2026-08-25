@@ -157,6 +157,22 @@ class TritonPythonModel:
                 },
             ]
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            # "detailed thinking off" in the system turn is this checkpoint's documented
+            # toggle for suppressing its <think>...</think> reasoning phase, but it's
+            # unreliable in practice: an empirical eval of 69 realistic voice-assistant
+            # prompts (docs/nemotron-response-quality.md) measured 32/69 (46%) still
+            # opening a visible <think> block and leaking raw reasoning text as the
+            # "spoken" response, and 68/69 (99%) hitting the max_tokens cap without a
+            # natural stop -- both consistent with the model treating "thinking off" as
+            # a soft preference it sometimes overrides, not a hard constraint. Forcing an
+            # *already-closed* empty think block into the prompt right after the
+            # generation-prompt header removes the model's ability to open one at all --
+            # the standard technique for this family of toggleable-reasoning checkpoints
+            # (same convention as DeepSeek-R1-distill/Nemotron-Nano: an empty
+            # <think>\n\n</think>\n\n immediately answered). Re-measured on the same 69
+            # prompts after this change -- see docs/nemotron-response-quality.md for the
+            # full before/after numbers.
+            prompt += "<think>\n\n</think>\n\n"
 
             sampling_params = self.SamplingParams(
                 # Lowered from 256 after measuring: at 256, this checkpoint's rambling
