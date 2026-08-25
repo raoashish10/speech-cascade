@@ -1,0 +1,141 @@
+# Prometheus alerting rules for the speech-cascade Triton deployment.
+#
+# Grounded in this session's load-testing findings (see docs/monitoring.md
+# and reports/session-report.md for the full numbers):
+#
+#   - Server-side queue time is the earliest, cleanest saturation signal.
+#     voice_pipeline's queue time stayed near 0ms through concurrency 4,
+#     then jumped to 7.5s at concurrency 8 and 22.2s at concurrency 16 --
+#     well before any client-visible failures. Thresholds below (2s warning,
+#     5s critical) sit comfortably inside that "before it's on fire" window.
+#
+#   - nemotron_llm is decoupled/streaming: its execute() returns almost
+#     instantly after handing off to a background thread pool, so Triton's
+#     own queue/compute timers no longer reflect real generation time or
+#     real backend saturation for that model. Alerting on them would give
+#     false reassurance (the number looks healthy even when the thread pool
+#     is the bottleneck), so the queue/compute alerts below explicitly
+#     exclude nemotron_llm. Its request throughput/success-failure counts
+#     are still meaningful and alertable.
+#
+#   - GPU free memory is the redline signal. nvidia-smi's advertised
+#     memory.total (16303 MiB) over-reports the real ceiling: memory.used +
+#     memory.free only ever summed to ~15843 MiB in practice this session
+#     (a ~460MiB reserved gap). Computing "free" as (advertised total) minus
+#     (used) therefore *overstates* real headroom by ~460MiB -- dangerous
+#     for a redline alert. The rules below instead subtract used bytes from
+#     the empirically observed ceiling (15843 MiB = 16612908032 bytes), not
+#     Triton's/NVML's advertised total. The one real OOM-adjacent failure
+#     this session (during a model *reload*, not steady request load) drove
+#     free memory down to 26-424MB; the 2GiB/1GiB thresholds below give
+#     multiple GB of advance warning before that zone.
+
+groups:
+  - name: speech-cascade-saturation
+    rules:
+      - alert: TritonQueueTimeHigh
+        expr: >-
+          (
+            sum by (model) (rate(nv_inference_queue_duration_us{model!="nemotron_llm"}[1m]))
+            /
+            clamp_min(sum by (model) (rate(nv_inference_exec_count{model!="nemotron_llm"}[1m])), 1e-9)
+          ) / 1e6 > 2
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.model }} average queue time is {{ $value | printf \"%.2f\" }}s (>2s)"
+          description: >-
+            Requests to {{ $labels.model }} have averaged over 2s of Triton scheduling-queue
+            wait time over the last minute. Under this session's load test, voice_pipeline's
+            queue time was ~0ms up to concurrency 4 and only crossed this level at concurrency
+            8+ -- this is an early warning, not yet a user-visible failure.
+          action: >-
+            Open the Grafana dashboard's "Queue time per model" panel to see which stage(s)
+            are backing up. Check GPU utilization/memory for the same window. If this is
+            expected load, consider raising instance_group.count or enabling dynamic_batching
+            for the saturated model in triton_model_repo/<model>/config.pbtxt (coordinate with
+            whoever owns capacity/backpressure changes before touching a loaded model). If it's
+            unexpected, look for a stuck/slow downstream call or a concurrent GPU-heavy process.
+
+      - alert: TritonQueueTimeCritical
+        expr: >-
+          (
+            sum by (model) (rate(nv_inference_queue_duration_us{model!="nemotron_llm"}[1m]))
+            /
+            clamp_min(sum by (model) (rate(nv_inference_exec_count{model!="nemotron_llm"}[1m])), 1e-9)
+          ) / 1e6 > 5
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.model }} average queue time is {{ $value | printf \"%.2f\" }}s (>5s)"
+          description: >-
+            {{ $labels.model }} has averaged over 5s of queue wait time for at least 30s. In
+            this session's load test, 5s+ queue time reliably preceded client-visible request
+            failures/timeouts as concurrency kept climbing.
+          action: >-
+            Treat as active degradation. Shed load if you control the client (streaming
+            gateway / test harness), and check whether this correlates with the GPU free
+            memory or model-not-ready alerts also firing. Do not reload/unload any Triton
+            model to try to "fix" this without coordinating -- another agent may hold
+            exclusive ownership of model (re)loads.
+
+  - name: speech-cascade-gpu-memory
+    rules:
+      - alert: GPUFreeMemoryLow
+        # 16612908032 bytes = 15843 MiB, the empirically observed used+free
+        # ceiling this session (not NVML's advertised 16303 MiB total --
+        # see the header note above).
+        expr: (16612908032 - nv_gpu_memory_used_bytes) < 2 * 1024 * 1024 * 1024
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU free memory is low ({{ $value | humanize1024 }}B)"
+          description: >-
+            Estimated free GPU memory has been below 2GiB for 30s+. Steady-state with all four
+            models loaded normally leaves ~5.5GB free; this level suggests memory pressure
+            building (a growing KV cache, a leak, or another process/reload competing for VRAM).
+          action: >-
+            Check `nvidia-smi` for what's using memory. Do not initiate a model reload yourself
+            while another agent may be mid-reload -- a second concurrent reload attempt at this
+            free-memory level risks a real OOM. If you didn't cause it and it isn't recovering,
+            flag it rather than intervening on shared GPU state.
+
+      - alert: GPUFreeMemoryCritical
+        expr: (16612908032 - nv_gpu_memory_used_bytes) < 1 * 1024 * 1024 * 1024
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU free memory is critically low ({{ $value | humanize1024 }}B)"
+          description: >-
+            Estimated free GPU memory has been below 1GiB for 15s+. The one real OOM-adjacent
+            failure this session occurred with free memory down at 26-424MB during a model
+            reload -- this alert gives a multi-hundred-MB to ~1GB margin before that zone.
+          action: >-
+            Immediate attention. If a model load/reload is in progress (check recent Triton
+            logs), let it finish or fail rather than adding more GPU load. If nothing explains
+            the drop, this may be heading for an OOM that will crash a model instance.
+
+  - name: speech-cascade-availability
+    rules:
+      - alert: TritonModelNotReady
+        expr: triton_model_ready == 0
+        for: 20s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.model }} is not READY"
+          description: >-
+            Triton's repository index API has reported {{ $labels.model }} as not READY
+            (UNAVAILABLE/LOADING/UNLOADING/etc.) for 20s+. The 20s "for" window is meant to
+            absorb the few-second UNAVAILABLE blip of a normal, intentional reload -- a
+            sustained state past that is not expected during steady serving.
+          action: >-
+            `curl -X POST http://localhost:18000/v2/repository/index -d '{}'` to see the exact
+            state and check the Triton server log for the model's load error. If another agent
+            is actively reloading models for capacity/backpressure work, confirm with them
+            before assuming this is a real failure -- otherwise this means the model failed to
+            (re)load and needs investigation before it can serve traffic again.

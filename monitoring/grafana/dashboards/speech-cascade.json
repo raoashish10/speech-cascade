@@ -1,0 +1,247 @@
+{
+  "id": null,
+  "uid": "speech-cascade-triton",
+  "title": "Speech Cascade — Triton Monitoring",
+  "description": "ASR -> LLM -> TTS pipeline served through Triton on a single RTX 5070 Ti. Sourced from Triton's /metrics (nv_inference_*, nv_gpu_*) plus a small custom exporter for model READY state (triton_model_ready). See docs/monitoring.md.",
+  "tags": ["speech-cascade", "triton"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Read me first",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 5 },
+      "options": {
+        "mode": "markdown",
+        "content": "**nemotron_llm caveat:** it's decoupled/streaming -- `execute()` hands off to a background thread pool and returns almost instantly, so Triton's own per-exec queue/compute timers no longer reflect real generation time or real backend load for this model. The *Queue time* and *Compute time* panels below deliberately **exclude nemotron_llm** for that reason (a low number there would look healthy while actually being meaningless). Its request throughput is still valid and shown separately.\n\n**GPU free memory caveat:** nvidia-smi/NVML advertise `memory.total` as 16303MiB, but `memory.used + memory.free` only ever summed to ~15843MiB in practice on this box (a ~460MiB reserved gap). All free-memory panels/alerts here subtract `used` from the empirically observed **15843MiB ceiling**, not the advertised total -- computing free memory the naive way overstates real headroom by ~460MiB."
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Per-model exec throughput (execs/sec)",
+      "description": "sum by (model) (rate(nv_inference_exec_count[1m])) -- how many model executions/sec Triton is completing, per model.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 0, "y": 5, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "sum by (model) (rate(nv_inference_exec_count[1m]))",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Request failures/sec by model",
+      "description": "sum by (model,reason) (rate(nv_inference_request_failure[1m])) -- should be flat 0 in steady state.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 12, "y": 5, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true }, "color": { "mode": "fixed", "fixedColor": "red" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "sum by (model, reason) (rate(nv_inference_request_failure[1m]))",
+          "legendFormat": "{{model}} ({{reason}})"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Queue time per model, ms (excludes nemotron_llm)",
+      "description": "Avg time a request waits in Triton's scheduling queue before execution. Earliest clean saturation signal seen this session -- stayed ~0ms through concurrency 4, hit 7.5s at concurrency 8, 22.2s at concurrency 16, well before failures. nemotron_llm excluded -- see Read Me First panel.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 0, "y": 13, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true },
+          "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "green" }, { "value": 2000, "color": "orange" }, { "value": 5000, "color": "red" } ] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "(sum by (model) (rate(nv_inference_queue_duration_us{model!=\"nemotron_llm\"}[1m])) / clamp_min(sum by (model) (rate(nv_inference_exec_count{model!=\"nemotron_llm\"}[1m])), 1e-9)) / 1000",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Compute time per model, ms (excludes nemotron_llm)",
+      "description": "Avg per-exec compute (inference) duration Triton reports. nemotron_llm excluded -- its execute() returns almost instantly (decoupled/streaming), so this number would not reflect real generation time. See Read Me First panel.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 12, "y": 13, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "(sum by (model) (rate(nv_inference_compute_infer_duration_us{model!=\"nemotron_llm\"}[1m])) / clamp_min(sum by (model) (rate(nv_inference_exec_count{model!=\"nemotron_llm\"}[1m])), 1e-9)) / 1000",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "nemotron_llm throughput only",
+      "description": "nemotron_llm's queue/compute timers aren't meaningful (see Read Me First) -- exec throughput is the one metric still worth watching for this model here.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 0, "y": 21, "w": 8, "h": 7 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "sum(rate(nv_inference_exec_count{model=\"nemotron_llm\"}[1m]))",
+          "legendFormat": "nemotron_llm execs/sec"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "GPU utilization",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 8, "y": 21, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "fillOpacity": 15 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "nv_gpu_utilization * 100",
+          "legendFormat": "GPU util %"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Model READY state",
+      "description": "From scripts/triton_state_exporter.py polling POST /v2/repository/index (not a native Triton metric).",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 16, "y": 21, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NOT READY", "color": "red" }, "1": { "text": "READY", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "red" }, { "value": 1, "color": "green" } ] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "triton_model_ready",
+          "legendFormat": "{{model}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "GPU memory: used vs. free (empirical ceiling)",
+      "description": "Free is computed as 15843MiB (the empirically observed used+free ceiling this session) minus used -- not NVML's advertised 16303MiB total. See Read Me First panel.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 0, "y": 28, "w": 16, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "used" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "free (estimate)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "nv_gpu_memory_used_bytes",
+          "legendFormat": "used"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "clamp_min(16612908032 - nv_gpu_memory_used_bytes, 0)",
+          "legendFormat": "free (estimate)"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "gauge",
+      "title": "GPU free memory (redline)",
+      "description": "Alert thresholds: warning <2GiB, critical <1GiB. Real OOM-adjacent failure this session hit 26-424MB free during a model reload.",
+      "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+      "gridPos": { "x": 16, "y": 28, "w": 8, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": 16612908032,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 1073741824, "color": "orange" },
+              { "value": 2147483648, "color": "green" }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdLabels": false, "showThresholdMarkers": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
+          "expr": "clamp_min(16612908032 - nv_gpu_memory_used_bytes, 0)",
+          "legendFormat": "free (estimate)",
+          "instant": true
+        }
+      ]
+    }
+  ]
+}
