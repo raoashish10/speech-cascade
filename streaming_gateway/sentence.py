@@ -9,9 +9,11 @@ internal chunking becomes a no-op most of the time, a safety net for
 unusually long sentences the rest of the time). This module only needs to
 find the boundaries, not do any of kokoro's own smoothing work.
 
-Known limitation, not fixed here: the naive punctuation-based boundary
-regex will prematurely split on abbreviations ("Dr. Smith", "e.g."). Fine
-for the "core pattern" scope this was built for.
+Abbreviations ("Dr. Smith", "e.g.", single-letter initials like "J. Smith")
+are special-cased below so the naive punctuation-based boundary doesn't
+split on them -- see _is_abbreviation(). Not a general-purpose sentence
+tokenizer (no ML, no exhaustive abbreviation list): just enough to cover
+the realistic voice-assistant-answer cases this pipeline actually produces.
 """
 
 import re
@@ -26,6 +28,34 @@ _SENTENCE_END_RE = re.compile(rf"(?<=[{re.escape(SENTENCE_MARKS)}])\s+")
 # (e.g. a comma-separated list), so TTS isn't stalled waiting forever.
 MAX_ACCUM_CHARS = 400
 
+# Common abbreviations a naive "punctuation + whitespace" boundary would
+# otherwise mistake for a sentence end. Titles/Latin abbreviations/units
+# that plausibly show up in a spoken, 1-2-sentence voice-assistant answer --
+# not an attempt at an exhaustive list.
+_ABBREVIATIONS = frozenset({
+    "dr.", "mr.", "mrs.", "ms.", "prof.", "sr.", "jr.", "st.",
+    "vs.", "e.g.", "i.e.", "etc.", "approx.", "inc.", "ltd.", "co.",
+    "no.", "fig.", "vol.", "pp.",
+})
+_LAST_WORD_RE = re.compile(r"(\S+)$")
+
+
+def _is_abbreviation(text_before_boundary: str) -> bool:
+    """True if the word immediately before a candidate boundary (the text
+    up to and including the punctuation mark that triggered the match) is a
+    known abbreviation or a single-letter initial ("J." in "J. Smith") --
+    i.e. this candidate boundary is a false positive, not a real sentence
+    end."""
+    m = _LAST_WORD_RE.search(text_before_boundary)
+    if not m:
+        return False
+    word = m.group(1).lower()
+    if word in _ABBREVIATIONS:
+        return True
+    # A lone letter + "." ("J.", "A.") -- real sentences essentially never
+    # end on a single initial.
+    return len(word) == 2 and word[1] == "." and word[0].isalpha()
+
 
 class SentenceAccumulator:
     """Feed LLM text_diff pieces in; get back zero or more complete
@@ -39,9 +69,14 @@ class SentenceAccumulator:
         self._buf += text_diff
         out = []
         while True:
-            m = _SENTENCE_END_RE.search(self._buf)
-            if m:
-                sentence, self._buf = self._buf[: m.start()], self._buf[m.end() :]
+            boundary = None
+            for m in _SENTENCE_END_RE.finditer(self._buf):
+                if _is_abbreviation(self._buf[: m.start()]):
+                    continue
+                boundary = m
+                break
+            if boundary:
+                sentence, self._buf = self._buf[: boundary.start()], self._buf[boundary.end() :]
                 sentence = sentence.strip()
                 if sentence:
                     out.append(sentence)
