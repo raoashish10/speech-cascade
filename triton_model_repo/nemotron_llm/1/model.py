@@ -159,7 +159,22 @@ class TritonPythonModel:
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
             sampling_params = self.SamplingParams(
-                max_tokens=256,
+                # Lowered from 256 after measuring: at 256, this checkpoint's rambling
+                # responses (see the chat-template fix's own follow-up notes) never
+                # reach a natural stop even by token 256 -- truncating the same
+                # deterministic (temperature=0) token stream at 64/96/128/160/192 showed
+                # no case where a coherent answer got cut off earlier, since none of the
+                # measured responses resolve to a coherent, complete answer within the
+                # 256-token window regardless of where the cut is. So the cap is a pure
+                # latency/cost bound here, not a content-completeness tradeoff. 96 gives
+                # ~1.5x headroom over what a well-behaved "1-2 short spoken sentences"
+                # answer needs (roughly 30-60 tokens), while cutting worst-case latency
+                # by roughly 2.5x versus 256. A separate experiment strengthening the
+                # user-turn instruction (single direct sentence, no hedging, no lists)
+                # did NOT help -- it made responses more meta/confused (asking for
+                # clarification on plain factual questions) while still hitting the cap
+                # 8/8 -- so that change was reverted; only max_tokens changed here.
+                max_tokens=96,
                 temperature=0,
                 # temperature=0 (exact greedy) with no repetition penalty degenerates into
                 # repeated phrases specifically under this engine's classic TensorRT backend
