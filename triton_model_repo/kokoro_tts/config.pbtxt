@@ -43,24 +43,33 @@ output [
 
 # kokoro_onnx's public API (Kokoro.create()) synthesizes one text string per
 # call -- there's no native multi-text batched call, so this is NOT
-# request-batching. It's multi-instance parallelism: 3 independent copies of
+# request-batching. It's multi-instance parallelism: independent copies of
 # the ONNX Runtime CUDA session, each able to run kokoro.create() at the same
 # time, instead of every request serializing through a single instance.
 # Measured before: concurrency 32 against count:1 -> avg_compute ~70-94ms per
 # call but avg_queue up to ~1628ms (all queueing, no compute bottleneck).
-# kokoro-82m is small (~325MB on disk), and a light warmup (a handful of
-# requests) only costs ~250MB total across all 3 instances -- but under
-# SUSTAINED heavy concurrent load (repeated bursts at concurrency 32),
-# onnxruntime's per-instance CUDA memory arena keeps growing and does not
-# shrink back (same behavior the project README already documents for a
-# single instance), and was measured reaching ~2.4GB per instance / ~7.2GB
-# total after repeated load testing -- a real chunk of this GPU's ~16GB. A
-# production deployment should watch this (e.g. periodic restarts, or an
-# onnxruntime arena size cap) rather than assume the light-load number holds
-# under sustained traffic; unloading+reloading the model resets it back down.
+#
+# UPDATE (see docs/kokoro-tts-capacity-fix.md): the growth this comment used
+# to describe -- onnxruntime's per-instance CUDA memory arena reaching
+# ~2.4GB/instance (~7.2GB/3 instances) under sustained concurrent load and
+# never shrinking back -- was a consequence of model.py building its
+# onnxruntime session with no session/provider options, leaving the CUDA EP
+# on arena_extend_strategy=kNextPowerOfTwo (doubles on every growth event)
+# and cudnn_conv_algo_search=EXHAUSTIVE (re-benchmarks conv algorithms, with
+# scratch-workspace allocation, on every new input shape -- and Kokoro sees a
+# new shape on nearly every call, since synthesis length tracks input text
+# length). model.py now builds its own session with
+# arena_extend_strategy=kSameAsRequested and cudnn_conv_algo_search=HEURISTIC.
+# Measured live: flat at ~889MB/instance (~2.67GB/3 instances) even across
+# repeated concurrency-32 bursts that used to drive the old ~2.4GB/instance
+# ceiling -- no growth observed, not just a lower starting point. Compute
+# latency did not regress (concurrency=8 direct: avg_compute 694-969ms/call
+# pre-fix -> 95.4ms/call post-fix; HEURISTIC's one-time-per-shape algorithm
+# selection is cheaper, not just smaller, than EXHAUSTIVE's repeated search).
+# The ~4.5GB this freed is what pays for the 4th instance below.
 instance_group [
   {
-    count: 3
+    count: 4
     kind: KIND_GPU
   }
 ]
@@ -70,10 +79,12 @@ instance_group [
 # kokoro.create() call as before -- no preferred_batch_size is set, so this
 # doesn't change dispatch behavior, only adds a queue depth cap and a fast
 # rejection instead of an unbounded wait. Grounded in the measured numbers
-# above: normal (uncontended) compute is ~70-90ms; with 3 instances, a
-# request still waiting 750ms (~9x normal compute) is a real sign of
+# above: normal (uncontended) compute is ~70-95ms; with 4 instances, a
+# request still waiting 750ms (~8-10x normal compute) is a real sign of
 # overload, not normal jitter. max_queue_size 32 matches the highest
-# concurrency this was load-tested at.
+# concurrency this was load-tested at. Left untouched by the arena-fix +
+# 4th-instance change above -- see docs/kokoro-tts-capacity-fix.md for
+# whether the timeout itself was also revisited.
 dynamic_batching {
   default_queue_policy {
     timeout_action: REJECT
