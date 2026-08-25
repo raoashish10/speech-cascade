@@ -62,8 +62,17 @@ class TritonPythonModel:
 
         from tensorrt_llm.llmapi.llm import _TrtLLM
         from tensorrt_llm import SamplingParams
+        from transformers import AutoTokenizer
 
         self.SamplingParams = SamplingParams
+        # Rendered ourselves via apply_chat_template() rather than passed as
+        # a messages list to generate_async() -- keeps template rendering
+        # explicit and independent of whatever TRT-LLM's own chat-template
+        # handling does or doesn't do, and matches the checkpoint's actual
+        # chat_template.jinja (a standard Llama-3.1 header/eot_id format)
+        # exactly, since it's the same HF tokenizer class reading the same
+        # tokenizer_config.json.
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
         self.llm = _TrtLLM(
             model=engine_dir,
             tokenizer=tokenizer_dir,
@@ -113,9 +122,41 @@ class TritonPythonModel:
         sender = request.get_response_sender()
         try:
             prompt_tensor = pb_utils.get_input_tensor_by_name(request, "PROMPT")
-            prompt = prompt_tensor.as_numpy().flatten()[0]
-            if isinstance(prompt, bytes):
-                prompt = prompt.decode("utf-8")
+            transcript = prompt_tensor.as_numpy().flatten()[0]
+            if isinstance(transcript, bytes):
+                transcript = transcript.decode("utf-8")
+
+            # The raw ASR transcript was previously sent straight to
+            # generate_async() with no chat template at all -- the model had
+            # no way to tell "answer this" from "continue this sentence",
+            # and treated every prompt as free-text continuation. Measured:
+            # 8/8 realistic voice-assistant prompts hit the 256-token cap
+            # with rambling, off-topic output ("What's the capital of
+            # France" -> a multi-paragraph tangent that never says "Paris").
+            # "detailed thinking off" is this checkpoint's own documented
+            # reasoning-mode toggle (see chat_template.jinja's default
+            # system content) -- leaving it unset let the model's <think>
+            # step-by-step mode leak into every response, which is most of
+            # what was actually being generated. First attempt appended
+            # extra voice-assistant instructions into the same system
+            # message and the toggle stopped working -- <think> kept
+            # leaking into the output as literal text. The template only
+            # ever uses this exact string as the system content in its own
+            # fallback branch, so it needs to be the system message's
+            # *entire* content, verbatim, not diluted with anything else;
+            # the voice-assistant framing moved into the user turn instead.
+            messages = [
+                {"role": "system", "content": "detailed thinking off"},
+                {
+                    "role": "user",
+                    "content": (
+                        "Answer the following directly and concisely, in 1-2 short "
+                        "sentences suitable for being spoken aloud. Do not show your "
+                        f"reasoning.\n\n{transcript}"
+                    ),
+                },
+            ]
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
             sampling_params = self.SamplingParams(
                 max_tokens=256,
@@ -126,6 +167,12 @@ class TritonPythonModel:
                 # checkpoint/settings). This keeps decoding deterministic while discouraging
                 # the loop.
                 repetition_penalty=1.15,
+                # The chat template's real end-of-turn token -- belt-and-suspenders
+                # alongside whatever EOS handling generate_async() does on its own,
+                # given this engine backend has already needed workarounds for
+                # decoding quirks the PyTorch/vLLM backends don't reproduce (see
+                # repetition_penalty above).
+                stop=["<|eot_id|>"],
             )
             result = self.llm.generate_async(prompt, sampling_params, streaming=True)
             for output in result:  # blocking sync iteration -- fine on a pool thread
