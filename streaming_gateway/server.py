@@ -82,7 +82,7 @@ async def stream(websocket: WebSocket):
         _active_sessions += 1
 
     try:
-        voice = websocket.query_params.get("voice", "af_heart")
+        voice = websocket.query_params.get("voice", "Sofia")
 
         async def send_json(payload: dict):
             await websocket.send_json(payload)

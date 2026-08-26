@@ -67,6 +67,7 @@ pty "${TRITON_BIN}" \
   --model-control-mode=explicit \
   --load-model=nemotron_llm \
   --load-model=whisper_asr \
-  --load-model=kokoro_tts \
+  --load-model=magpie_tts \
   --load-model=voice_pipeline \
+  --exit-on-error=false \
   --log-verbose=0 2>&1

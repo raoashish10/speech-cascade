@@ -34,7 +34,7 @@ MAX_UTTERANCE_SEC = 15.0
 
 
 class StreamingSession:
-    def __init__(self, send_json, voice: str = "af_heart"):
+    def __init__(self, send_json, voice: str = "Sofia"):
         self._send_json = send_json
         self.voice = voice
         self.vad = UtteranceVAD()

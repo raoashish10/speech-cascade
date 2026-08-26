@@ -1,4 +1,4 @@
-"""Triton BLS orchestrator: chains whisper_asr -> nemotron_llm -> kokoro_tts
+"""Triton BLS orchestrator: chains whisper_asr -> nemotron_llm -> magpie_tts
 into a single request/response, matching the diagram's audio-in/audio-out
 voice pipeline. Pure orchestration -- no model weights of its own, so it
 needs no GPU instance; the three models it calls each manage their own.
@@ -77,7 +77,7 @@ class TritonPythonModel:
         responses = []
         for request in requests:
             # Any of the three downstream calls below can legitimately fail
-            # under load now that whisper_asr/kokoro_tts/nemotron_llm all
+            # under load now that whisper_asr/magpie_tts/nemotron_llm all
             # have admission control (dynamic_batching default_queue_policy
             # REJECT / the in-flight-request counter) -- a downstream
             # rejection is an expected, everyday response under overload, not
@@ -124,7 +124,7 @@ class TritonPythonModel:
         if voice_tensor is not None:
             tts_inputs.append(voice_tensor)
 
-        tts_out = _run("kokoro_tts", tts_inputs, ["AUDIO_SAMPLES", "SAMPLE_RATE"])
+        tts_out = _run("magpie_tts", tts_inputs, ["AUDIO_SAMPLES", "SAMPLE_RATE"])
 
         return pb_utils.InferenceResponse(
             output_tensors=[

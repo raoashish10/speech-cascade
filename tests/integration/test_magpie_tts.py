@@ -1,4 +1,4 @@
-"""Integration tests for kokoro_tts in isolation, against the live Triton
+"""Integration tests for magpie_tts in isolation, against the live Triton
 server. See tests/integration/conftest.py."""
 
 import numpy as np
@@ -18,7 +18,7 @@ async def _tts_infer(client, text, voice=None):
         v_inp.set_data_from_numpy(v_arr)
         inputs.append(v_inp)
     result = await client.infer(
-        model_name="kokoro_tts",
+        model_name="magpie_tts",
         inputs=inputs,
         outputs=[
             grpcclient.InferRequestedOutput("AUDIO_SAMPLES"),
@@ -31,8 +31,8 @@ async def _tts_infer(client, text, voice=None):
     return audio, sample_rate
 
 
-async def test_kokoro_tts_responds_to_real_text(grpc_client, require_ready):
-    await require_ready("kokoro_tts")
+async def test_magpie_tts_responds_to_real_text(grpc_client, require_ready):
+    await require_ready("magpie_tts")
     audio, sample_rate = await _tts_infer(grpc_client, "Hello there, this is a test.")
 
     assert audio.size > 0, "audio output should be non-empty"
@@ -42,17 +42,17 @@ async def test_kokoro_tts_responds_to_real_text(grpc_client, require_ready):
     assert audio.size / sample_rate > 0.1
 
 
-async def test_kokoro_tts_uses_default_voice_when_unspecified(grpc_client, require_ready):
-    await require_ready("kokoro_tts")
+async def test_magpie_tts_uses_default_voice_when_unspecified(grpc_client, require_ready):
+    await require_ready("magpie_tts")
     audio, sample_rate = await _tts_infer(grpc_client, "Testing the default voice parameter.")
     assert audio.size > 0
     assert sample_rate > 0
 
 
-async def test_kokoro_tts_accepts_explicit_voice(grpc_client, require_ready):
-    await require_ready("kokoro_tts")
-    # af_heart matches config.pbtxt's own default_voice -- passing it
+async def test_magpie_tts_accepts_explicit_voice(grpc_client, require_ready):
+    await require_ready("magpie_tts")
+    # Sofia matches config.pbtxt's own default_voice -- passing it
     # explicitly should behave the same as omitting VOICE entirely.
-    audio, sample_rate = await _tts_infer(grpc_client, "Testing an explicit voice.", voice="af_heart")
+    audio, sample_rate = await _tts_infer(grpc_client, "Testing an explicit voice.", voice="Sofia")
     assert audio.size > 0
     assert sample_rate > 0

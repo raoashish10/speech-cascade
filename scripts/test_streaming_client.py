@@ -8,7 +8,7 @@ Usage (from outside the box, through the Caddy-authed external port -- see
 streaming_gateway/README.md for the full external-access writeup):
     python3 test_streaming_client.py --wav clip.wav \\
         --gateway-url ws://<PUBLIC_IPADDR>:<VAST_TCP_PORT_10100>/ws/stream \\
-        --token "$OPEN_BUTTON_TOKEN" --voice af_heart
+        --token "$OPEN_BUTTON_TOKEN" --voice Sofia
 
 The token is sent as a `?token=` query param by default -- that's the only
 method a browser's native WebSocket API can use (it can't set custom
@@ -119,7 +119,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--wav", required=True)
     p.add_argument("--gateway-url", default="ws://localhost:18010/ws/stream")
-    p.add_argument("--voice", default="af_heart")
+    p.add_argument("--voice", default="Sofia")
     p.add_argument("--out-dir", default="./stream_test_output")
     p.add_argument("--no-realtime", action="store_true",
                     help="blast the whole file instantly instead of real-time-paced")

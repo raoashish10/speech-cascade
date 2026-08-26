@@ -16,7 +16,7 @@ CLIENT_TIMEOUT_S = 60.0
 
 
 async def test_voice_pipeline_end_to_end(grpc_client, require_ready, synth_speech):
-    for model in ("whisper_asr", "nemotron_llm", "kokoro_tts", "voice_pipeline"):
+    for model in ("whisper_asr", "nemotron_llm", "magpie_tts", "voice_pipeline"):
         await require_ready(model)
 
     _text, audio, sample_rate = synth_speech

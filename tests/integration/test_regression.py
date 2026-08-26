@@ -50,13 +50,13 @@ async def test_nemotron_llm_known_good_prompts(grpc_client, require_ready, strea
 
 
 @pytest.mark.parametrize("text", KNOWN_GOOD_TTS_TEXTS)
-async def test_kokoro_tts_known_good_texts(grpc_client, require_ready, text):
-    await require_ready("kokoro_tts")
+async def test_magpie_tts_known_good_texts(grpc_client, require_ready, text):
+    await require_ready("magpie_tts")
     arr = np.array([[text]], dtype=object)
     inp = grpcclient.InferInput("TEXT", arr.shape, "BYTES")
     inp.set_data_from_numpy(arr)
     result = await grpc_client.infer(
-        model_name="kokoro_tts",
+        model_name="magpie_tts",
         inputs=[inp],
         outputs=[
             grpcclient.InferRequestedOutput("AUDIO_SAMPLES"),

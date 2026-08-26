@@ -62,7 +62,7 @@ through the authed edge and saving the returned TTS audio locally:
 ```bash
 python3 scripts/test_streaming_client.py --wav your_clip.wav \
   --gateway-url ws://<PUBLIC_IPADDR>:<VAST_TCP_PORT_10100>/ws/stream \
-  --token "$OPEN_BUTTON_TOKEN" --voice af_heart
+  --token "$OPEN_BUTTON_TOKEN" --voice Sofia
 ```
 Add `--auth-mode header` to send the token as `Authorization: Bearer …`
 instead of the default `?token=` query param.
@@ -110,7 +110,9 @@ what's deliberately not, for a small research/demo deployment:
   `GATEWAY_MAX_SESSIONS`, in `server.py`). The real risk on this box isn't
   abuse of the gateway process — it's every open session queuing work onto
   the *same* GPU-resident Triton models (`whisper_asr`, `nemotron_llm`,
-  `kokoro_tts`) with only ~5.5GB of VRAM headroom at steady state. A hard
+  `magpie_tts`) with limited VRAM headroom at steady state (the ~5.5GB
+  figure here was measured against kokoro_tts; not yet re-measured against
+  magpie_tts's different footprint). A hard
   cap on concurrent WebSocket sessions is the cheapest guard against that
   specific failure mode: past the cap, new connections are accepted (so the
   client gets a clean WS close, not a raw TCP-level failure) and

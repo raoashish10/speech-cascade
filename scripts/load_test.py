@@ -19,7 +19,7 @@ Time-to-first-token (TTFT): measured only for nemotron_llm, the one model
 that actually streams. It's the time from request start to the first
 response chunk carrying a non-empty GENERATED_TEXT text_diff (the server
 sends one more, empty, chunk at the very end just to close the stream --
-that one is not counted as "first token"). whisper_asr, kokoro_tts, and
+that one is not counted as "first token"). whisper_asr, magpie_tts, and
 voice_pipeline are unary: the whole response arrives as one atomic reply,
 so there's no meaningful sub-request granularity to time -- TTFT and total
 response time would be the same number by construction, which is not a
@@ -29,11 +29,11 @@ says so explicitly instead of leaving it ambiguous.
 
 Usage:
     python3 load_test.py --concurrency 4 --total-requests 20
-        # runs whisper_asr, nemotron_llm, kokoro_tts, voice_pipeline in turn,
+        # runs whisper_asr, nemotron_llm, magpie_tts, voice_pipeline in turn,
         # each isolated (no cross-stage GPU contention), same concurrency,
         # for a clean per-stage p50/p90 breakdown.
 
-    python3 load_test.py --concurrency 4 --total-requests 20 --model kokoro_tts
+    python3 load_test.py --concurrency 4 --total-requests 20 --model magpie_tts
         # just one model.
 
     python3 load_test.py --concurrency 16 --total-requests 64 --model nemotron_llm \
@@ -42,7 +42,7 @@ Usage:
         # a batch-size/concurrency sweep table across many separate runs.
         # For nemotron_llm this also fills ttft_p50_s/ttft_p90_s/ttft_p99_s
         # (time-to-first-token, seconds); those three columns are left blank
-        # for whisper_asr/kokoro_tts/voice_pipeline since those models are
+        # for whisper_asr/magpie_tts/voice_pipeline since those models are
         # unary and have no sub-request first-token event to time separately
         # from total response time (p50_s/p90_s/p99_s above).
 """
@@ -102,7 +102,7 @@ def build_request(model):
         inp.set_data_from_numpy(arr)
         return [inp], [grpcclient.InferRequestedOutput("GENERATED_TEXT")]
 
-    if model == "kokoro_tts":
+    if model == "magpie_tts":
         arr = np.array([["Hello there, this is a test."]], dtype=object)
         inp = grpcclient.InferInput("TEXT", arr.shape, "BYTES")
         inp.set_data_from_numpy(arr)
@@ -315,7 +315,7 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
 
 
 async def main(concurrency, total_requests, model, csv_path):
-    models = [model] if model else ["whisper_asr", "nemotron_llm", "kokoro_tts", "voice_pipeline"]
+    models = [model] if model else ["whisper_asr", "nemotron_llm", "magpie_tts", "voice_pipeline"]
     async with httpx.AsyncClient() as http_client:
         grpc_client = grpcclient.InferenceServerClient(url=TRITON_GRPC_URL)
         all_results = []
@@ -335,7 +335,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--total-requests", type=int, default=20)
-    parser.add_argument("--model", choices=["whisper_asr", "nemotron_llm", "kokoro_tts", "voice_pipeline"], default=None)
+    parser.add_argument("--model", choices=["whisper_asr", "nemotron_llm", "magpie_tts", "voice_pipeline"], default=None)
     parser.add_argument("--csv", default=None, help="append one summary row per model to this CSV file")
     args = parser.parse_args()
     asyncio.run(main(args.concurrency, args.total_requests, args.model, args.csv))

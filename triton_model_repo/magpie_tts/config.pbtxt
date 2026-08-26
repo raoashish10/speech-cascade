@@ -1,0 +1,58 @@
+name: "magpie_tts"
+backend: "python"
+# Same reasoning as kokoro_tts before it: MagpieTTSModel.do_tts() has no
+# native multi-text batched call (it's an autoregressive decode loop per
+# utterance), so max_batch_size stays at 1 -- the dynamic batcher below is
+# a pure per-request dispatch/admission-control mechanism, never a grouping
+# one. instance_group.count starts at 1 (not tuned yet, unlike kokoro's
+# measured count:4): do_tts()'s concurrency safety on a single CUDA context
+# hasn't been load-tested for this model, so this is the conservative
+# baseline pending that measurement.
+max_batch_size: 1
+
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "VOICE"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "AUDIO_SAMPLES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+parameters: {
+  key: "model_path"
+  value: { string_value: "/workspace/speech-cascade-inference/models/magpie-tts-multilingual-357m/magpie_tts_multilingual_357m.nemo" }
+}
+parameters: {
+  key: "default_voice"
+  value: { string_value: "Sofia" }
+}
+parameters: {
+  key: "default_language"
+  value: { string_value: "en" }
+}

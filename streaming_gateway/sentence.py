@@ -2,12 +2,16 @@
 as soon as a boundary is crossed, so TTS can start on sentence N while the
 LLM is still generating sentence N+1.
 
-kokoro_onnx.Kokoro.create() already does its own sentence/clause chunking,
-splice-avoidance, and pause insertion for whatever complete text it's given
--- so feeding it one already-complete sentence at a time is a safe fit (its
-internal chunking becomes a no-op most of the time, a safety net for
-unusually long sentences the rest of the time). This module only needs to
-find the boundaries, not do any of kokoro's own smoothing work.
+kokoro_onnx.Kokoro.create() used to do its own sentence/clause chunking,
+splice-avoidance, and pause insertion for whatever complete text it was
+given, making it a safe fit for one already-complete sentence at a time.
+magpie_tts (nemo's MagpieTTSModel.do_tts()) has no documented equivalent
+internal chunking and caps standard-mode generation at ~20s of audio per
+call -- an unusually long accumulated "sentence" that used to be a no-op
+safety net under Kokoro could now hit that cap under Magpie. Not yet
+handled here; this module still only finds sentence boundaries, on the
+(currently unverified for Magpie) assumption that a single sentence never
+approaches the 20s ceiling.
 
 Abbreviations ("Dr. Smith", "e.g.", single-letter initials like "J. Smith")
 are special-cased below so the naive punctuation-based boundary doesn't
