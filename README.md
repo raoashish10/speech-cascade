@@ -315,6 +315,17 @@ TensorRT-LLM version it was built with — copying it to different hardware
 isn't reliable, so replicating this repo elsewhere means rerunning this
 script there, not copying `models/llama_nemotron_engine/`.
 
+`scripts/quantize_nvfp4.py` reconstructs the NVFP4 quantization step that
+actually produced what `nemotron_llm` serves today (see `deploy/REBUILD.md`
+"4b") — the FP8 path above was superseded, not deleted; it's kept for
+reference and any future re-quantization on hardware/versions where NVFP4
+isn't the right call. Unlike `quantize_fp8.py`, this wraps NVIDIA's own
+`hf_ptq.py` example CLI (cloned from `NVIDIA/TensorRT-Model-Optimizer`)
+rather than calling the calibration API directly — see the script's own
+docstring for exactly which flags are confirmed against upstream source vs.
+reconstructed from `speech-cascade-inference/reports/session-report.md`.
+Defaults to a scratch output directory, not the live-served checkpoint path.
+
 ## Metrics and load testing
 
 Triton exposes rich per-model Prometheus metrics at `/metrics` on port 18002

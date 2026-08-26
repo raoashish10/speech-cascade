@@ -147,7 +147,7 @@ original FP8 engine was built with. `build_engine.sh`'s own header explains
 why the output isn't portable across GPU architectures or TensorRT-LLM
 versions -- rerun it on the target machine, don't copy the `.engine` file.
 
-### 4b. LLM, NVFP4 (currently deployed -- **not fully scripted**, see gap below)
+### 4b. LLM, NVFP4 (currently deployed -- reconstructed script, not yet run end-to-end)
 
 `triton_model_repo/nemotron_llm/config.pbtxt` currently points at
 `models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4` (the "full" NVFP4 variant,
@@ -155,33 +155,52 @@ loaded dynamically via TensorRT-LLM's `LLM` API -- no `trtllm-build` AOT
 step for this path, unlike 4a). This checkpoint already exists once S3 is
 restored (step 2); the steps below are for regenerating it from scratch.
 
+`scripts/quantize_nvfp4.py` now captures this as code (previously this
+section was the only record of the step -- see "Known gaps" below for what
+changed). Usage:
+
+```bash
+python3 scripts/quantize_nvfp4.py --hf-token $HF_TOKEN
+# outputs to a scratch dir by default, NOT the live-served checkpoint path --
+# pass --export-dir explicitly to produce a real replacement
+```
+
 Recorded in `speech-cascade-inference/reports/session-report.md`
-("1. Quantization"), summarized here:
+("1. Quantization"), summarized here (see the script's own docstring for
+the full breakdown of what's confirmed against upstream source vs.
+reconstructed from prose):
 
 ```bash
 pip install nvidia-modelopt[hf]==0.46.0
 
-# NVIDIA's Model-Optimizer GitHub repo -- checkout the 0.46.0 TAG, not
-# main (main's hf_ptq.py example imports a module that doesn't exist in
-# the 0.46.0 release).
+# NVIDIA's Model-Optimizer GitHub repo -- checkout the 0.46.0 tag (no "v"
+# prefix -- session-report.md and an earlier version of this doc said
+# "v0.46.0", which doesn't exist as a tag; confirmed via the GitHub API).
+# Not main: main's hf_ptq.py example imports a module that doesn't exist in
+# the 0.46.0 release.
 git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer /tmp/modelopt
-cd /tmp/modelopt && git checkout v0.46.0
+cd /tmp/modelopt && git checkout 0.46.0
 
 # Calibration: 512 samples from cnn_dailymail + a Nemotron post-training
 # dataset (nvidia/Nemotron-Post-Training-Dataset-v2, gated -- needs an
-# HF_TOKEN from an account that accepted its terms). Full NVFP4 (every
-# linear layer, not MLP-only) is what's actually deployed -- the session
-# report's cross-engine benchmark found it outscored MLP-only on this
-# model, the opposite of NVIDIA's general guidance.
+# HF_TOKEN from an account that accepted its terms) -- this is NVIDIA's own
+# "cnn_nemotron_v2_mix" combo, confirmed in modelopt's dataset registry, an
+# even 256/256 split of 512 samples. Full NVFP4 (every linear layer, not
+# MLP-only) is what's actually deployed -- the session report's cross-engine
+# benchmark found it outscored MLP-only on this model, the opposite of
+# NVIDIA's general guidance.
 #
 # Exact hf_ptq.py flags were run interactively and NOT preserved as a
-# script -- see "Known gaps" below. At a minimum this needs: source BF16
-# checkpoint path, --qformat nvfp4 (not the MLP-only variant),
-# --kv_cache_qformat none (KV cache left unquantized), the calibration
-# dataset mix above, and an export path under
-# models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4. Consult
-# examples/llm_ptq/hf_ptq.py --help in the checked-out modelopt repo for
-# current flag names.
+# script. scripts/quantize_nvfp4.py reconstructs and runs:
+#   --pyt_ckpt_path <source BF16 checkpoint>
+#   --qformat nvfp4            # not the mlp_only variant; confirmed valid
+#                               # against hf_ptq.py's own --qformat choices
+#   --kv_cache_qformat none    # KV cache left unquantized; confirmed valid
+#   --dataset cnn_nemotron_v2_mix --calib_size 512
+#   --export_path <output, under models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4 to deploy>
+# confirmed against the actual hf_ptq.py source + modelopt dataset/preset
+# registries at tag 0.46.0 -- see the script's docstring for what remains
+# genuinely unverified (calib_seq, batch_size, trust_remote_code).
 ```
 
 `nemotron_llm/1/model.py` loads this checkpoint directly via
@@ -294,13 +313,25 @@ See `tests/README.md` for which Python environment each test tier needs.
 
 ## Known gaps (be upfront about these, don't paper over them)
 
-- **4b (NVFP4 LLM quantization) has no committed script**, unlike 4a (FP8)
-  and 4c (Whisper). The exact `hf_ptq.py` invocation was run interactively
-  during the quantization session and only survives as prose in
-  `speech-cascade-inference/reports/session-report.md`. Turning it into a
-  real `scripts/quantize_nvfp4.py` (mirroring `scripts/quantize_fp8.py`'s
-  shape) would close this gap -- worth doing as a follow-up, not attempted
-  here to avoid writing an unverified script into the repo.
+- **4b (NVFP4 LLM quantization) now has `scripts/quantize_nvfp4.py`, but it
+  is reconstructed and NOT verified end-to-end on this instance.** The
+  exact `hf_ptq.py` invocation was run interactively during the original
+  quantization session and was never preserved as a script; the survives-as-
+  prose gap this note used to describe is closed, but the closing was done
+  without re-running the quantization here (this instance's GPU had ~1.6GB
+  free at reconstruction time -- comfortably below what a ~8.5GB BF16 model
+  plus calibration needs, and taking that memory would have risked the
+  live-serving models sharing this GPU). The script's flags and dataset
+  handling are cross-checked directly against the `hf_ptq.py` source,
+  argparse definitions, and dataset registry at the pinned `0.46.0` tag
+  (fetched from `NVIDIA/TensorRT-Model-Optimizer` on GitHub), which is
+  stronger grounding than the prose alone gave -- but "the flags are valid
+  and match the documented calibration recipe" is not the same claim as
+  "this exact invocation was run and reproduces the deployed checkpoint."
+  Next person with real GPU headroom should run it end-to-end and diff the
+  resulting checkpoint's tensor count/dtypes/size against the deployed one
+  (963 tensors, 3.5GB, per the session report) before trusting it as a
+  faithful rebuild.
 - **4c (Whisper TensorRT-LLM engines) was reconstructed from the upstream
   example + the deployed config, not re-run end-to-end** during this PR
   (would require a multi-GB weight download and several minutes of
