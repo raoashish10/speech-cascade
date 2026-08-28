@@ -17,16 +17,21 @@ speech-cascade-inference/
     llama_nemotron_fp8_ckpt/           TensorRT-LLM checkpoint (FP8, post-quantize)
     llama_nemotron_engine/             Compiled TensorRT .engine (what's actually served)
     whisper-base/                      ONNX Whisper (encoder + merged decoder)
-    magpie-tts-multilingual-357m/      NeMo Magpie-TTS checkpoint (.nemo, replaces kokoro-82m)
     trtllm_build_timing_cache.bin      trtllm-build's timing cache (speeds up rebuilds)
   triton_model_repo/                 Triton model repository (4 models, see below)
   triton_server/
     extracted/tritonserver/            Redistributable no-Docker Triton server build
     compat_libs/                       Locally-extracted libssl.so.1.1 (not in Ubuntu 24.04)
   scripts/                            Standalone validation scripts (used during setup)
+    pipeline_output.wav                 chatterbox_tts's reference voice clip (voice-cloning conditioning input)
   deprecated/
     Nemotron-3-Nano-4B-FP8/            Abandoned model, see "Why not Nemotron-3-Nano" below
 ```
+
+`chatterbox_tts`'s own weights aren't under `models/` -- `ChatterboxTurboTTS.from_pretrained()`
+pulls them from the HF cache (`HF_HOME`) the first time it's run, same as any
+other `from_pretrained()`-based HF model, rather than a locally-checked-in
+`.nemo`/ONNX-style checkpoint.
 
 `/opt/supervisor-scripts/speech-cascade-triton.sh` and
 `/etc/supervisor/conf.d/speech-cascade-triton.conf` run the server as a
@@ -39,13 +44,13 @@ supervisor-managed apps).
 |---|---|---|---|
 | `nemotron_llm` | python | TensorRT-LLM, classic AOT-compiled engine | `PROMPT` (string) -> `GENERATED_TEXT` (string) |
 | `whisper_asr` | python | `WhisperTRTLLM` (vendored TensorRT-LLM Whisper runtime, compiled encoder+decoder engines — see `deploy/REBUILD.md` 4c; this table previously said `optimum`/ONNX Runtime, which is stale) | `AUDIO_SAMPLES` (float32[]) + optional `SAMPLE_RATE` (int32) -> `TRANSCRIPT` (string) |
-| `magpie_tts` | python | `nemo.collections.tts.models.MagpieTTSModel` (plain PyTorch/NeMo, replaces the former `kokoro_tts` / `kokoro_onnx`-ONNX-Runtime model — no TensorRT path yet, see "Not yet done") | `TEXT` (string) + optional `VOICE` (string) -> `AUDIO_SAMPLES` (float32[]) + `SAMPLE_RATE` (int32) |
+| `chatterbox_tts` | python | ResembleAI's Chatterbox-Turbo reference implementation (`ChatterboxTurboTTS`, plain PyTorch), run as a subprocess in its own isolated venv (`/venv/chatterbox`) rather than in-process — replaces the former `magpie_tts` (rejected candidate, never actually deployed) / `kokoro_tts` (dead: package uninstalled, weights removed) — see "Not yet done" | `TEXT` (string) + optional `VOICE` (string, currently ignored — single fixed reference voice) -> `AUDIO_SAMPLES` (float32[]) + `SAMPLE_RATE` (int32) |
 | `voice_pipeline` | python | Calls the three above via Triton's in-process BLS API (`pb_utils.InferenceRequest`) | `AUDIO_SAMPLES` + optional `SAMPLE_RATE`/`VOICE` -> `TRANSCRIPT`, `GENERATED_TEXT`, `AUDIO_SAMPLES`, `SAMPLE_RATE` |
 
 The first three use Triton's **python backend** as a thin wrapper around a
 Python-level runtime (TensorRT-LLM's `LLM` API, vendored TensorRT-LLM Whisper
-runtime, NeMo's `MagpieTTSModel`) rather than Triton's native
-`onnxruntime`/`tensorrt` backends directly.
+runtime, a subprocess running ResembleAI's `ChatterboxTurboTTS`) rather than
+Triton's native `onnxruntime`/`tensorrt` backends directly.
 `voice_pipeline` is pure orchestration — no model weights of its own, no GPU
 instance needed — chaining the other three into one audio-in/audio-out
 request/response, matching what the diagram's arrows actually show. That's
@@ -80,19 +85,22 @@ snapshot with all four models loaded, one instance each:
 
 Where the stub's own VRAM number lands depends on the model:
 
-- **`magpie_tts`**: like the ONNX-based models this replaced, the stub
-  process *is* where the model actually runs — `MagpieTTSModel` (PyTorch/
-  NeMo) loads directly into the `triton_python_backend_stub` process, no
-  separate worker. Measured standalone-script footprint was ~1.6GB for the
-  357M-param checkpoint + audio codec; not yet re-measured inside Triton
-  under load (unlike the `~2-2.5GB`/arena-growth numbers this section used
-  to cite for the old ONNX Runtime-based `kokoro_tts`/`whisper_asr`, which
-  no longer apply to either model in this row).
+- **`chatterbox_tts`**: unlike every other model in this table, the
+  `triton_python_backend_stub` process is **not** where the model actually
+  runs. `chatterbox_tts/1/model.py` spawns a persistent subprocess running
+  `/venv/chatterbox/bin/python3` (a separate, isolated venv — Chatterbox's
+  torch/torchaudio pins conflict with this venv's TensorRT-LLM stack) and
+  talks to it over a pipe; the stub process itself stays lightweight
+  (Triton/Python overhead only), and the real GPU memory shows up against
+  that separate `python3` process in `nvidia-smi`, not against
+  `triton_python_backend_stub`. Measured standalone footprint (outside
+  Triton, same reference implementation): ~3.0-3.4GB — see
+  `docs/tts-replacement-investigation.md`.
 - **`whisper_asr`**: now TensorRT-LLM-based (`WhisperTRTLLM`, see the model
   table above) rather than the ONNX Runtime path this section originally
   described — whether it also spawns a separate MPI worker like
-  `nemotron_llm` below, or stays in-process like `magpie_tts`, hasn't been
-  re-verified since that migration.
+  `nemotron_llm` below, or stays in-process, hasn't been re-verified since
+  that migration.
 - **`nemotron_llm`**: architecturally different. TensorRT-LLM's executor
   spawns a *separate* MPI worker subprocess to actually run the engine (the
   `MpiPoolSession` mechanism — see the "Environment quirks" section above,
@@ -212,9 +220,9 @@ API needs a JSON body — an empty POST returns "Method Not Allowed" — and
 the repository index endpoint is POST, not GET:
 
 ```bash
-# after editing whisper_asr/1/model.py, magpie_tts/1/model.py, or voice_pipeline/1/model.py:
+# after editing whisper_asr/1/model.py, chatterbox_tts/1/model.py, or voice_pipeline/1/model.py:
 curl -X POST http://localhost:18000/v2/repository/models/whisper_asr/load -d '{}'
-curl -X POST http://localhost:18000/v2/repository/models/magpie_tts/load -d '{}'
+curl -X POST http://localhost:18000/v2/repository/models/chatterbox_tts/load -d '{}'
 curl -X POST http://localhost:18000/v2/repository/models/voice_pipeline/load -d '{}'
 # nemotron_llm reload still pays the ~5 min tensorrt_llm import cost, same as a full restart
 
@@ -286,7 +294,7 @@ curl -s -X POST http://localhost:18000/v2/models/nemotron_llm/infer \
 
 # ASR — needs a float32 audio array; see scripts/test_asr.py for the standalone version
 # TTS
-curl -s -X POST http://localhost:18000/v2/models/magpie_tts/infer \
+curl -s -X POST http://localhost:18000/v2/models/chatterbox_tts/infer \
   -H "Content-Type: application/json" \
   -d '{"inputs":[{"name":"TEXT","shape":[1,1],"datatype":"BYTES","data":["Hello there."]}]}'
 
@@ -359,12 +367,12 @@ gRPC binary protocol (see "Two further optimizations" below for why not
 JSON-over-HTTP), records client-side latency percentiles, and diffs Triton's
 own metrics before/after to report per-model exec counts and average
 compute/queue time. With no `--model`, it runs `whisper_asr`, `nemotron_llm`,
-`magpie_tts`, and `voice_pipeline` in turn (each isolated, same concurrency)
+`chatterbox_tts`, and `voice_pipeline` in turn (each isolated, same concurrency)
 for a clean per-stage p50 breakdown:
 
 ```bash
 python3 scripts/load_test.py --concurrency 4 --total-requests 20
-python3 scripts/load_test.py --concurrency 4 --total-requests 20 --model magpie_tts  # just one
+python3 scripts/load_test.py --concurrency 4 --total-requests 20 --model chatterbox_tts  # just one
 ```
 
 **Two real bugs this surfaced**, both now fixed:
@@ -522,17 +530,40 @@ See `deploy/README.md` for the full breakdown.
   wave. Fixing this for real means restructuring the pipeline (e.g.
   streaming/overlapping stages) rather than another `dynamic_batching`
   tweak — a genuinely bigger change, not attempted.
-- **`kokoro_tts` was replaced by `magpie_tts` (NVIDIA Magpie-TTS-Multilingual-357M),
-  which has no TensorRT/ONNX export path at all yet** — it's a multi-stage
-  autoregressive system (transformer decoder over discrete audio-codec
-  tokens + neural audio codec + local transformer for codebook expansion),
-  unlike Kokoro's single feed-forward ONNX graph, so there's no existing
-  example to port from (unlike `whisper_asr`'s TensorRT-LLM migration below).
-  Currently plain PyTorch/NeMo (`nemo.collections.tts.models.MagpieTTSModel.do_tts()`)
-  in `triton_model_repo/magpie_tts/1/model.py` — confirmed working on this
-  Blackwell (sm_120) GPU despite the model card only listing Ada/Ampere/
-  Hopper as supported. TensorRT porting is a deliberate follow-up phase, not
-  attempted yet.
+- **`kokoro_tts` is now dead and `magpie_tts` was never actually a working
+  replacement — corrected here, see `docs/tts-replacement-investigation.md`
+  for the full record.** A prior commit (`f440a32`, "Replace Kokoro with
+  Magpie") merged a `magpie_tts` Triton backend into this repo claiming to
+  be "confirmed working on this Blackwell (sm_120) GPU" — this line used to
+  repeat that claim. It wasn't true: `nemo_toolkit` (the package
+  `magpie_tts/1/model.py` imports) was never added to
+  `deploy/requirements-main.txt`, the actual deploy directory
+  (`speech-cascade-inference/triton_model_repo`) still had `kokoro_tts`, not
+  `magpie_tts`, and Magpie was separately investigated per
+  `task2-tts.md`/`docs/magpie-tts-investigation.md` and **rejected**
+  (confirmed real GPU-bandwidth contention with `nemotron_llm` — 5.2x
+  TTFT/3.1x total-latency degradation at concurrency=8 — plus a phonemizer
+  bug dropping currency symbols like `$45.99`). Meanwhile `kokoro_tts`
+  itself went fully dead on this instance independently of any of that
+  (`kokoro-onnx` uninstalled from `/venv/main`, its weight files deleted
+  during an unrelated disk-space cleanup) — so TTS had no working backend
+  at all for a period. **Replaced with `chatterbox_tts`** (ResembleAI
+  Chatterbox-Turbo, MIT license — see the investigation doc for why it won
+  over F5-TTS/XTTS-v2/IndexTTS-2.5), run as a subprocess in its own
+  `/venv/chatterbox` venv (`triton_model_repo/chatterbox_tts/1/model.py`)
+  since Chatterbox's torch/torchaudio pins conflict with `/venv/main`'s
+  TensorRT-LLM stack. No TensorRT/ONNX export path exists for it yet either
+  — same story as Magpie's autoregressive-decoder-plus-vocoder shape, no
+  existing example to port from — that porting work is a deliberate
+  follow-up phase, not attempted here. **Actually verified this time**
+  (unlike the false "confirmed working" claim this replaces): a real call
+  through the live Triton `voice_pipeline` gRPC endpoint produced a real
+  transcript, LLM response, and 6.44s of genuine synthesized audio, and a
+  15-minute/471-turn composed-pipeline soak test against that same live
+  endpoint completed with 0 errors and no leak signature beyond early
+  allocator warmup — see `docs/tts-replacement-investigation.md`'s "Task 3"
+  section for the exact numbers. Not yet tuned for concurrency
+  (`instance_group.count: 1`, unlike `kokoro_tts`'s measured `count: 4`).
 - **`whisper_asr` migrated off ONNX Runtime to a vendored TensorRT-LLM
   runtime (`WhisperTRTLLM`, see `deploy/REBUILD.md` 4c)** — this resolves
   what used to be listed here as a "not yet done" TensorRT item for ASR.
@@ -543,9 +574,9 @@ See `deploy/README.md` for the full breakdown.
   defaulted to FP32 ONNX weights; smaller precision variants (INT8, `q8f16`,
   etc.) existed in the same HF repos and were never tried (FP16 specifically
   produced NaN output on this GPU/onnxruntime combination — see above). Now
-  moot for `whisper_asr` (different runtime entirely) and for `magpie_tts`
-  (different model), but worth revisiting once magpie_tts has a compiled
-  path.
+  moot for `whisper_asr` (different runtime entirely) and for `chatterbox_tts`
+  (different model, plain PyTorch, no quantized variant tried), but worth
+  revisiting once chatterbox_tts has a compiled path.
 - **TensorRT-LLM engine build flags left at near-defaults.** `reduce_fusion`,
   `multiple_profiles`, and `use_fp8_context_fmha` were all logged as
   disabled at `trtllm-build` time. The last one needs FP8 KV cache

@@ -1,0 +1,49 @@
+name: "chatterbox_tts"
+backend: "python"
+# max_batch_size 1, instance_group.count 1: Chatterbox's generate() has no
+# native multi-text batched call (autoregressive decode + vocoder per
+# utterance, same reasoning as kokoro_tts/magpie_tts before it), and this
+# model runs through a single persistent worker subprocess holding one CUDA
+# context (see model.py) -- concurrency has not been load-tested/tuned yet,
+# unlike kokoro_tts's measured count:4 (docs/kokoro-tts-capacity-fix.md).
+# This is a functional baseline pending that measurement.
+max_batch_size: 1
+
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "VOICE"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "AUDIO_SAMPLES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "SAMPLE_RATE"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+parameters: {
+  key: "ref_audio_path"
+  value: { string_value: "/workspace/speech-cascade-inference/scripts/pipeline_output.wav" }
+}

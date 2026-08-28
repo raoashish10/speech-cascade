@@ -53,7 +53,9 @@ app = FastAPI()
 # isn't a per-user identity here). The concrete risk on this box isn't
 # abuse of the gateway process itself, it's every session queuing work
 # onto the *same* GPU-resident Triton models (whisper_asr / nemotron_llm /
-# kokoro_tts) with only ~5.5GB VRAM headroom at steady state -- a handful
+# chatterbox_tts) with only ~5.5GB VRAM headroom at steady state (that
+# figure was measured against kokoro_tts; not yet re-measured against
+# chatterbox_tts's own ~3.0-3.4GB footprint) -- a handful
 # of concurrent utterances easily starves that. A hard concurrency cap is
 # the cheapest guard against that specific failure mode, so that's what's
 # here; see the module docstring above for the reachability side of this,

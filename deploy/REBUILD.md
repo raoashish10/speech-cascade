@@ -83,12 +83,12 @@ repo (`speech-cascade`) -- clone that separately in the normal way.
 
 ## 3. Python environments
 
-Two isolated venvs. Restore exact versions from this repo rather than
+Three isolated venvs. Restore exact versions from this repo rather than
 letting pip/uv re-resolve latest (that's the whole point of capturing
 these):
 
 ```bash
-# Main serving venv -- tensorrt_llm, torch, onnxruntime-gpu, kokoro-onnx.
+# Main serving venv -- tensorrt_llm, torch, onnxruntime-gpu.
 # FRAGILE: numpy is pinned <2 (TensorRT-LLM's compiled bindings are built
 # against numpy 1.x; several packages in this list silently upgrade numpy
 # if installed carelessly -- see main README quirk #10). Installing from
@@ -103,16 +103,28 @@ python3.12 -m venv /venv/main
 # numpy pin above.
 python3.12 -m venv /venv/gateway
 /venv/gateway/bin/pip install -r deploy/requirements-gateway.txt
+
+# Chatterbox TTS venv -- chatterbox-tts's own torch/torchaudio pins
+# conflict with /venv/main's TensorRT-LLM stack, so it's fully isolated
+# here too. chatterbox_tts's Triton backend (triton_model_repo/
+# chatterbox_tts/1/model.py) launches this venv's python as a subprocess
+# rather than importing chatterbox_tts inside Triton's own /venv/main
+# stub process -- do not try to `pip install chatterbox-tts` into
+# /venv/main instead of building this.
+python3.12 -m venv /venv/chatterbox
+/venv/chatterbox/bin/pip install -r deploy/requirements-chatterbox.txt
 ```
 
-`deploy/requirements-main.txt` and `deploy/requirements-gateway.txt` are
-`pip freeze` snapshots of the venvs actually running this deployment,
-taken while writing this runbook -- exact, not "whatever resolves today".
-Regenerate them after any intentional dependency change:
+`deploy/requirements-main.txt`, `deploy/requirements-gateway.txt`, and
+`deploy/requirements-chatterbox.txt` are `pip freeze` snapshots of the
+venvs actually running this deployment, taken while writing this runbook
+(or, for chatterbox, while wiring it into Triton) -- exact, not "whatever
+resolves today". Regenerate them after any intentional dependency change:
 
 ```bash
 /venv/main/bin/python -m pip freeze > deploy/requirements-main.txt
 uv pip freeze --python /venv/gateway/bin/python > deploy/requirements-gateway.txt
+/venv/chatterbox/bin/python -m pip freeze > deploy/requirements-chatterbox.txt
 ```
 
 Getting TensorRT-LLM itself importable in `/venv/main` in the first place

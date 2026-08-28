@@ -1,31 +1,26 @@
+"""Standalone smoke test for chatterbox_tts, outside Triton. Run with
+/venv/chatterbox/bin/python3 (this project's TensorRT-LLM venv, /venv/main,
+does not have chatterbox-tts installed and is not compatible with its
+torch/torchaudio pins -- see triton_model_repo/chatterbox_tts/1/model.py's
+docstring for why the Triton backend runs this as a subprocess instead)."""
+
 import time
 
-import soundfile as sf
-import torch
+import torchaudio as ta
 
-from nemo.collections.tts.models import MagpieTTSModel
+from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-t0 = time.time()
-model = MagpieTTSModel.restore_from(
-    "/workspace/speech-cascade-inference/models/magpie-tts-multilingual-357m/magpie_tts_multilingual_357m.nemo",
-    map_location="cuda",
-)
-model = model.cuda().eval()
-print(f"Magpie-TTS load took {time.time()-t0:.1f}s", flush=True)
+REF_AUDIO = "/workspace/speech-cascade-inference/scripts/pipeline_output.wav"
 
 t0 = time.time()
-with torch.no_grad():
-    audio, audio_len = model.do_tts(
-        transcript="Hello, this is a test of the text to speech pipeline.",
-        language="en",
-        apply_TN=False,
-        use_cfg=True,
-        speaker_index=4,  # Sofia
-    )
-samples = audio[0, : audio_len[0]].float().cpu().numpy()
-sample_rate = 22050
-print(f"TTS generation took {time.time()-t0:.1f}s, sample_rate={sample_rate}, samples={len(samples)}", flush=True)
+model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+model.prepare_conditionals(REF_AUDIO)
+print(f"Chatterbox-Turbo load took {time.time()-t0:.1f}s", flush=True)
 
-sf.write("/workspace/speech-cascade-inference/test_tts_output.wav", samples, sample_rate)
+t0 = time.time()
+wav = model.generate("Hello, this is a test of the text to speech pipeline.")
+print(f"TTS generation took {time.time()-t0:.1f}s, sample_rate={model.sr}, samples={wav.shape[-1]}", flush=True)
+
+ta.save("/workspace/speech-cascade-inference/test_tts_output.wav", wav, model.sr)
 print("Wrote /workspace/speech-cascade-inference/test_tts_output.wav", flush=True)
 print("DONE", flush=True)

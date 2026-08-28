@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs the project's Triton Inference Server (the 4-model voice pipeline:
-# nemotron_llm, whisper_asr, kokoro_tts, voice_pipeline) as a managed
+# nemotron_llm, whisper_asr, chatterbox_tts, voice_pipeline) as a managed
 # supervisor service.
 #
 # STATUS AS OF THIS PR: captured but NOT installed on the live instance.
@@ -67,7 +67,7 @@ pty "${TRITON_BIN}" \
   --model-control-mode=explicit \
   --load-model=nemotron_llm \
   --load-model=whisper_asr \
-  --load-model=magpie_tts \
+  --load-model=chatterbox_tts \
   --load-model=voice_pipeline \
   --exit-on-error=false \
   --log-verbose=0 2>&1

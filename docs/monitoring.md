@@ -1,7 +1,7 @@
 # Monitoring and alerting
 
 Grafana dashboard + Prometheus alerting for the 4-model Triton pipeline
-(`nemotron_llm`, `whisper_asr`, `kokoro_tts`, `voice_pipeline`) on this
+(`nemotron_llm`, `whisper_asr`, `chatterbox_tts`, `voice_pipeline`) on this
 single-GPU box. Everything here is grounded in this session's actual
 load-testing data (`reports/session-report.md`), not generic defaults.
 

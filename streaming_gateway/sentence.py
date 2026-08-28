@@ -5,13 +5,15 @@ LLM is still generating sentence N+1.
 kokoro_onnx.Kokoro.create() used to do its own sentence/clause chunking,
 splice-avoidance, and pause insertion for whatever complete text it was
 given, making it a safe fit for one already-complete sentence at a time.
-magpie_tts (nemo's MagpieTTSModel.do_tts()) has no documented equivalent
-internal chunking and caps standard-mode generation at ~20s of audio per
-call -- an unusually long accumulated "sentence" that used to be a no-op
-safety net under Kokoro could now hit that cap under Magpie. Not yet
-handled here; this module still only finds sentence boundaries, on the
-(currently unverified for Magpie) assumption that a single sentence never
-approaches the 20s ceiling.
+chatterbox_tts (ChatterboxTurboTTS.generate(), the current backend -- see
+docs/tts-replacement-investigation.md) has no documented equivalent internal
+chunking, and this project's own soak test only ever exercised short
+LLM-generated turns (max_tokens=96, comfortably sub-sentence-cap length in
+every one of 1039 turns) -- so a hard per-call length ceiling for this
+backend, if one exists, is untested territory, not confirmed absent. This
+module still only finds sentence boundaries, on the same unverified
+assumption as before: that a single accumulated "sentence" never approaches
+whatever that ceiling turns out to be.
 
 Abbreviations ("Dr. Smith", "e.g.", single-letter initials like "J. Smith")
 are special-cased below so the naive punctuation-based boundary doesn't

@@ -1,6 +1,6 @@
 """Async Triton gRPC client wrapper for the streaming gateway.
 
-whisper_asr and magpie_tts keep max_batch_size > 0, so their wire shapes
+whisper_asr and chatterbox_tts keep max_batch_size > 0, so their wire shapes
 need an explicit leading batch dim. nemotron_llm is now max_batch_size: 0
 and decoupled (streaming), so it takes no batch dim and uses stream_infer()
 instead of a unary infer() call.
@@ -63,9 +63,16 @@ async def generate_stream(prompt: str):
             yield text
 
 
-async def synthesize(text: str, voice: str = "Sofia"):
-    """Unary call to magpie_tts for one already-complete sentence.
-    Returns (audio: np.ndarray[float32], sample_rate: int)."""
+async def synthesize(text: str, voice: str = "default"):
+    """Unary call to chatterbox_tts for one already-complete sentence.
+    Returns (audio: np.ndarray[float32], sample_rate: int).
+
+    `voice` is accepted for interface compatibility with the prior
+    kokoro_tts/magpie_tts backends but is currently ignored --
+    chatterbox_tts serves a single reference voice embedded at model load
+    time (see triton_model_repo/chatterbox_tts/config.pbtxt's
+    ref_audio_path); multi-voice selection was not built for this backend.
+    """
     text_arr = np.array([[text.encode("utf-8")]], dtype=np.object_)
     voice_arr = np.array([[voice.encode("utf-8")]], dtype=np.object_)
 
@@ -75,7 +82,7 @@ async def synthesize(text: str, voice: str = "Sofia"):
     inp_voice.set_data_from_numpy(voice_arr)
 
     result = await get_client().infer(
-        model_name="magpie_tts",
+        model_name="chatterbox_tts",
         inputs=[inp_text, inp_voice],
         outputs=[
             grpcclient.InferRequestedOutput("AUDIO_SAMPLES"),

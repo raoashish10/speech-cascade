@@ -31,7 +31,7 @@ why they're the tier CI runs. Run with the **gateway venv**:
 Real gRPC calls (`tritonclient.grpc.aio`) against whatever's actually
 loaded on `localhost:18001` right now:
 
-- `test_whisper_asr.py`, `test_nemotron_llm.py`, `test_magpie_tts.py` — each
+- `test_whisper_asr.py`, `test_nemotron_llm.py`, `test_chatterbox_tts.py` — each
   of the three real models, in isolation.
 - `test_voice_pipeline.py` — the BLS orchestrator, end to end (audio in,
   audio out, one call).
@@ -64,7 +64,7 @@ they never load/unload/reload a model, so they're safe to run at any time
 without racing another agent's model changes. They were written against
 whatever behavior was actually observed on the live server at the time
 this PR was authored; if the capacity/backpressure PR changes things like
-`magpie_tts`'s instance count or adds admission-control rejection under
+`chatterbox_tts`'s instance count or adds admission-control rejection under
 load, these single-request (non-concurrent) assertions should still pass,
 but are worth rechecking once that PR lands.
 

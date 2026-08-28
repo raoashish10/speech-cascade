@@ -75,7 +75,8 @@ jupyter_core==5.9.1
 jupyterlab_widgets==3.0.17
 kaldialign==0.12.0
 kiwisolver==1.5.0
-# kokoro-onnx==0.6.1  # removed: replacing Kokoro TTS with Magpie-TTS; kokoro-onnx>=0.6.1 requires numpy>=2.0.2, conflicting with the numpy==1.26.4 pin below (TensorRT-LLM's compiled bindings need numpy 1.x)
+# kokoro-onnx==0.6.1  # removed: kokoro_tts replaced by chatterbox_tts; kokoro-onnx>=0.6.1 requires numpy>=2.0.2, conflicting with the numpy==1.26.4 pin below (TensorRT-LLM's compiled bindings need numpy 1.x)
+# chatterbox-tts is intentionally NOT listed here: its torch/torchaudio pins conflict with this venv's TensorRT-LLM stack. It runs in a separate, self-contained venv (/venv/chatterbox) that chatterbox_tts's Triton backend launches as a subprocess -- see triton_model_repo/chatterbox_tts/1/model.py. Build that venv per deploy/REBUILD.md.
 lark==1.3.1
 lazy-loader==0.5
 librosa==1.0.0

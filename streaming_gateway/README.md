@@ -110,9 +110,11 @@ what's deliberately not, for a small research/demo deployment:
   `GATEWAY_MAX_SESSIONS`, in `server.py`). The real risk on this box isn't
   abuse of the gateway process — it's every open session queuing work onto
   the *same* GPU-resident Triton models (`whisper_asr`, `nemotron_llm`,
-  `magpie_tts`) with limited VRAM headroom at steady state (the ~5.5GB
+  `chatterbox_tts`) with limited VRAM headroom at steady state (the ~5.5GB
   figure here was measured against kokoro_tts; not yet re-measured against
-  magpie_tts's different footprint). A hard
+  chatterbox_tts's different footprint — measured standalone at ~3.0-3.4GB,
+  see docs/tts-replacement-investigation.md, but not yet under this
+  gateway's own concurrent-session load). A hard
   cap on concurrent WebSocket sessions is the cheapest guard against that
   specific failure mode: past the cap, new connections are accepted (so the
   client gets a clean WS close, not a raw TCP-level failure) and

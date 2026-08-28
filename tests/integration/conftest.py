@@ -75,23 +75,23 @@ async def require_ready(grpc_client):
 @pytest_asyncio.fixture(scope="session")
 async def synth_speech(grpc_client):
     """A short real speech clip ("This is a known good test sentence.")
-    synthesized via the live magpie_tts model -- used as ASR/pipeline input
+    synthesized via the live chatterbox_tts model -- used as ASR/pipeline input
     so ASR-dependent tests exercise real speech content instead of silence
     or noise, without committing a binary audio fixture that would go stale
     against whatever voice/model version is actually deployed.
 
     Plain inference call (no reload) -- safe alongside other agents' work.
     """
-    ready = await grpc_client.is_model_ready("magpie_tts")
+    ready = await grpc_client.is_model_ready("chatterbox_tts")
     if not ready:
-        pytest.skip("magpie_tts is not READY on the live server right now")
+        pytest.skip("chatterbox_tts is not READY on the live server right now")
 
     text = "This is a known good test sentence."
     arr = np.array([[text]], dtype=object)
     inp = grpcclient.InferInput("TEXT", arr.shape, "BYTES")
     inp.set_data_from_numpy(arr)
     result = await grpc_client.infer(
-        model_name="magpie_tts",
+        model_name="chatterbox_tts",
         inputs=[inp],
         outputs=[
             grpcclient.InferRequestedOutput("AUDIO_SAMPLES"),
