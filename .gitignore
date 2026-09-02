@@ -17,3 +17,7 @@ scripts/*.log
 
 __pycache__/
 *.pyc
+
+# Ansible secrets -- only the .example templates are tracked.
+deploy/ansible/group_vars/all/vault.yml
+deploy/ansible/inventory.ini

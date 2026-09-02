@@ -1,0 +1,66 @@
+---
+# Non-secret configuration. See vault.yml.example for credentials.
+
+# -- repo / workspace layout (deploy/REBUILD.md "0. Layout recap") --
+workspace_dir: /workspace
+repo_dir: "{{ workspace_dir }}/speech-cascade"
+repo_url: https://github.com/raoashish10/speech-cascade.git
+repo_version: main
+inference_dir: "{{ workspace_dir }}/speech-cascade-inference"
+s3_bucket_uri: s3://ashish-s3-coding-bucket/speech-cascade-inference/
+
+# -- system packages (REBUILD.md step 1 / README.md "Environment quirks" #1,2,6) --
+# Toolkit-only packages, never the `cuda` metapackage — installing `cuda`
+# pulls cuda-drivers and can replace the host-injected NVIDIA driver, which
+# must stay matched to the host kernel module (see the top-level agent
+# guide's CUDA section). These are all ≤ this deployment's validated
+# CUDA 13.2 ceiling.
+apt_packages:
+  - openmpi-bin
+  - libopenmpi-dev
+  - cuda-libraries-13-2
+  - cuda-toolkit-13-2
+  - datacenter-gpu-manager-4-cuda13
+
+# -- libssl1.1 compat extraction (README.md quirk #5) --
+# Ubuntu 24.04 dropped libssl.so.1.1, which the redistributable Triton
+# server binary links against. Extracted, not installed system-wide, to
+# avoid touching the system's OpenSSL 3.
+libssl1_1_deb_url: http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+compat_libs_dir: "{{ inference_dir }}/triton_server/compat_libs"
+
+# -- python venvs (REBUILD.md step 3) --
+python_bin: python3.12
+venvs:
+  - name: main
+    path: /venv/main
+    requirements: "{{ repo_dir }}/deploy/requirements-main.txt"
+    # TensorRT-LLM's compiled bindings are built against numpy 1.x — see
+    # README.md quirk #10. This is the tripwire the runbook warns about.
+    expected_numpy_version: "1.26.4"
+  - name: gateway
+    path: /venv/gateway
+    requirements: "{{ repo_dir }}/deploy/requirements-gateway.txt"
+  - name: chatterbox
+    path: /venv/chatterbox
+    requirements: "{{ repo_dir }}/deploy/requirements-chatterbox.txt"
+
+# -- supervisor services (REBUILD.md step 6) --
+supervisor_scripts_dir: /opt/supervisor-scripts
+supervisor_confd_dir: /etc/supervisor/conf.d
+supervisor_services:
+  - gateway
+  - triton
+
+# Set true only when you've confirmed no one else is relying on the
+# currently-running speech-cascade-triton (see this dir's README's
+# "The one dangerous tag"). Safe to leave false for a genuinely fresh
+# instance where nothing is running yet.
+confirm_triton_restart: false
+
+# -- verification (REBUILD.md step 7) --
+# Integration tests need a live GPU + ~5-6 min for Triton to finish loading
+# all four models; skipped by default so a normal playbook run doesn't
+# block that long. Set true (or -e run_integration_tests=true) once you've
+# confirmed the server is READY.
+run_integration_tests: false
