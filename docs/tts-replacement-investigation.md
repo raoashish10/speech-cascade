@@ -1,11 +1,14 @@
 # TTS replacement investigation
 
 Status: **COMPLETE — recommendation reached, Task 3 integration done and
-verified** (remaining noted gaps: shortened soak test, no live Kokoro paired
-comparison — Kokoro itself is now dead on this instance, see below). See
-`/workspace/task2-tts.md` for the full brief and the "Final verdict" section
-at the bottom of this document, and "Task 3: wired into Triton" further
-down for the integration and its own composed-pipeline verification.
+verified, F5-TTS/XTTS-v2 composed-harness soak tests also done** (remaining
+noted gaps: no listening review yet for F5-TTS/XTTS-v2/IndexTTS-2.5, no
+live Kokoro paired comparison — Kokoro itself is now dead on this
+instance, see below). See `/workspace/task2-tts.md` for the full brief and
+the "Final verdict" section at the bottom of this document, "Task 3: wired
+into Triton" for the Chatterbox-Turbo production integration, and the
+"Resumed" update under Chatterbox-Turbo's own soak-test section for the
+F5-TTS/XTTS-v2 results.
 
 ## Important discrepancy — flagged, not resolved (per explicit user instruction)
 
@@ -675,9 +678,46 @@ sustained window — directly answering the brief's original concern about
 isolated vs. composed behavior diverging (the same concern that motivated
 Task 3's planned re-test in Triton).
 
-**Paused here** (per explicit instruction) before running the same
-stress test against XTTS-v2 and F5-TTS — the harness is built and working;
-resuming just means rerunning it with a different backend argument.
+**Resumed** (per explicit instruction, later session) — same harness,
+different backend argument, exactly as anticipated above. New environment
+work needed first: F5-TTS's venv already existed and worked as-is.
+XTTS-v2's did not — Coqui `TTS`'s last PyPI release (0.22.0) caps at
+Python <3.12 (this instance's system Python), so its venv needed `uv` to
+provision a 3.11 interpreter (same fix already used for IndexTTS-2.5
+above), and two further compatibility patches were needed before it would
+even smoke-test: (1) `transformers>=4.33.0` with no upper bound resolved
+to `5.16.1`, which is missing `BeamSearchScorer` that Coqui's XTTS
+stream-generator code imports directly — pinned back to `transformers==4.44.2`;
+(2) `torch>=2.6` flipped `torch.load`'s `weights_only` default to `True`,
+and Coqui's checkpoint loader doesn't opt out, so loading XTTS-v2's own
+official checkpoint failed until its config classes
+(`XttsConfig`/`XttsAudioConfig`/`XttsArgs`/`BaseDatasetConfig`) were
+explicitly registered via `torch.serialization.add_safe_globals(...)` —
+reasonable given the checkpoint is Coqui's own official release, not an
+untrusted third party. Also needed `torchcodec` installed explicitly
+(newer `torchaudio` versions no longer bundle audio I/O, delegating to it).
+
+**Full 15-minute composed-harness soak results (same harness, same
+methodology as Chatterbox-Turbo's own run above — real ASR->LLM->TTS
+chain, sustained load, concurrent background LLM pressure the whole
+time):**
+
+| | F5-TTS | XTTS-v2 |
+|---|---|---|
+| Turns completed | 863 | 980 |
+| Errors | **0** | **0** |
+| Background concurrent LLM reqs fired | 9711 | 9208 |
+| Total turn latency (steady state) | ~1.0-1.05s | ~0.8-0.97s |
+| TTS-only latency (steady state) | ~0.88-0.92s | ~0.68-0.86s |
+| GPU memory over the run | flat ~11.24-11.25GB (small ~10MB drift, in line with noise) | **flat at 12518MiB for the entire visible run — no measurable drift at all** |
+
+**Both pass cleanly** — same bar Chatterbox-Turbo already cleared (0
+errors, no leak signature, no degradation under concurrent LLM load).
+Neither candidate is now disqualified by this test; the comparison comes
+down to the axes already tracked above (license, footprint, symbol
+handling, and now — pending — human listening quality) rather than a
+stability/reliability difference, since all three are equally clean on
+that front.
 
 **Human listening feedback (partial)**: samples for all four candidates
 (basic phrase, currency/symbol test, and — for IndexTTS-2.5, F5-TTS, and
@@ -689,12 +729,19 @@ recorded in this document as of this writing. F5-TTS, XTTS-v2, and
 IndexTTS-2.5 have not yet received explicit feedback. Combined with its
 clean MIT license and passing every technical gate measured (fits
 alongside Qwen3-8B-NVFP4, ~1.26x concurrent-load degradation, well below
-the Magpie rejection threshold), **Chatterbox-Turbo is currently the
-strongest-evidenced candidate in this investigation** — the only one with
-both a fully clean technical/licensing picture and a real human quality
-signal, not just this session's own measurements. Not yet a final
-decision: XTTS-v2 and F5-TTS haven't had their own listening review, and a
-side-by-side comparison against Kokoro (the brief's original baseline)
+the Magpie rejection threshold, **plus now the real Triton composed-pipeline
+verification recorded under "Task 3" further down**), **Chatterbox-Turbo
+is currently the strongest-evidenced candidate in this investigation** —
+the only one with a fully clean technical/licensing picture, a real human
+quality signal, AND a real production integration already wired and
+soak-tested, not just this session's own isolated measurements. F5-TTS and
+XTTS-v2 have now also cleared the same full 15-minute composed-harness
+soak test cleanly (0 errors each, see table above) — so the remaining gap
+between them and Chatterbox-Turbo is no longer a stability question, it's
+that neither has (a) a listening review or (b) any Triton integration
+work. Not yet a fully closed decision: XTTS-v2 and F5-TTS still haven't had
+their own listening review, and a side-by-side comparison against Kokoro
+(the brief's original baseline)
 still hasn't happened.
 
 ## Task 3: wired into Triton (later session, per explicit instruction)
