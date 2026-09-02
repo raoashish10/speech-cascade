@@ -186,3 +186,12 @@ These are the first `qwen_llm` numbers ever recorded (no prior comparable
 `README.md`'s "Metrics and load testing" section's existing narrative and
 numbers were measured on `nemotron_llm` before this migration and are kept
 there as history, not current fact).
+
+## 4. How this compares to vLLM and SGLang serving the same checkpoint
+
+Separate from the Triton deployment above: see
+[`qwen-nvfp4-serving-backend-comparison.md`](qwen-nvfp4-serving-backend-comparison.md)
+for a controlled, isolated (single-model, idle-GPU) comparison of
+`Qwen3-8B-NVFP4` served via TensorRT-LLM, vLLM, and SGLang — including two
+real `flashinfer` SM120 (this GPU's architecture) compatibility gaps hit
+getting vLLM and SGLang working at all, and the workarounds for each.
