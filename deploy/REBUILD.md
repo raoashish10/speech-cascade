@@ -59,7 +59,16 @@ dpkg-deb -x libssl1.1_1.1.1f-1ubuntu2_amd64.deb extracted/
 
 # 6. NVIDIA DCGM (Triton links against libdcgm.so.4 for GPU metrics --
 #    this is a hard ELF dependency, not something --allow-metrics=false
-#    routes around)
+#    routes around). MUST be the real apt package -- do NOT substitute a
+#    hand dpkg-deb -x extraction of just libdcgm.so.4 the way step 5 does
+#    for libssl1.1. The real package installs a family of companion
+#    module libraries (libdcgmmodulesysmon.so.4, libdcgmmoduleprofiling.so.4,
+#    etc.) that a bare libdcgm.so.4 extraction doesn't have; without them
+#    Triton fails with a deterministic, misleading-looking crash at startup
+#    ("undefined symbol: errorString" in libtritonserver.so, downstream of
+#    a python-backend stub reporting "not healthy" first) that has nothing
+#    to do with whatever model was loading at the time. Full writeup:
+#    docs/qwen-llm-migration.md, section 1.
 apt-get install -y datacenter-gpu-manager-4-cuda13
 ```
 

@@ -381,6 +381,13 @@ python3 scripts/load_test.py --concurrency 4 --total-requests 20
 python3 scripts/load_test.py --concurrency 4 --total-requests 20 --model chatterbox_tts  # just one
 ```
 
+**The numbers and bugs below are historical, measured on `nemotron_llm`
+before the `qwen_llm` migration** — kept as-is since they document real,
+still-relevant findings about `voice_pipeline`/`whisper_asr`/batching
+behavior that isn't specific to which LLM is loaded. For `qwen_llm`'s own
+first post-migration load test results, see
+[`docs/qwen-llm-migration.md`](docs/qwen-llm-migration.md) section 3.
+
 **Two real bugs this surfaced**, both now fixed:
 
 1. **`voice_pipeline` defaulted to `instance_group.count: 1`.** Its
