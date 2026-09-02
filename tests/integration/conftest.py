@@ -107,7 +107,7 @@ async def synth_speech(grpc_client):
 
 @pytest.fixture
 def stream_infer_collect():
-    """nemotron_llm is decoupled/streaming (max_batch_size: 0) -- a plain
+    """qwen_llm is decoupled/streaming (max_batch_size: 0) -- a plain
     infer() is rejected outright ("ModelInfer RPC doesn't support models
     with decoupled transaction policy"). Returns an async helper that fires
     one stream_infer() request, drains every chunk, and concatenates

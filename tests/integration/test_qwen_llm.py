@@ -1,5 +1,5 @@
-"""Integration tests for nemotron_llm in isolation, against the live Triton
-server. nemotron_llm is decoupled/streaming (max_batch_size: 0) -- every
+"""Integration tests for qwen_llm in isolation, against the live Triton
+server. qwen_llm is decoupled/streaming (max_batch_size: 0) -- every
 call here goes through stream_infer(), never plain infer() (which Triton
 rejects outright for a decoupled model). See tests/integration/conftest.py.
 """
@@ -15,24 +15,24 @@ def _prompt_request(prompt):
     return [inp], [grpcclient.InferRequestedOutput("GENERATED_TEXT")]
 
 
-async def test_nemotron_llm_responds_to_a_real_prompt(grpc_client, require_ready, stream_infer_collect):
-    await require_ready("nemotron_llm")
+async def test_qwen_llm_responds_to_a_real_prompt(grpc_client, require_ready, stream_infer_collect):
+    await require_ready("qwen_llm")
     inputs, outputs = _prompt_request("Hello, my name is")
-    text = await stream_infer_collect(grpc_client, "nemotron_llm", inputs, outputs)
+    text = await stream_infer_collect(grpc_client, "qwen_llm", inputs, outputs)
 
     assert isinstance(text, str)
     assert text.strip() != "", "generated text should be non-empty"
 
 
-async def test_nemotron_llm_plain_infer_is_rejected(grpc_client, require_ready):
+async def test_qwen_llm_plain_infer_is_rejected(grpc_client, require_ready):
     """Documents the decoupled-model contract this whole suite (and
     scripts/load_test.py) works around: a plain unary infer() call must
     fail, not silently hang or succeed."""
-    await require_ready("nemotron_llm")
+    await require_ready("qwen_llm")
     inputs, outputs = _prompt_request("Hello")
     try:
         await grpc_client.infer(
-            model_name="nemotron_llm", inputs=inputs, outputs=outputs, client_timeout=15.0
+            model_name="qwen_llm", inputs=inputs, outputs=outputs, client_timeout=15.0
         )
     except Exception:
         return  # expected

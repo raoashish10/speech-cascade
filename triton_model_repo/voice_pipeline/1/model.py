@@ -1,4 +1,4 @@
-"""Triton BLS orchestrator: chains whisper_asr -> nemotron_llm -> chatterbox_tts
+"""Triton BLS orchestrator: chains whisper_asr -> qwen_llm -> chatterbox_tts
 into a single request/response, matching the diagram's audio-in/audio-out
 voice pipeline. Pure orchestration -- no model weights of its own, so it
 needs no GPU instance; the three models it calls each manage their own.
@@ -40,14 +40,14 @@ def _run(model_name, inputs, output_names):
 
 
 def _run_llm_decoupled(prompt_tensor):
-    """nemotron_llm is decoupled/streaming now (max_batch_size: 0, no batch
+    """qwen_llm is decoupled/streaming now (max_batch_size: 0, no batch
     dim -- unlike _run()'s callees, don't _batched() it) so a plain exec()
     doesn't work against it; exec(decoupled=True) returns an iterator of
     responses instead of one. Drain and concatenate GENERATED_TEXT chunks
     into the single string voice_pipeline's own non-streaming contract
     still promises callers."""
     request = pb_utils.InferenceRequest(
-        model_name="nemotron_llm",
+        model_name="qwen_llm",
         requested_output_names=["GENERATED_TEXT"],
         inputs=[prompt_tensor],
     )
@@ -55,7 +55,7 @@ def _run_llm_decoupled(prompt_tensor):
     for response in request.exec(decoupled=True):
         if response.has_error():
             raise pb_utils.TritonModelException(
-                f"nemotron_llm failed: {response.error().message()}"
+                f"qwen_llm failed: {response.error().message()}"
             )
         out = pb_utils.get_output_tensor_by_name(response, "GENERATED_TEXT")
         if out is None:
@@ -77,7 +77,7 @@ class TritonPythonModel:
         responses = []
         for request in requests:
             # Any of the three downstream calls below can legitimately fail
-            # under load now that whisper_asr/chatterbox_tts/nemotron_llm all
+            # under load now that whisper_asr/chatterbox_tts/qwen_llm all
             # have admission control (dynamic_batching default_queue_policy
             # REJECT / the in-flight-request counter) -- a downstream
             # rejection is an expected, everyday response under overload, not
@@ -89,7 +89,7 @@ class TritonPythonModel:
             # the "clean, fast rejection" callers should see either.
             # Catching it here and returning a plain InferenceResponse(error=...)
             # for just this request gives callers the original short message
-            # (e.g. "nemotron_llm is overloaded: ...") with no traceback
+            # (e.g. "qwen_llm is overloaded: ...") with no traceback
             # noise, while any other request in the same execute() batch is
             # unaffected.
             try:

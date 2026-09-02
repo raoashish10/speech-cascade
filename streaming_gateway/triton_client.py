@@ -1,7 +1,7 @@
 """Async Triton gRPC client wrapper for the streaming gateway.
 
 whisper_asr and chatterbox_tts keep max_batch_size > 0, so their wire shapes
-need an explicit leading batch dim. nemotron_llm is now max_batch_size: 0
+need an explicit leading batch dim. qwen_llm is now max_batch_size: 0
 and decoupled (streaming), so it takes no batch dim and uses stream_infer()
 instead of a unary infer() call.
 """
@@ -41,7 +41,7 @@ async def transcribe(audio: np.ndarray, sample_rate: int = 16000) -> str:
 
 
 async def generate_stream(prompt: str):
-    """Decoupled streaming call to nemotron_llm. Yields text_diff strings
+    """Decoupled streaming call to qwen_llm. Yields text_diff strings
     as they're produced."""
     arr = np.array([prompt.encode("utf-8")], dtype=np.object_)  # max_batch_size: 0 -- no batch dim
     inp = grpcclient.InferInput("PROMPT", arr.shape, "BYTES")
@@ -49,14 +49,14 @@ async def generate_stream(prompt: str):
 
     async def _one_request():
         yield {
-            "model_name": "nemotron_llm",
+            "model_name": "qwen_llm",
             "inputs": [inp],
             "outputs": [grpcclient.InferRequestedOutput("GENERATED_TEXT")],
         }
 
     async for result, error in get_client().stream_infer(_one_request()):
         if error is not None:
-            raise RuntimeError(f"nemotron_llm stream error: {error}")
+            raise RuntimeError(f"qwen_llm stream error: {error}")
         text = result.as_numpy("GENERATED_TEXT").flatten()[0]
         text = text.decode("utf-8") if isinstance(text, bytes) else text
         if text:

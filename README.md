@@ -42,7 +42,7 @@ supervisor-managed apps).
 
 | Model | Backend | What it wraps | Input -> Output |
 |---|---|---|---|
-| `nemotron_llm` | python | TensorRT-LLM, classic AOT-compiled engine | `PROMPT` (string) -> `GENERATED_TEXT` (string) |
+| `qwen_llm` | python | TensorRT-LLM, classic AOT-compiled engine | `PROMPT` (string) -> `GENERATED_TEXT` (string) |
 | `whisper_asr` | python | `WhisperTRTLLM` (vendored TensorRT-LLM Whisper runtime, compiled encoder+decoder engines — see `deploy/REBUILD.md` 4c; this table previously said `optimum`/ONNX Runtime, which is stale) | `AUDIO_SAMPLES` (float32[]) + optional `SAMPLE_RATE` (int32) -> `TRANSCRIPT` (string) |
 | `chatterbox_tts` | python | ResembleAI's Chatterbox-Turbo reference implementation (`ChatterboxTurboTTS`, plain PyTorch), run as a subprocess in its own isolated venv (`/venv/chatterbox`) rather than in-process — replaces the former `magpie_tts` (rejected candidate, never actually deployed) / `kokoro_tts` (dead: package uninstalled, weights removed) — see "Not yet done" | `TEXT` (string) + optional `VOICE` (string, currently ignored — single fixed reference voice) -> `AUDIO_SAMPLES` (float32[]) + `SAMPLE_RATE` (int32) |
 | `voice_pipeline` | python | Calls the three above via Triton's in-process BLS API (`pb_utils.InferenceRequest`) | `AUDIO_SAMPLES` + optional `SAMPLE_RATE`/`VOICE` -> `TRANSCRIPT`, `GENERATED_TEXT`, `AUDIO_SAMPLES`, `SAMPLE_RATE` |
@@ -132,6 +132,12 @@ GPU shared with two other models. `max_seq_len` is set by the engine's build
 config (4096 tokens).
 
 ## Why the LLM is Llama-3.1-Nemotron-Nano-4B, not Nemotron-3-Nano-4B
+
+**Superseded:** `qwen_llm` now serves `Qwen3-8B-NVFP4`, not a Nemotron
+checkpoint at all — see the model table above and `deploy/REBUILD.md`. The
+history below (including the VRAM/batching numbers further down that were
+measured against the Nemotron checkpoint) is kept as the record of how that
+choice was made and later revisited; it does not describe the current LLM.
 
 The original attempt used `nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8` (see
 `deprecated/`), a hybrid Mamba2+Transformer architecture. TensorRT-LLM can
@@ -224,7 +230,7 @@ the repository index endpoint is POST, not GET:
 curl -X POST http://localhost:18000/v2/repository/models/whisper_asr/load -d '{}'
 curl -X POST http://localhost:18000/v2/repository/models/chatterbox_tts/load -d '{}'
 curl -X POST http://localhost:18000/v2/repository/models/voice_pipeline/load -d '{}'
-# nemotron_llm reload still pays the ~5 min tensorrt_llm import cost, same as a full restart
+# qwen_llm reload still pays the ~5 min tensorrt_llm import cost, same as a full restart
 
 curl -X POST http://localhost:18000/v2/repository/index   # list loaded models + state
 ```
@@ -288,7 +294,7 @@ concurrent-session cap, and what deliberately wasn't added — are in
 
 ```bash
 # LLM
-curl -s -X POST http://localhost:18000/v2/models/nemotron_llm/infer \
+curl -s -X POST http://localhost:18000/v2/models/qwen_llm/infer \
   -H "Content-Type: application/json" \
   -d '{"inputs":[{"name":"PROMPT","shape":[1,1],"datatype":"BYTES","data":["Hello, my name is"]}]}'
 

@@ -9,13 +9,13 @@
 #     well before any client-visible failures. Thresholds below (2s warning,
 #     5s critical) sit comfortably inside that "before it's on fire" window.
 #
-#   - nemotron_llm is decoupled/streaming: its execute() returns almost
+#   - qwen_llm is decoupled/streaming: its execute() returns almost
 #     instantly after handing off to a background thread pool, so Triton's
 #     own queue/compute timers no longer reflect real generation time or
 #     real backend saturation for that model. Alerting on them would give
 #     false reassurance (the number looks healthy even when the thread pool
 #     is the bottleneck), so the queue/compute alerts below explicitly
-#     exclude nemotron_llm. Its request throughput/success-failure counts
+#     exclude qwen_llm. Its request throughput/success-failure counts
 #     are still meaningful and alertable.
 #
 #   - GPU free memory is the redline signal. nvidia-smi's advertised
@@ -36,9 +36,9 @@ groups:
       - alert: TritonQueueTimeHigh
         expr: >-
           (
-            sum by (model) (rate(nv_inference_queue_duration_us{model!="nemotron_llm"}[1m]))
+            sum by (model) (rate(nv_inference_queue_duration_us{model!="qwen_llm"}[1m]))
             /
-            clamp_min(sum by (model) (rate(nv_inference_exec_count{model!="nemotron_llm"}[1m])), 1e-9)
+            clamp_min(sum by (model) (rate(nv_inference_exec_count{model!="qwen_llm"}[1m])), 1e-9)
           ) / 1e6 > 2
         for: 30s
         labels:
@@ -61,9 +61,9 @@ groups:
       - alert: TritonQueueTimeCritical
         expr: >-
           (
-            sum by (model) (rate(nv_inference_queue_duration_us{model!="nemotron_llm"}[1m]))
+            sum by (model) (rate(nv_inference_queue_duration_us{model!="qwen_llm"}[1m]))
             /
-            clamp_min(sum by (model) (rate(nv_inference_exec_count{model!="nemotron_llm"}[1m])), 1e-9)
+            clamp_min(sum by (model) (rate(nv_inference_exec_count{model!="qwen_llm"}[1m])), 1e-9)
           ) / 1e6 > 5
         for: 30s
         labels:

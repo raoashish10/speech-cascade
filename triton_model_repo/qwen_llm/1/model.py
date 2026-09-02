@@ -1,6 +1,6 @@
-"""Triton Python backend for Llama-3.1-Nemotron-Nano-4B-v1.1 (NVFP4), served by
-loading the quantized HF checkpoint directly via TensorRT-LLM's LLM API (JIT
-graph build, classic TensorRT backend, not AutoDeploy).
+"""Triton Python backend for Qwen3-8B-NVFP4, served by loading the quantized
+HF checkpoint directly via TensorRT-LLM's LLM API (JIT graph build, classic
+TensorRT backend, not AutoDeploy).
 
 Decoupled/streaming: each request gets its own generate_async(streaming=True)
 call on a bounded thread pool, forwarding each incremental text_diff to the
@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 try:
     import numpy as np
 except Exception as e:
-    with open("/workspace/nemotron/numpy_debug.log", "w") as f:
+    with open("/workspace/qwen/numpy_debug.log", "w") as f:
         f.write(f"sys.path={sys.path}\n")
         f.write(f"sys.prefix={sys.prefix}\n")
         f.write(f"sys.base_prefix={sys.base_prefix}\n")
@@ -75,7 +75,7 @@ class TritonPythonModel:
         # a messages list to generate_async() -- keeps template rendering
         # explicit and independent of whatever TRT-LLM's own chat-template
         # handling does or doesn't do, and matches the checkpoint's actual
-        # chat_template.jinja (a standard Llama-3.1 header/eot_id format)
+        # chat_template.jinja (Qwen3's ChatML format: <|im_start|>/<|im_end|>)
         # exactly, since it's the same HF tokenizer class reading the same
         # tokenizer_config.json.
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
@@ -117,7 +117,7 @@ class TritonPythonModel:
         sender.send(
             pb_utils.InferenceResponse(
                 error=pb_utils.TritonError(
-                    f"nemotron_llm is overloaded: {MAX_ADMITTED} requests already "
+                    f"qwen_llm is overloaded: {MAX_ADMITTED} requests already "
                     "in flight or queued. Try again shortly."
                 )
             ),
@@ -135,24 +135,12 @@ class TritonPythonModel:
             # The raw ASR transcript was previously sent straight to
             # generate_async() with no chat template at all -- the model had
             # no way to tell "answer this" from "continue this sentence",
-            # and treated every prompt as free-text continuation. Measured:
-            # 8/8 realistic voice-assistant prompts hit the 256-token cap
-            # with rambling, off-topic output ("What's the capital of
-            # France" -> a multi-paragraph tangent that never says "Paris").
-            # "detailed thinking off" is this checkpoint's own documented
-            # reasoning-mode toggle (see chat_template.jinja's default
-            # system content) -- leaving it unset let the model's <think>
-            # step-by-step mode leak into every response, which is most of
-            # what was actually being generated. First attempt appended
-            # extra voice-assistant instructions into the same system
-            # message and the toggle stopped working -- <think> kept
-            # leaking into the output as literal text. The template only
-            # ever uses this exact string as the system content in its own
-            # fallback branch, so it needs to be the system message's
-            # *entire* content, verbatim, not diluted with anything else;
-            # the voice-assistant framing moved into the user turn instead.
+            # and treated every prompt as free-text continuation. Measured
+            # (on the prior Nemotron checkpoint): 8/8 realistic
+            # voice-assistant prompts hit the 256-token cap with rambling,
+            # off-topic output ("What's the capital of France" -> a
+            # multi-paragraph tangent that never says "Paris").
             messages = [
-                {"role": "system", "content": "detailed thinking off"},
                 {
                     "role": "user",
                     "content": (
@@ -162,23 +150,15 @@ class TritonPythonModel:
                     ),
                 },
             ]
-            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            # "detailed thinking off" in the system turn is this checkpoint's documented
-            # toggle for suppressing its <think>...</think> reasoning phase, but it's
-            # unreliable in practice: an empirical eval of 69 realistic voice-assistant
-            # prompts (docs/nemotron-response-quality.md) measured 32/69 (46%) still
-            # opening a visible <think> block and leaking raw reasoning text as the
-            # "spoken" response, and 68/69 (99%) hitting the max_tokens cap without a
-            # natural stop -- both consistent with the model treating "thinking off" as
-            # a soft preference it sometimes overrides, not a hard constraint. Forcing an
-            # *already-closed* empty think block into the prompt right after the
-            # generation-prompt header removes the model's ability to open one at all --
-            # the standard technique for this family of toggleable-reasoning checkpoints
-            # (same convention as DeepSeek-R1-distill/Nemotron-Nano: an empty
-            # <think>\n\n</think>\n\n immediately answered). Re-measured on the same 69
-            # prompts after this change -- see docs/nemotron-response-quality.md for the
-            # full before/after numbers.
-            prompt += "<think>\n\n</think>\n\n"
+            # enable_thinking=False is Qwen3's native reasoning-mode-off toggle:
+            # its chat_template.jinja checks this exact kwarg (not a magic system
+            # string) and, when false, appends an already-closed
+            # <think>\n\n</think>\n\n itself right after the generation-prompt
+            # header -- same effect the previous Nemotron checkpoint needed a
+            # manual prompt-string hack to achieve, done natively here instead.
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
 
             sampling_params = self.SamplingParams(
                 # Lowered from 256 after measuring: at 256, this checkpoint's rambling
@@ -218,12 +198,13 @@ class TritonPythonModel:
                 # rarer artifact where the model hallucinates a stray, unopened </think>
                 # tag mid-response (a side effect of the forced-empty-think-block fix --
                 # see docs/nemotron-response-quality.md new artifact class section).
-                # "<|eot_id|>" is the chat template real end-of-turn token, kept as
-                # belt-and-suspenders alongside whatever EOS handling generate_async()
-                # does on its own, given this engine backend has already needed
-                # workarounds for decoding quirks the PyTorch/vLLM backends do not
-                # reproduce (see repetition_penalty above).
-                stop=["<|eot_id|>", "\n\n", "</think>"],
+                # "<|im_end|>" is Qwen3's chat template end-of-turn token (its
+                # eos_token per tokenizer_config.json), kept as belt-and-suspenders
+                # alongside whatever EOS handling generate_async() does on its own,
+                # given this engine backend has already needed workarounds for
+                # decoding quirks the PyTorch/vLLM backends do not reproduce (see
+                # repetition_penalty above).
+                stop=["<|im_end|>", "\n\n", "</think>"],
             )
             result = self.llm.generate_async(prompt, sampling_params, streaming=True)
             for output in result:  # blocking sync iteration -- fine on a pool thread

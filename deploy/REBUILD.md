@@ -159,9 +159,17 @@ original FP8 engine was built with. `build_engine.sh`'s own header explains
 why the output isn't portable across GPU architectures or TensorRT-LLM
 versions -- rerun it on the target machine, don't copy the `.engine` file.
 
-### 4b. LLM, NVFP4 (currently deployed -- reconstructed script, not yet run end-to-end)
+### 4b. LLM, NVFP4 (superseded -- kept as the record of how the Nemotron NVFP4 checkpoint was built)
 
-`triton_model_repo/nemotron_llm/config.pbtxt` currently points at
+**Superseded:** the live model is now `triton_model_repo/qwen_llm/config.pbtxt`,
+pointing at `models/Qwen3-8B-NVFP4` -- a pre-quantized checkpoint pulled
+directly from Hugging Face (`raoashish10/Qwen3-8B-NVFP4`), not produced by
+the `quantize_nvfp4.py` process below. This section is kept as the record
+of how the prior Nemotron NVFP4 checkpoint was built; none of it applies to
+the current Qwen checkpoint.
+
+`triton_model_repo/nemotron_llm/config.pbtxt` (this path no longer exists;
+see above) used to point at
 `models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4` (the "full" NVFP4 variant,
 loaded dynamically via TensorRT-LLM's `LLM` API -- no `trtllm-build` AOT
 step for this path, unlike 4a). This checkpoint already exists once S3 is

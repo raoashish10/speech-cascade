@@ -52,7 +52,7 @@ app = FastAPI()
 # auth token (Caddy authenticates the connection, not the "user" -- there
 # isn't a per-user identity here). The concrete risk on this box isn't
 # abuse of the gateway process itself, it's every session queuing work
-# onto the *same* GPU-resident Triton models (whisper_asr / nemotron_llm /
+# onto the *same* GPU-resident Triton models (whisper_asr / qwen_llm /
 # chatterbox_tts) with only ~5.5GB VRAM headroom at steady state (that
 # figure was measured against kokoro_tts; not yet re-measured against
 # chatterbox_tts's own ~3.0-3.4GB footprint) -- a handful
