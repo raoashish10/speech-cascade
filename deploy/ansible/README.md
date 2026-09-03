@@ -39,8 +39,9 @@ it isn't a model.
 |---|---|
 | `playbook.yml` | The whole thing, tagged by phase (see below). |
 | `inventory.example.ini` | Copy to `inventory.ini`, point it at the fresh instance. |
-| `group_vars/all.yml` | Non-secret vars (paths, package names, version pins). |
-| `group_vars/vault.yml.example` | Template for secrets. Copy to `group_vars/vault.yml`, fill in real values, then `ansible-vault encrypt group_vars/vault.yml`. **Never commit the unencrypted file.** |
+| `group_vars/all/vars.yml` | Non-secret vars (paths, package names, version pins). |
+| `group_vars/all/vault.yml.example` | Template for secrets. Copy to `group_vars/all/vault.yml`, fill in real values, then `ansible-vault encrypt group_vars/all/vault.yml`. **Never commit the unencrypted file.** |
+| `setup.py` | Guided wizard: prompts for the target host, `build_source`, and whichever secrets that choice needs, writes `inventory.ini` + `group_vars/all/vault.yml` for you, and runs the playbook. The manual steps below are what it does under the hood — use them directly if you want more control, or aren't running this interactively. |
 
 ## Secrets this needs
 
@@ -48,15 +49,31 @@ it isn't a model.
 - A GitHub token with read access to this repo (to clone it onto the fresh instance) — skip this if you're running the playbook from a checkout that's already there, or if the instance already has SSH deploy keys set up.
 - An `HF_TOKEN` (`vault_hf_token`) — needed when `build_source: scratch`. Must be from an account that has accepted the terms of the gated `nvidia/Nemotron-Post-Training-Dataset-v2` dataset used for NVFP4 calibration, not just any token. Not needed when `build_source: s3`.
 
-None of these live in this repo. Put them in `group_vars/vault.yml` (vault-encrypted) or pass as `-e` extra-vars / environment on the `ansible-playbook` command line.
+None of these live in this repo. Put them in `group_vars/all/vault.yml` (vault-encrypted) or pass as `-e` extra-vars / environment on the `ansible-playbook` command line.
 
 ## Usage
 
+**Guided (recommended for a first run):**
+
+```bash
+python3 setup.py
+```
+
+Prompts for the target (SSH host, or "this machine"), which `build_source`
+to use, and only the secrets that choice actually needs — see "How it
+works" below. Writes `inventory.ini` and `group_vars/all/vault.yml`
+(encrypting the latter with a vault password you set on the spot), shows
+you the exact `ansible-playbook` command it's about to run, and asks for
+confirmation before running it. Re-run it any time to change your answers
+— it'll ask before overwriting existing files.
+
+**Manual (more control, or non-interactive/scripted use):**
+
 ```bash
 cp inventory.example.ini inventory.ini        # edit: point at the fresh instance's IP + mapped SSH port
-cp group_vars/vault.yml.example group_vars/vault.yml
-$EDITOR group_vars/vault.yml                  # fill in real credentials
-ansible-vault encrypt group_vars/vault.yml
+cp group_vars/all/vault.yml.example group_vars/all/vault.yml
+$EDITOR group_vars/all/vault.yml              # fill in real credentials
+ansible-vault encrypt group_vars/all/vault.yml
 
 # full rebuild, restoring pre-built engines from S3 (default, needs bucket access):
 ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass
@@ -76,6 +93,32 @@ ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass --tags verify
 
 Targeting the box you're already on (no SSH hop)? Use the bundled
 `inventory.local.ini` instead — `ansible-playbook -i inventory.local.ini playbook.yml ...`.
+
+## How `setup.py` works
+
+It only asks for what the playbook actually uses today — no placeholder
+questions about things nothing branches on (e.g. it doesn't ask which GPU
+model you have; nothing in the playbook currently varies by that). In
+order:
+
+1. **Target**: SSH host/port/user, or "this machine" (writes
+   `inventory.ini` either way — a real `[speech_cascade]` entry with
+   `ansible_host`/`ansible_port`/`ansible_user`, or the same
+   `ansible_connection=local` shortcut `inventory.local.ini` uses).
+2. **`build_source`**: `s3` or `scratch` — see above for what each means.
+3. **Secrets for that choice only**: AWS access key/secret if `s3`; an HF
+   token if `scratch` (with a reminder that it needs to have accepted the
+   gated calibration dataset's terms). Either way, an optional GitHub
+   token, skippable if the target already has this repo checked out or its
+   own GitHub auth configured.
+4. Whether to run the integration test suite once deployment finishes.
+5. A vault password, used only to encrypt this run's `group_vars/all/vault.yml`
+   — not stored anywhere by the script itself.
+
+It then prints the exact `ansible-playbook` command it's about to run and
+asks for confirmation before executing it — nothing happens without that
+final yes. Pass `--dry-run` to see the generated files and command without
+writing or running anything.
 
 ## The one dangerous tag: `supervisor`
 
