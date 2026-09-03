@@ -41,7 +41,6 @@ it isn't a model.
 | `inventory.example.ini` | Copy to `inventory.ini`, point it at the fresh instance. |
 | `group_vars/all/vars.yml` | Non-secret vars (paths, package names, version pins). |
 | `group_vars/all/vault.yml.example` | Template for secrets. Copy to `group_vars/all/vault.yml`, fill in real values, then `ansible-vault encrypt group_vars/all/vault.yml`. **Never commit the unencrypted file.** |
-| `setup.py` | Guided wizard: prompts for the target host, `build_source`, and whichever secrets that choice needs, writes `inventory.ini` + `group_vars/all/vault.yml` for you, and runs the playbook. The manual steps below are what it does under the hood — use them directly if you want more control, or aren't running this interactively. |
 
 ## Secrets this needs
 
@@ -52,22 +51,6 @@ it isn't a model.
 None of these live in this repo. Put them in `group_vars/all/vault.yml` (vault-encrypted) or pass as `-e` extra-vars / environment on the `ansible-playbook` command line.
 
 ## Usage
-
-**Guided (recommended for a first run):**
-
-```bash
-python3 setup.py
-```
-
-Prompts for the target (SSH host, or "this machine"), which `build_source`
-to use, and only the secrets that choice actually needs — see "How it
-works" below. Writes `inventory.ini` and `group_vars/all/vault.yml`
-(encrypting the latter with a vault password you set on the spot), shows
-you the exact `ansible-playbook` command it's about to run, and asks for
-confirmation before running it. Re-run it any time to change your answers
-— it'll ask before overwriting existing files.
-
-**Manual (more control, or non-interactive/scripted use):**
 
 ```bash
 cp inventory.example.ini inventory.ini        # edit: point at the fresh instance's IP + mapped SSH port
@@ -94,31 +77,76 @@ ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass --tags verify
 Targeting the box you're already on (no SSH hop)? Use the bundled
 `inventory.local.ini` instead — `ansible-playbook -i inventory.local.ini playbook.yml ...`.
 
-## How `setup.py` works
+## Walkthrough: replicating from scratch, step by step
 
-It only asks for what the playbook actually uses today — no placeholder
-questions about things nothing branches on (e.g. it doesn't ask which GPU
-model you have; nothing in the playbook currently varies by that). In
-order:
+For someone new to this project, without access to the private S3 bucket,
+end to end:
 
-1. **Target**: SSH host/port/user, or "this machine" (writes
-   `inventory.ini` either way — a real `[speech_cascade]` entry with
-   `ansible_host`/`ansible_port`/`ansible_user`, or the same
-   `ansible_connection=local` shortcut `inventory.local.ini` uses).
-2. **`build_source`**: `s3` or `scratch` — see above for what each means.
-3. **Secrets for that choice only**: AWS access key/secret if `s3`; an HF
-   token if `scratch` (with a reminder that it needs to have accepted the
-   gated calibration dataset's terms). Either way, an optional GitHub
-   token, skippable if the target already has this repo checked out or its
-   own GitHub auth configured.
-4. Whether to run the integration test suite once deployment finishes.
-5. A vault password, used only to encrypt this run's `group_vars/all/vault.yml`
-   — not stored anywhere by the script itself.
-
-It then prints the exact `ansible-playbook` command it's about to run and
-asks for confirmation before executing it — nothing happens without that
-final yes. Pass `--dry-run` to see the generated files and command without
-writing or running anything.
+1. **Provision a fresh GPU instance.** Needs to be a GPU box (this project
+   targets an RTX 5070 Ti / SM120-class card) — the playbook itself doesn't
+   provision the machine, that's outside its scope, same as REBUILD.md.
+2. **Clone this repo** onto whichever machine you're running
+   `ansible-playbook` from. The playbook separately clones it *onto the
+   target instance* in the `repo` task below, but you need a local
+   checkout first to have `deploy/ansible/` to run at all.
+3. **Set up the inventory**: copy `inventory.example.ini` to
+   `inventory.ini` and point it at the fresh instance's IP + SSH port, or
+   use the bundled `inventory.local.ini` if running directly on the box
+   (no SSH hop).
+4. **Set up secrets**: copy `group_vars/all/vault.yml.example` to
+   `group_vars/all/vault.yml`, fill in real values, then
+   `ansible-vault encrypt group_vars/all/vault.yml`. The one that actually
+   matters for a from-scratch replication is `vault_hf_token` — it must
+   come from an HF account that's accepted the terms of the gated
+   `nvidia/Nemotron-Post-Training-Dataset-v2` dataset (used for NVFP4
+   calibration), not just any token. (`vault_aws_access_key_id`/`secret`
+   are only needed for the S3 path, which a new person without bucket
+   access wouldn't be using anyway.)
+5. **Set `build_source: scratch`** — either edit `group_vars/all/vars.yml`
+   directly, or just pass `-e build_source=scratch` on the command line.
+   This is the switch that builds everything locally instead of trying to
+   `aws s3 sync` from a bucket you don't have access to.
+6. **Run it**:
+   `ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass -e build_source=scratch`.
+   From here the playbook runs through its tagged phases in order:
+   - **`repo`** — clones this git repo onto the target instance.
+   - **`packages`** — installs the system packages this project needs
+     bare-metal (MPI, CUDA 13.2 toolkit-only libs, DCGM), plus extracts the
+     `libssl1.1` compat shim Ubuntu 24.04 doesn't ship. Identical regardless
+     of `build_source`.
+   - **`s3_restore`** — skipped (since `build_source != s3`) except for a
+     debug message flagging one honest gap: the Triton server binary
+     itself has no from-scratch build path documented anywhere, so it has
+     to come from somewhere else — it isn't a model, so this playbook
+     can't conjure it.
+   - **`venvs`** — creates the three pinned Python virtual environments
+     (`main`, `gateway`, `chatterbox`) from the exact `pip freeze`
+     snapshots checked into the repo, then verifies numpy didn't silently
+     get upgraded (which would break TensorRT-LLM's compiled bindings).
+   - **`build_from_scratch`** (only runs because `build_source: scratch`):
+     1. Fails fast with a clear message if `vault_hf_token` is empty.
+     2. Installs `nvidia-modelopt[hf]` into `/venv/main`.
+     3. Runs `scripts/quantize_nvfp4.py` to produce the NVFP4-quantized LLM
+        checkpoint.
+     4. Clones the TensorRT-LLM GitHub repo (just for its Whisper example
+        scripts, which aren't shipped in the pip package).
+     5. Downloads Whisper-base's weights and assets.
+     6. Converts the Whisper checkpoint and runs the two `trtllm-build`
+        calls (encoder, then decoder) to produce its TensorRT-LLM engines.
+   - **`supervisor`** — installs and starts the gateway and Triton as
+     supervisor-managed services (refuses to touch Triton if it's already
+     running live, unless explicitly confirmed).
+   - **`verify`** — polls Triton's `/v2/repository/index` until all four
+     models report `READY`, and optionally runs the integration test suite
+     against the live server.
+7. **Wait.** This path takes real time and GPU compute (quantization +
+   calibration + two `trtllm-build` compiles), unlike the S3 path, which is
+   just a fast download.
+8. **Know it's genuinely unverified end-to-end** — the one honest caveat
+   worth repeating: these tasks are a direct translation of REBUILD.md's
+   documented commands, not a rerun-and-confirmed automation. If it breaks
+   on a first real run, that's useful signal for closing a real gap, not a
+   sign you did something wrong.
 
 ## The one dangerous tag: `supervisor`
 
@@ -145,6 +173,16 @@ The gateway service (cheap to restart) isn't guarded the same way.
 - **The Vast.ai base image itself** (Caddy, the portal, Jupyter, syncthing,
   tensorboard) — that's the image, not something this project deploys;
   nothing to automate there beyond what's already baked in.
+- **Non-Blackwell GPUs on `build_source: scratch`.** The `build_from_scratch`
+  tasks assume Blackwell-class hardware (NVFP4 needs native FP4 tensor
+  cores, which only exist from Blackwell onward — this isn't a config
+  choice, older architectures can't run it at all). If you're replicating
+  this on an older GPU, use `scripts/quantize_fp8.py` + `build_engine.sh`
+  by hand instead (REBUILD.md §4a — already scripted, GPU-generation-
+  agnostic) and point `triton_model_repo/nemotron_llm/config.pbtxt` at the
+  result yourself. Not automated here — no evidence yet that anyone's
+  actually hit this, so it isn't worth the added complexity (see the
+  git history around this doc for the reasoning) until someone does.
 
 ## The `build_from_scratch` tag is unverified end-to-end
 
