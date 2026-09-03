@@ -293,10 +293,19 @@ mkdir -p ${output_dir}/assets
 cp assets/multilingual.tiktoken assets/mel_filters.npz ${output_dir}/assets/
 ```
 
-This was NOT run to produce this repo's runbook -- it's reconstructed from
-the TensorRT-LLM example's own README plus the deployed config values,
-which match. **Verify against `tests/integration/test_whisper_asr.py`
-before trusting a from-scratch rebuild.**
+**Verified end-to-end**, `tensorrt_llm_repo_ref: v1.2.1` (matching
+`requirements-main.txt`'s pinned `tensorrt_llm==1.2.1`): every command
+above run exactly as written, with zero deviations, against a fresh
+instance with no S3 access -- `convert_checkpoint.py` completed in under a
+second, both `trtllm-build` calls (encoder ~19s, decoder ~2s on an RTX
+5070 Ti) produced working engines, and all 15 tests in
+`tests/integration` passed against them, including
+`test_whisper_asr.py`'s three tests and the full `voice_pipeline`
+end-to-end round trip. See
+[`qwen3-collapse-recheck-and-quality-eval.md`](qwen3-collapse-recheck-and-quality-eval.md)'s
+sibling doc,
+[`whisper-scratch-build-and-qwen-cold-start.md`](whisper-scratch-build-and-qwen-cold-start.md),
+for the full record.
 
 ## 5. Point config.pbtxt at the right paths
 
@@ -361,16 +370,24 @@ See `tests/README.md` for which Python environment each test tier needs.
   resulting checkpoint's tensor count/dtypes/size against the deployed one
   (963 tensors, 3.5GB, per the session report) before trusting it as a
   faithful rebuild.
-- **4c (Whisper TensorRT-LLM engines) was reconstructed from the upstream
-  example + the deployed config, not re-run end-to-end** during this PR
-  (would require a multi-GB weight download and several minutes of
-  `trtllm-build`, and risks GPU contention with the other agents' live
-  work). The values are cross-checked against the actually-deployed
-  decoder config (`max_seq_len 114` etc.) and against
-  `tests/integration/test_whisper_asr.py` passing against the live
-  server, but the *build steps themselves* are unverified on this
-  instance.
-- **`speech-cascade-triton`'s supervisor files are captured but not
-  installed live** (see step 6) -- next person to restart Triton on this
-  instance should install them then, rather than falling back to a manual
-  launch again.
+- ~~4c (Whisper TensorRT-LLM engines) was reconstructed from the upstream
+  example + the deployed config, not re-run end-to-end~~ **Closed**: run
+  end-to-end on a fresh instance with no S3 access
+  (`qwen3-collapse-recheck-and-quality-eval` branch's sibling doc,
+  `whisper-scratch-build-and-qwen-cold-start.md`) -- every command above
+  worked exactly as written, zero deviations, and all of
+  `tests/integration` (including `test_whisper_asr.py` and the full
+  `voice_pipeline` round trip) passed against the resulting engines.
+- **`speech-cascade-triton`'s supervisor script had a real bug, since
+  fixed**: `PYTHONHOME=/venv/main`, needed for the Python-backend stub's
+  own numpy/site-packages resolution at startup, is fatal to any *later*
+  plain-Python process TensorRT-LLM's MPI machinery spawns (breaks `import
+  ctypes` outright on a venv created the documented `python3.12 -m venv`
+  way -- confirmed empirically, see the doc above) and made `qwen_llm`
+  fail to load. Fixed with a targeted `os.environ.pop("PYTHONHOME", None)`
+  in `qwen_llm/1/model.py`, before the `tensorrt_llm` import (not just
+  before `_TrtLLM(...)` -- importing `tensorrt_llm` itself is what spawns
+  the MPI singleton daemon that bakes in whatever environment existed at
+  that moment). `speech-cascade-triton`'s supervisor files themselves are
+  now confirmed to work end-to-end (installed and run live on a fresh
+  instance, all four models reaching `READY`), not just captured.

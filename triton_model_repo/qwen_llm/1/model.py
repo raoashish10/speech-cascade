@@ -15,6 +15,7 @@ response instead of being handed to the pool, so a caller finds out the
 system is overloaded in milliseconds instead of after minutes of queueing."""
 
 import json
+import os
 import sys
 import threading
 import traceback
@@ -65,6 +66,28 @@ class TritonPythonModel:
         params = model_config.get("parameters", {})
         engine_dir = params["engine_dir"]["string_value"]
         tokenizer_dir = params["tokenizer_dir"]["string_value"]
+
+        # PYTHONHOME=/venv/main (set by speech-cascade-triton.sh so this
+        # stub process resolves numpy/site-packages correctly at startup --
+        # see README.md quirk #3) is fatal to any FRESH python process
+        # spawned later: importing tensorrt_llm below transitively imports
+        # mpi4py.MPI, which -- as an import side effect -- spawns an `orted`
+        # MPI singleton daemon that inherits os.environ AT IMPORT TIME and
+        # keeps that copy for its own lifetime (spawning it earlier, e.g.
+        # only before _TrtLLM's constructor runs, is too late: the daemon
+        # is already forked with the poisoned environment baked in by
+        # then). Every worker orted spawns after that inherits PYTHONHOME
+        # from it, and on a venv created the plain `python3.12 -m venv` way
+        # (REBUILD.md step 3), that breaks `import ctypes` outright
+        # (`undefined symbol: _PyErr_SetLocaleString` in _ctypes...so) in
+        # those workers -- which mpi4py needs transitively, so the MPI
+        # spawn dies and this model never loads. Must run before the
+        # tensorrt_llm import line below, not just before _TrtLLM(...).
+        # Confirmed empirically: identical `python3.12 -c "import ctypes"`
+        # fails with PYTHONHOME=/venv/main set, succeeds without it; this
+        # process's own already-running interpreter is unaffected by
+        # popping it now (PYTHONHOME only matters at process startup).
+        os.environ.pop("PYTHONHOME", None)
 
         from tensorrt_llm.llmapi.llm import _TrtLLM
         from tensorrt_llm import SamplingParams
