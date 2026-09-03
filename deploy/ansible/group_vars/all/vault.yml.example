@@ -17,7 +17,9 @@ vault_aws_secret_access_key: "REPLACE_ME"
 # GitHub configured.
 vault_github_token: "REPLACE_ME"
 
-# Only needed for REBUILD.md §4b (NVFP4 requantization from scratch),
-# which this playbook does not automate — see this dir's README. Leave
-# blank unless you're running that step by hand.
+# Needed when build_source: scratch (see all/vars.yml) — REBUILD.md §4b's
+# NVFP4 calibration set includes a gated HF dataset
+# (nvidia/Nemotron-Post-Training-Dataset-v2), so this must be a token from
+# an account that has accepted that dataset's terms, not just any token.
+# Leave blank if build_source stays at the default "s3".
 vault_hf_token: ""
