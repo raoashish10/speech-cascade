@@ -1,0 +1,100 @@
+---
+# Non-secret configuration. See vault.yml.example for credentials.
+
+# -- repo / workspace layout (deploy/REBUILD.md "0. Layout recap") --
+workspace_dir: /workspace
+repo_dir: "{{ workspace_dir }}/speech-cascade"
+repo_url: https://github.com/raoashish10/speech-cascade.git
+repo_version: main
+inference_dir: "{{ workspace_dir }}/speech-cascade-inference"
+s3_bucket_uri: s3://ashish-s3-coding-bucket/speech-cascade-inference/
+
+# -- system packages (REBUILD.md step 1 / README.md "Environment quirks" #1,2,6) --
+# Toolkit-only packages, never the `cuda` metapackage — installing `cuda`
+# pulls cuda-drivers and can replace the host-injected NVIDIA driver, which
+# must stay matched to the host kernel module (see the top-level agent
+# guide's CUDA section). These are all ≤ this deployment's validated
+# CUDA 13.2 ceiling.
+apt_packages:
+  - openmpi-bin
+  - libopenmpi-dev
+  - cuda-libraries-13-2
+  - cuda-toolkit-13-2
+  - datacenter-gpu-manager-4-cuda13
+
+# -- libssl1.1 compat extraction (README.md quirk #5) --
+# Ubuntu 24.04 dropped libssl.so.1.1, which the redistributable Triton
+# server binary links against. Extracted, not installed system-wide, to
+# avoid touching the system's OpenSSL 3.
+libssl1_1_deb_url: http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+compat_libs_dir: "{{ inference_dir }}/triton_server/compat_libs"
+
+# -- python venvs (REBUILD.md step 3) --
+python_bin: python3.12
+venvs:
+  - name: main
+    path: /venv/main
+    requirements: "{{ repo_dir }}/deploy/requirements-main.txt"
+    # TensorRT-LLM's compiled bindings are built against numpy 1.x — see
+    # README.md quirk #10. This is the tripwire the runbook warns about.
+    expected_numpy_version: "1.26.4"
+  - name: gateway
+    path: /venv/gateway
+    requirements: "{{ repo_dir }}/deploy/requirements-gateway.txt"
+  - name: chatterbox
+    path: /venv/chatterbox
+    requirements: "{{ repo_dir }}/deploy/requirements-chatterbox.txt"
+
+# -- step 4: compiled engines, from-scratch alternative to S3 restore --
+# "s3" (default, unchanged behavior) restores pre-built checkpoints/engines
+# from the bucket in s3_bucket_uri above -- fast, but only usable by
+# someone with access to that private bucket, and only reproduces working
+# engines on hardware matching the exact GPU architecture/TensorRT-LLM
+# version they were originally built with (see scripts/build_engine.sh's
+# own header on why compiled engines aren't portable). "scratch" instead
+# runs the quantization/build steps documented in REBUILD.md section 4 on
+# the target instance itself, so someone replicating this project without
+# bucket access still ends up with a working deployment on their own GPU.
+build_source: s3
+
+# LLM, NVFP4 (REBUILD.md 4b). Output path scripts/quantize_nvfp4.py writes
+# to -- matches what triton_model_repo/nemotron_llm/config.pbtxt's
+# engine_dir/tokenizer_dir parameters expect. No separate trtllm-build step
+# for this checkpoint: TensorRT-LLM's LLM API JIT-compiles it the first
+# time Triton loads the model (~14.5GB transient host-RAM peak during that
+# JIT build, per the qwen-llm-migration branch's finding -- this is why
+# models load sequentially, not in parallel, at Triton startup).
+modelopt_version: "0.46.0"
+nvfp4_export_dir: "{{ inference_dir }}/models/Llama-3.1-Nemotron-Nano-4B-v1.1-NVFP4"
+
+# Whisper ASR, TensorRT-LLM engines (REBUILD.md 4c). tensorrt_llm_repo_ref
+# should track requirements-main.txt's pinned tensorrt_llm==1.2.1, but the
+# actual GitHub tag naming was NOT independently confirmed (REBUILD.md 4c
+# itself is reconstructed from the upstream example, not re-run end-to-end
+# on this instance -- this playbook task inherits that same "unverified"
+# status; see this dir's README before trusting a from-scratch run).
+tensorrt_llm_repo_ref: v1.2.1
+tensorrt_llm_repo_dir: "{{ workspace_dir }}/tensorrt_llm_repo"
+whisper_trtllm_checkpoint_dir: "{{ workspace_dir }}/whisper_base_weights"
+whisper_trtllm_output_dir: "{{ inference_dir }}/models/whisper-base-trtllm"
+whisper_max_batch_size: 8
+
+# -- supervisor services (REBUILD.md step 6) --
+supervisor_scripts_dir: /opt/supervisor-scripts
+supervisor_confd_dir: /etc/supervisor/conf.d
+supervisor_services:
+  - gateway
+  - triton
+
+# Set true only when you've confirmed no one else is relying on the
+# currently-running speech-cascade-triton (see this dir's README's
+# "The one dangerous tag"). Safe to leave false for a genuinely fresh
+# instance where nothing is running yet.
+confirm_triton_restart: false
+
+# -- verification (REBUILD.md step 7) --
+# Integration tests need a live GPU + ~5-6 min for Triton to finish loading
+# all four models; skipped by default so a normal playbook run doesn't
+# block that long. Set true (or -e run_integration_tests=true) once you've
+# confirmed the server is READY.
+run_integration_tests: false

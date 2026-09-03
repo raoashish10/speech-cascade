@@ -1,0 +1,25 @@
+---
+# Copy this file to vault.yml, fill in real values, then:
+#   ansible-vault encrypt group_vars/vault.yml
+# NEVER commit an unencrypted vault.yml (it's in .gitignore, but double
+# check `git status` before pushing anyway).
+
+# AWS credentials with read access to the S3 bucket in all.yml's
+# s3_bucket_uri. Scope these to read-only on that one bucket if you can —
+# the playbook only ever runs `aws s3 sync` (read), never writes.
+vault_aws_access_key_id: "REPLACE_ME"
+vault_aws_secret_access_key: "REPLACE_ME"
+
+# GitHub token with read access to raoashish10/speech-cascade, used only
+# to clone the repo onto a fresh instance that doesn't already have it
+# checked out. Leave as-is (unused) if repo_dir already exists on the
+# target, or if the target already has its own deploy key / SSH auth for
+# GitHub configured.
+vault_github_token: "REPLACE_ME"
+
+# Needed when build_source: scratch (see all/vars.yml) — REBUILD.md §4b's
+# NVFP4 calibration set includes a gated HF dataset
+# (nvidia/Nemotron-Post-Training-Dataset-v2), so this must be a token from
+# an account that has accepted that dataset's terms, not just any token.
+# Leave blank if build_source stays at the default "s3".
+vault_hf_token: ""

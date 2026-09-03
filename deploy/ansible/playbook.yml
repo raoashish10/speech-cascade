@@ -1,0 +1,390 @@
+---
+# Automates deploy/REBUILD.md, steps 1/2/3/6, plus optionally step 4
+# (build_source: scratch — see group_vars/all/vars.yml). See this dir's
+# README.md for what's still deliberately left out (the monitoring stack),
+# the from-scratch path's "unverified end-to-end" caveat, and the safety
+# guard on the `supervisor` tag.
+
+- name: Rebuild speech-cascade deployment
+  hosts: speech_cascade
+  become: true
+
+  tasks:
+    # ---------------------------------------------------------------
+    # Step 0 (REBUILD.md "Layout recap"): the git-tracked repo itself.
+    # Not part of REBUILD.md's numbered steps (it says "clone that
+    # separately in the normal way") but needed before later steps can
+    # reference deploy/requirements-*.txt and deploy/supervisor/*.
+    # ---------------------------------------------------------------
+    - name: Check whether the repo is already checked out
+      ansible.builtin.stat:
+        path: "{{ repo_dir }}/.git"
+      register: repo_git_dir
+      tags: [repo]
+
+    - name: Clone speech-cascade
+      ansible.builtin.git:
+        repo: >-
+          {{ repo_url | regex_replace('^https://', 'https://' + vault_github_token + '@')
+             if vault_github_token | default('') else repo_url }}
+        dest: "{{ repo_dir }}"
+        version: "{{ repo_version }}"
+      when: not repo_git_dir.stat.exists
+      tags: [repo]
+
+    - name: Scrub the token back out of origin's URL (it's only needed for the initial clone)
+      ansible.builtin.command:
+        cmd: "git remote set-url origin {{ repo_url }}"
+        chdir: "{{ repo_dir }}"
+      when:
+        - not repo_git_dir.stat.exists
+        - vault_github_token | default('')
+      changed_when: true
+      tags: [repo]
+
+    # ---------------------------------------------------------------
+    # Step 1: system packages (REBUILD.md step 1 / README.md quirks #1,2,6)
+    # ---------------------------------------------------------------
+    - name: Install system packages (MPI, CUDA 13.2 toolkit-only libs, DCGM)
+      ansible.builtin.apt:
+        name: "{{ apt_packages }}"
+        state: present
+        update_cache: true
+      tags: [packages]
+
+    # ---------------------------------------------------------------
+    # libssl1.1 compat extraction (README.md quirk #5). Extracted only —
+    # never installed system-wide, so system OpenSSL 3 is untouched.
+    # ---------------------------------------------------------------
+    - name: Ensure compat_libs directory exists
+      ansible.builtin.file:
+        path: "{{ compat_libs_dir }}"
+        state: directory
+        mode: "0755"
+      tags: [packages]
+
+    - name: Download libssl1.1 .deb (Ubuntu 20.04 build, extracted not installed)
+      ansible.builtin.get_url:
+        url: "{{ libssl1_1_deb_url }}"
+        dest: "{{ compat_libs_dir }}/libssl1.1_1.1.1f-1ubuntu2_amd64.deb"
+        mode: "0644"
+      tags: [packages]
+
+    - name: Extract libssl1.1 .so files (dpkg-deb -x, not dpkg -i)
+      ansible.builtin.command:
+        cmd: dpkg-deb -x libssl1.1_1.1.1f-1ubuntu2_amd64.deb extracted
+        chdir: "{{ compat_libs_dir }}"
+        creates: "{{ compat_libs_dir }}/extracted/usr/lib/x86_64-linux-gnu/libssl.so.1.1"
+      tags: [packages]
+
+    # ---------------------------------------------------------------
+    # Step 2: restore weights/engines/Triton binary from S3.
+    # This is a READ-ONLY sync from the bucket — the playbook never
+    # writes back to it. Only runs when build_source: s3 (the default) —
+    # see group_vars/all/vars.yml. The Triton server binary + compat_libs
+    # only ever come from here regardless of build_source; there's no
+    # from-scratch path for those, they're not models.
+    # ---------------------------------------------------------------
+    - name: Restore models, compiled engines, and the Triton binary from S3
+      ansible.builtin.command:
+        cmd: >-
+          aws s3 sync {{ s3_bucket_uri }} {{ inference_dir }}/
+        environment:
+          AWS_ACCESS_KEY_ID: "{{ vault_aws_access_key_id }}"
+          AWS_SECRET_ACCESS_KEY: "{{ vault_aws_secret_access_key }}"
+      when: build_source == 's3'
+      changed_when: true
+      tags: [s3_restore]
+
+    - name: build_source is 'scratch' — S3 restore skipped, engines built below after venvs are ready
+      ansible.builtin.debug:
+        msg: >-
+          Skipping S3 restore (build_source=scratch). This still needs
+          triton_server/extracted/ and triton_server/compat_libs/ (the
+          Triton binary itself, not a model) to exist on this host some
+          other way — REBUILD.md doesn't document building those from
+          scratch, only restoring them. See this dir's README.
+      when: build_source != 's3'
+      tags: [s3_restore]
+
+    # ---------------------------------------------------------------
+    # Step 3: three isolated venvs, exact pinned versions (not latest).
+    # ---------------------------------------------------------------
+    - name: "Create venv: {{ item.name }}"
+      ansible.builtin.command:
+        cmd: "{{ python_bin }} -m venv {{ item.path }}"
+        creates: "{{ item.path }}/bin/python"
+      loop: "{{ venvs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [venvs]
+
+    - name: "Install pinned requirements: {{ item.name }}"
+      ansible.builtin.pip:
+        requirements: "{{ item.requirements }}"
+        virtualenv: "{{ item.path }}"
+        virtualenv_command: "{{ python_bin }} -m venv"
+      loop: "{{ venvs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [venvs]
+
+    - name: Verify /venv/main's numpy pin held (README.md quirk #10)
+      ansible.builtin.command:
+        cmd: "{{ item.path }}/bin/python -c 'import numpy; print(numpy.__version__)'"
+      register: numpy_check
+      changed_when: false
+      loop: "{{ venvs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.expected_numpy_version is defined
+      tags: [venvs]
+
+    - name: Fail if numpy silently upgraded (breaks TensorRT-LLM's compiled bindings)
+      ansible.builtin.fail:
+        msg: >-
+          {{ item.item.name }}'s numpy is {{ item.stdout }}, expected
+          {{ item.item.expected_numpy_version }}. Something in
+          requirements-main.txt (or install order) upgraded it — see
+          README.md quirk #10 before proceeding.
+      when:
+        - item.item.expected_numpy_version is defined
+        - (item.stdout | default('')) != item.item.expected_numpy_version
+      loop: "{{ numpy_check.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      tags: [venvs]
+
+    # ---------------------------------------------------------------
+    # Step 4 (REBUILD.md "Compiled artifacts"): build engines from scratch
+    # instead of restoring from S3. Only runs when build_source: scratch —
+    # see group_vars/all/vars.yml for why you'd choose this (mainly: you're
+    # a new person replicating this project without access to the private
+    # S3 bucket). Needs /venv/main from the step above, so this has to run
+    # after the venvs block, not before it like the S3 restore does.
+    #
+    # UNVERIFIED END-TO-END, same caveat REBUILD.md itself gives 4b/4c:
+    # this is a direct translation of those sections' documented commands,
+    # not a rerun-and-confirmed automation. Treat a first run of this on
+    # real hardware as the actual verification, not this playbook's
+    # existence. See this dir's README.
+    # ---------------------------------------------------------------
+    - name: Fail fast if build_source=scratch but no HF token is set
+      ansible.builtin.fail:
+        msg: >-
+          build_source is 'scratch' but vault_hf_token is empty. The NVFP4
+          calibration set includes a gated HF dataset
+          (nvidia/Nemotron-Post-Training-Dataset-v2) — you need a token
+          from an account that has accepted its terms. See
+          group_vars/vault.yml.example.
+      when:
+        - build_source == 'scratch'
+        - not vault_hf_token | default('')
+      tags: [build_from_scratch]
+
+    - name: "Install nvidia-modelopt into /venv/main (REBUILD.md 4b)"
+      ansible.builtin.pip:
+        name: "nvidia-modelopt[hf]=={{ modelopt_version }}"
+        virtualenv: /venv/main
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: "Quantize the LLM to NVFP4 (scripts/quantize_nvfp4.py)"
+      ansible.builtin.command:
+        cmd: >-
+          /venv/main/bin/python scripts/quantize_nvfp4.py
+          --hf-token {{ vault_hf_token }}
+          --export-dir {{ nvfp4_export_dir }}
+        chdir: "{{ repo_dir }}"
+        creates: "{{ nvfp4_export_dir }}"
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: "Clone tensorrt_llm source (only needed for its Whisper example scripts, not importable from the pip package)"
+      ansible.builtin.git:
+        repo: https://github.com/NVIDIA/TensorRT-LLM.git
+        dest: "{{ tensorrt_llm_repo_dir }}"
+        version: "{{ tensorrt_llm_repo_ref }}"
+        depth: 1
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: Ensure Whisper checkpoint/assets working dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ tensorrt_llm_repo_dir }}/examples/models/core/whisper/assets"
+        - "{{ whisper_trtllm_output_dir }}/assets"
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: Download Whisper-base assets and weights (REBUILD.md 4c)
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ tensorrt_llm_repo_dir }}/examples/models/core/whisper/assets/{{ item.name }}"
+        mode: "0644"
+      loop:
+        - name: multilingual.tiktoken
+          url: https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/multilingual.tiktoken
+        - name: mel_filters.npz
+          url: https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz
+        - name: base.pt
+          url: https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt
+      loop_control:
+        label: "{{ item.name }}"
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: Convert Whisper-base weights to a TensorRT-LLM checkpoint
+      ansible.builtin.command:
+        cmd: >-
+          /venv/main/bin/python convert_checkpoint.py
+          --output_dir {{ whisper_trtllm_checkpoint_dir }}
+          --model_name base
+        chdir: "{{ tensorrt_llm_repo_dir }}/examples/models/core/whisper"
+        creates: "{{ whisper_trtllm_checkpoint_dir }}"
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: Build the Whisper encoder engine
+      ansible.builtin.command:
+        cmd: >-
+          /venv/main/bin/trtllm-build
+          --checkpoint_dir {{ whisper_trtllm_checkpoint_dir }}/encoder
+          --output_dir {{ whisper_trtllm_output_dir }}/encoder
+          --moe_plugin disable
+          --max_batch_size {{ whisper_max_batch_size }}
+          --gemm_plugin disable
+          --bert_attention_plugin float16
+          --max_input_len 3000 --max_seq_len=3000
+        creates: "{{ whisper_trtllm_output_dir }}/encoder"
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: Build the Whisper decoder engine
+      ansible.builtin.command:
+        cmd: >-
+          /venv/main/bin/trtllm-build
+          --checkpoint_dir {{ whisper_trtllm_checkpoint_dir }}/decoder
+          --output_dir {{ whisper_trtllm_output_dir }}/decoder
+          --moe_plugin disable
+          --max_beam_width 4
+          --max_batch_size {{ whisper_max_batch_size }}
+          --max_seq_len 114
+          --max_input_len 14
+          --max_encoder_input_len 3000
+          --gemm_plugin float16
+          --bert_attention_plugin float16
+          --gpt_attention_plugin float16
+        creates: "{{ whisper_trtllm_output_dir }}/decoder"
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    - name: Copy Whisper assets (mel filterbank + tokenizer vocab) next to the built engines
+      ansible.builtin.copy:
+        src: "{{ tensorrt_llm_repo_dir }}/examples/models/core/whisper/assets/{{ item }}"
+        dest: "{{ whisper_trtllm_output_dir }}/assets/{{ item }}"
+        mode: "0644"
+        remote_src: true
+      loop:
+        - multilingual.tiktoken
+        - mel_filters.npz
+      when: build_source == 'scratch'
+      tags: [build_from_scratch]
+
+    # ---------------------------------------------------------------
+    # Step 6: supervisor services.
+    # ---------------------------------------------------------------
+    - name: Check current state of speech-cascade-triton before touching it
+      ansible.builtin.command: supervisorctl status speech-cascade-triton
+      register: triton_status
+      changed_when: false
+      failed_when: false
+      tags: [supervisor]
+
+    - name: Refuse to install/restart speech-cascade-triton while it's already running
+      ansible.builtin.fail:
+        msg: >-
+          speech-cascade-triton is already RUNNING on this host. Restarting
+          it duplicates GPU model loads and fights over ports 18000-18002 —
+          see this dir's README's "The one dangerous tag". If you've
+          confirmed nothing else depends on the current process, re-run
+          with -e confirm_triton_restart=true.
+      when:
+        - "'RUNNING' in triton_status.stdout"
+        - not confirm_triton_restart
+      tags: [supervisor]
+
+    - name: Install supervisor wrapper scripts
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/deploy/supervisor/speech-cascade-{{ item }}.sh"
+        dest: "{{ supervisor_scripts_dir }}/speech-cascade-{{ item }}.sh"
+        mode: "0755"
+        remote_src: true
+      loop: "{{ supervisor_services }}"
+      tags: [supervisor]
+
+    - name: Install supervisor conf.d entries
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/deploy/supervisor/speech-cascade-{{ item }}.conf"
+        dest: "{{ supervisor_confd_dir }}/speech-cascade-{{ item }}.conf"
+        mode: "0644"
+        remote_src: true
+      loop: "{{ supervisor_services }}"
+      tags: [supervisor]
+
+    - name: supervisorctl reread
+      ansible.builtin.command: supervisorctl reread
+      changed_when: true
+      tags: [supervisor]
+
+    - name: supervisorctl update
+      ansible.builtin.command: supervisorctl update
+      changed_when: true
+      tags: [supervisor]
+
+    # ---------------------------------------------------------------
+    # Step 7: verify. Triton takes ~5-6 min to become READY (TensorRT-LLM
+    # import + engine load) — poll rather than assuming it's instant.
+    # ---------------------------------------------------------------
+    - name: Wait for Triton's repository index endpoint to respond
+      ansible.builtin.uri:
+        url: http://localhost:18000/v2/repository/index
+        method: POST
+        status_code: 200
+      register: repo_index
+      until: repo_index.status == 200
+      retries: 40
+      delay: 15
+      tags: [verify]
+
+    - name: Show model load state
+      ansible.builtin.debug:
+        msg: "{{ repo_index.json }}"
+      tags: [verify]
+
+    - name: Fail if any model isn't READY
+      ansible.builtin.fail:
+        msg: "Model {{ item.name }} is in state {{ item.state }}, not READY."
+      loop: "{{ repo_index.json }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.state is defined and item.state != "READY"
+      tags: [verify]
+
+    - name: Run integration tests (needs live GPU server, ~several minutes)
+      ansible.builtin.command:
+        cmd: /venv/main/bin/python -m pytest tests/integration -v
+        chdir: "{{ repo_dir }}"
+      register: integration_tests
+      changed_when: false
+      when: run_integration_tests | bool
+      tags: [verify, integration_tests]
+
+    - name: Show integration test output
+      ansible.builtin.debug:
+        var: integration_tests.stdout_lines
+      when: run_integration_tests | bool
+      tags: [verify, integration_tests]
