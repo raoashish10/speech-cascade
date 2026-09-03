@@ -1,7 +1,7 @@
 # Monitoring and alerting
 
 Grafana dashboard + Prometheus alerting for the 4-model Triton pipeline
-(`nemotron_llm`, `whisper_asr`, `chatterbox_tts`, `voice_pipeline`) on this
+(`qwen_llm`, `whisper_asr`, `chatterbox_tts`, `voice_pipeline`) on this
 single-GPU box. Everything here is grounded in this session's actual
 load-testing data (`reports/session-report.md`), not generic defaults.
 
@@ -25,17 +25,17 @@ load-testing data (`reports/session-report.md`), not generic defaults.
 
 10 panels: a "read me first" text panel, per-model exec throughput,
 request failures/sec, queue time and compute time per model (both
-**excluding `nemotron_llm`** — see below for why), `nemotron_llm`
+**excluding `qwen_llm`** — see below for why), `qwen_llm`
 throughput on its own panel, GPU utilization, model READY state, GPU
 memory used-vs-free, and a GPU free-memory redline gauge.
 
-## Why `nemotron_llm` is excluded from queue/compute panels and alerts
+## Why `qwen_llm` is excluded from queue/compute panels and alerts
 
-`nemotron_llm` is decoupled/streaming: its `execute()` returns almost
+`qwen_llm` is decoupled/streaming: its `execute()` returns almost
 instantly after handing the request to a background thread pool, so
 Triton's own per-exec queue/compute duration timers no longer capture
 real generation time or real backend saturation for it. Charting or
-alerting on those two metrics for `nemotron_llm` would show a healthy
+alerting on those two metrics for `qwen_llm` would show a healthy
 number even when its thread pool is the actual bottleneck — worse than
 no signal, a *misleading* one. Its request throughput and failure counts
 are still real and are charted normally.
@@ -50,7 +50,7 @@ webhook via `ALERT_WEBHOOK_URL` in `.env`).
 
 | Alert | Fires when | What it means | What to do |
 |---|---|---|---|
-| `TritonQueueTimeHigh` | avg queue time > 2s for 30s, any model except `nemotron_llm` | Early warning — this session's load test showed queue time near 0ms up to concurrency 4, crossing 2s only once a stage started saturating, well before client-visible failures | Check the dashboard's queue-time panel to see which stage. If load is expected, consider `instance_group.count` or batching for that model. If not, look for a stuck downstream call or a competing GPU process |
+| `TritonQueueTimeHigh` | avg queue time > 2s for 30s, any model except `qwen_llm` | Early warning — this session's load test showed queue time near 0ms up to concurrency 4, crossing 2s only once a stage started saturating, well before client-visible failures | Check the dashboard's queue-time panel to see which stage. If load is expected, consider `instance_group.count` or batching for that model. If not, look for a stuck downstream call or a competing GPU process |
 | `TritonQueueTimeCritical` | avg queue time > 5s for 30s | In this session's testing, 5s+ queue time reliably preceded client-visible failures as concurrency climbed further | Active degradation — shed load if you control the client. Don't reload/unload a model to try to fix this without checking whether another session already owns in-progress model changes |
 | `GPUFreeMemoryLow` | free VRAM < 2GiB for 30s | Steady-state with all 4 models loaded normally leaves ~5.5GB free; this suggests real memory pressure building | `nvidia-smi` to see what's using it. Don't start a model reload yourself while free memory is already this tight |
 | `GPUFreeMemoryCritical` | free VRAM < 1GiB for 15s | The one real OOM this session happened with free memory at 26-424MB during a model *reload* (not steady request load) — this gives real advance warning | Immediate attention. If a load/reload is already in progress, let it finish or fail rather than adding more GPU load |

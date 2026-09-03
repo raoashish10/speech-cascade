@@ -109,7 +109,7 @@ what's deliberately not, for a small research/demo deployment:
 - **Concurrent-session cap** (`MAX_CONCURRENT_SESSIONS`, default 4, env
   `GATEWAY_MAX_SESSIONS`, in `server.py`). The real risk on this box isn't
   abuse of the gateway process — it's every open session queuing work onto
-  the *same* GPU-resident Triton models (`whisper_asr`, `nemotron_llm`,
+  the *same* GPU-resident Triton models (`whisper_asr`, `qwen_llm`,
   `chatterbox_tts`) with limited VRAM headroom at steady state (the ~5.5GB
   figure here was measured against kokoro_tts; not yet re-measured against
   chatterbox_tts's different footprint — measured standalone at ~3.0-3.4GB,

@@ -17,7 +17,7 @@
       "gridPos": { "x": 0, "y": 0, "w": 24, "h": 5 },
       "options": {
         "mode": "markdown",
-        "content": "**nemotron_llm caveat:** it's decoupled/streaming -- `execute()` hands off to a background thread pool and returns almost instantly, so Triton's own per-exec queue/compute timers no longer reflect real generation time or real backend load for this model. The *Queue time* and *Compute time* panels below deliberately **exclude nemotron_llm** for that reason (a low number there would look healthy while actually being meaningless). Its request throughput is still valid and shown separately.\n\n**GPU free memory caveat:** nvidia-smi/NVML advertise `memory.total` as 16303MiB, but `memory.used + memory.free` only ever summed to ~15843MiB in practice on this box (a ~460MiB reserved gap). All free-memory panels/alerts here subtract `used` from the empirically observed **15843MiB ceiling**, not the advertised total -- computing free memory the naive way overstates real headroom by ~460MiB."
+        "content": "**qwen_llm caveat:** it's decoupled/streaming -- `execute()` hands off to a background thread pool and returns almost instantly, so Triton's own per-exec queue/compute timers no longer reflect real generation time or real backend load for this model. The *Queue time* and *Compute time* panels below deliberately **exclude qwen_llm** for that reason (a low number there would look healthy while actually being meaningless). Its request throughput is still valid and shown separately.\n\n**GPU free memory caveat:** nvidia-smi/NVML advertise `memory.total` as 16303MiB, but `memory.used + memory.free` only ever summed to ~15843MiB in practice on this box (a ~460MiB reserved gap). All free-memory panels/alerts here subtract `used` from the empirically observed **15843MiB ceiling**, not the advertised total -- computing free memory the naive way overstates real headroom by ~460MiB."
       }
     },
     {
@@ -65,8 +65,8 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Queue time per model, ms (excludes nemotron_llm)",
-      "description": "Avg time a request waits in Triton's scheduling queue before execution. Earliest clean saturation signal seen this session -- stayed ~0ms through concurrency 4, hit 7.5s at concurrency 8, 22.2s at concurrency 16, well before failures. nemotron_llm excluded -- see Read Me First panel.",
+      "title": "Queue time per model, ms (excludes qwen_llm)",
+      "description": "Avg time a request waits in Triton's scheduling queue before execution. Earliest clean saturation signal seen this session -- stayed ~0ms through concurrency 4, hit 7.5s at concurrency 8, 22.2s at concurrency 16, well before failures. qwen_llm excluded -- see Read Me First panel.",
       "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
       "gridPos": { "x": 0, "y": 13, "w": 12, "h": 8 },
       "fieldConfig": {
@@ -82,7 +82,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
-          "expr": "(sum by (model) (rate(nv_inference_queue_duration_us{model!=\"nemotron_llm\"}[1m])) / clamp_min(sum by (model) (rate(nv_inference_exec_count{model!=\"nemotron_llm\"}[1m])), 1e-9)) / 1000",
+          "expr": "(sum by (model) (rate(nv_inference_queue_duration_us{model!=\"qwen_llm\"}[1m])) / clamp_min(sum by (model) (rate(nv_inference_exec_count{model!=\"qwen_llm\"}[1m])), 1e-9)) / 1000",
           "legendFormat": "{{model}}"
         }
       ]
@@ -90,8 +90,8 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Compute time per model, ms (excludes nemotron_llm)",
-      "description": "Avg per-exec compute (inference) duration Triton reports. nemotron_llm excluded -- its execute() returns almost instantly (decoupled/streaming), so this number would not reflect real generation time. See Read Me First panel.",
+      "title": "Compute time per model, ms (excludes qwen_llm)",
+      "description": "Avg per-exec compute (inference) duration Triton reports. qwen_llm excluded -- its execute() returns almost instantly (decoupled/streaming), so this number would not reflect real generation time. See Read Me First panel.",
       "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
       "gridPos": { "x": 12, "y": 13, "w": 12, "h": 8 },
       "fieldConfig": {
@@ -103,7 +103,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
-          "expr": "(sum by (model) (rate(nv_inference_compute_infer_duration_us{model!=\"nemotron_llm\"}[1m])) / clamp_min(sum by (model) (rate(nv_inference_exec_count{model!=\"nemotron_llm\"}[1m])), 1e-9)) / 1000",
+          "expr": "(sum by (model) (rate(nv_inference_compute_infer_duration_us{model!=\"qwen_llm\"}[1m])) / clamp_min(sum by (model) (rate(nv_inference_exec_count{model!=\"qwen_llm\"}[1m])), 1e-9)) / 1000",
           "legendFormat": "{{model}}"
         }
       ]
@@ -111,8 +111,8 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "nemotron_llm throughput only",
-      "description": "nemotron_llm's queue/compute timers aren't meaningful (see Read Me First) -- exec throughput is the one metric still worth watching for this model here.",
+      "title": "qwen_llm throughput only",
+      "description": "qwen_llm's queue/compute timers aren't meaningful (see Read Me First) -- exec throughput is the one metric still worth watching for this model here.",
       "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
       "gridPos": { "x": 0, "y": 21, "w": 8, "h": 7 },
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
@@ -121,8 +121,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus-triton" },
-          "expr": "sum(rate(nv_inference_exec_count{model=\"nemotron_llm\"}[1m]))",
-          "legendFormat": "nemotron_llm execs/sec"
+          "expr": "sum(rate(nv_inference_exec_count{model=\"qwen_llm\"}[1m]))",
+          "legendFormat": "qwen_llm execs/sec"
         }
       ]
     },

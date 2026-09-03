@@ -38,13 +38,13 @@ KNOWN_GOOD_TTS_TEXTS = [
 
 
 @pytest.mark.parametrize("prompt", KNOWN_GOOD_LLM_PROMPTS)
-async def test_nemotron_llm_known_good_prompts(grpc_client, require_ready, stream_infer_collect, prompt):
-    await require_ready("nemotron_llm")
+async def test_qwen_llm_known_good_prompts(grpc_client, require_ready, stream_infer_collect, prompt):
+    await require_ready("qwen_llm")
     arr = np.array([prompt.encode("utf-8")], dtype=object)
     inp = grpcclient.InferInput("PROMPT", arr.shape, "BYTES")
     inp.set_data_from_numpy(arr)
     text = await stream_infer_collect(
-        grpc_client, "nemotron_llm", [inp], [grpcclient.InferRequestedOutput("GENERATED_TEXT")]
+        grpc_client, "qwen_llm", [inp], [grpcclient.InferRequestedOutput("GENERATED_TEXT")]
     )
     assert text.strip() != "", f"empty completion for known-good prompt {prompt!r}"
 

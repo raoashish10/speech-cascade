@@ -8,14 +8,14 @@ JSON-encoding tens of thousands of floats as text numbers (both directions)
 was previously the dominant cost for whisper_asr/voice_pipeline requests,
 dwarfing Triton's own reported compute time.
 
-nemotron_llm is decoupled/streaming (see triton_model_repo/nemotron_llm) --
+qwen_llm is decoupled/streaming (see triton_model_repo/qwen_llm) --
 a plain unary infer() call to it fails outright ("ModelInfer RPC doesn't
 support models with decoupled transaction policy"). This script measures it
 via stream_infer(), timing from request start to the final response chunk,
 so its latency numbers stay comparable to the other (unary) models' full-
 completion latency.
 
-Time-to-first-token (TTFT): measured only for nemotron_llm, the one model
+Time-to-first-token (TTFT): measured only for qwen_llm, the one model
 that actually streams. It's the time from request start to the first
 response chunk carrying a non-empty GENERATED_TEXT text_diff (the server
 sends one more, empty, chunk at the very end just to close the stream --
@@ -29,18 +29,18 @@ says so explicitly instead of leaving it ambiguous.
 
 Usage:
     python3 load_test.py --concurrency 4 --total-requests 20
-        # runs whisper_asr, nemotron_llm, chatterbox_tts, voice_pipeline in turn,
+        # runs whisper_asr, qwen_llm, chatterbox_tts, voice_pipeline in turn,
         # each isolated (no cross-stage GPU contention), same concurrency,
         # for a clean per-stage p50/p90 breakdown.
 
     python3 load_test.py --concurrency 4 --total-requests 20 --model chatterbox_tts
         # just one model.
 
-    python3 load_test.py --concurrency 16 --total-requests 64 --model nemotron_llm \
+    python3 load_test.py --concurrency 16 --total-requests 64 --model qwen_llm \
         --csv results.csv
         # appends one row of every metric below to results.csv, for building
         # a batch-size/concurrency sweep table across many separate runs.
-        # For nemotron_llm this also fills ttft_p50_s/ttft_p90_s/ttft_p99_s
+        # For qwen_llm this also fills ttft_p50_s/ttft_p90_s/ttft_p99_s
         # (time-to-first-token, seconds); those three columns are left blank
         # for whisper_asr/chatterbox_tts/voice_pipeline since those models are
         # unary and have no sub-request first-token event to time separately
@@ -95,7 +95,7 @@ def build_request(model):
         inputs.append(sr_input)
         return inputs, [grpcclient.InferRequestedOutput("TRANSCRIPT")]
 
-    if model == "nemotron_llm":
+    if model == "qwen_llm":
         # max_batch_size: 0 now (decoupled/streaming) -- no leading batch dim.
         arr = np.array(["Hello, my name is".encode("utf-8")], dtype=object)
         inp = grpcclient.InferInput("PROMPT", arr.shape, "BYTES")
@@ -151,7 +151,7 @@ def get_metric(metrics, name, label_substr=""):
     # exposes each GPU-instance model's counters as TWO lines in /metrics --
     # one tagged with gpu_uuid=... (the real, incrementing value) and one
     # without (stays 0 on this single-GPU box) -- and which one appears
-    # first varies by model: nemotron_llm/kokoro_tts have the gpu_uuid line
+    # first varies by model: qwen_llm/kokoro_tts have the gpu_uuid line
     # first, but whisper_asr has it second. Returning "the first match" was
     # silently reading the always-0 line for whisper_asr specifically,
     # meaning every prior load_test.py run against whisper_asr (directly or
@@ -170,11 +170,11 @@ def get_metric(metrics, name, label_substr=""):
 
 
 async def _stream_one_request(client, inputs, outputs, model_name, t0):
-    """nemotron_llm is decoupled -- fire a single-request stream_infer call
+    """qwen_llm is decoupled -- fire a single-request stream_infer call
     and drain every chunk, since a plain infer() is rejected outright.
 
     Also captures time-to-first-token: the model.py backend (see
-    triton_model_repo/nemotron_llm/1/model.py) sends one response per
+    triton_model_repo/qwen_llm/1/model.py) sends one response per
     non-empty generated text_diff, then a final response with no output
     tensors at all just to close the stream (sender.send(None, flags=
     COMPLETE_FINAL)). TTFT is measured to the first chunk that actually
@@ -206,7 +206,7 @@ async def fire_request(client, model, results, sem):
         inputs, outputs = build_request(model)
         t0 = time.time()
         try:
-            if model == "nemotron_llm":
+            if model == "qwen_llm":
                 ttft = await asyncio.wait_for(
                     _stream_one_request(client, inputs, outputs, model, t0), timeout=60.0
                 )
@@ -251,7 +251,7 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
     latencies = sorted(r[0] for r in results)
     successes = [r for r in results if r[1]]
     failures = [r for r in results if not r[1]]
-    # TTFT only exists for nemotron_llm (streaming); r[3] is None for the
+    # TTFT only exists for qwen_llm (streaming); r[3] is None for the
     # three unary models and for any request that never got a data chunk.
     ttfts = sorted(r[3] for r in successes if r[3] is not None)
 
@@ -271,7 +271,7 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
     if latencies:
         print(f"client latency  min={latencies[0]:.3f}s  p50={pct(latencies,0.50):.3f}s  "
               f"p90={pct(latencies,0.90):.3f}s  p99={pct(latencies,0.99):.3f}s  max={latencies[-1]:.3f}s")
-    if model == "nemotron_llm":
+    if model == "qwen_llm":
         if ttfts:
             print(f"TTFT (time-to-first-token, streaming)  p50={pct(ttfts,0.50):.3f}s  "
                   f"p90={pct(ttfts,0.90):.3f}s  p99={pct(ttfts,0.99):.3f}s")
@@ -315,7 +315,7 @@ async def run_one(grpc_client, http_client, model, concurrency, total_requests, 
 
 
 async def main(concurrency, total_requests, model, csv_path):
-    models = [model] if model else ["whisper_asr", "nemotron_llm", "chatterbox_tts", "voice_pipeline"]
+    models = [model] if model else ["whisper_asr", "qwen_llm", "chatterbox_tts", "voice_pipeline"]
     async with httpx.AsyncClient() as http_client:
         grpc_client = grpcclient.InferenceServerClient(url=TRITON_GRPC_URL)
         all_results = []
@@ -335,7 +335,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--total-requests", type=int, default=20)
-    parser.add_argument("--model", choices=["whisper_asr", "nemotron_llm", "chatterbox_tts", "voice_pipeline"], default=None)
+    parser.add_argument("--model", choices=["whisper_asr", "qwen_llm", "chatterbox_tts", "voice_pipeline"], default=None)
     parser.add_argument("--csv", default=None, help="append one summary row per model to this CSV file")
     args = parser.parse_args()
     asyncio.run(main(args.concurrency, args.total_requests, args.model, args.csv))

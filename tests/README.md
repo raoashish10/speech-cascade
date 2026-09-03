@@ -31,7 +31,7 @@ why they're the tier CI runs. Run with the **gateway venv**:
 Real gRPC calls (`tritonclient.grpc.aio`) against whatever's actually
 loaded on `localhost:18001` right now:
 
-- `test_whisper_asr.py`, `test_nemotron_llm.py`, `test_chatterbox_tts.py` — each
+- `test_whisper_asr.py`, `test_qwen_llm.py`, `test_chatterbox_tts.py` — each
   of the three real models, in isolation.
 - `test_voice_pipeline.py` — the BLS orchestrator, end to end (audio in,
   audio out, one call).

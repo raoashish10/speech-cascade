@@ -1,20 +1,27 @@
 #!/bin/bash
 # Runs the project's Triton Inference Server (the 4-model voice pipeline:
-# nemotron_llm, whisper_asr, chatterbox_tts, voice_pipeline) as a managed
+# qwen_llm, whisper_asr, chatterbox_tts, voice_pipeline) as a managed
 # supervisor service.
 #
-# STATUS AS OF THIS PR: captured but NOT installed on the live instance.
-# The server is currently started by hand (confirmed via
-# `ps aux | grep tritonserver` -- no supervisor entry existed for it, only
-# for the streaming gateway). This file records the exact command line and
-# environment that manual invocation actually needs (cross-checked against
-# /proc/<pid>/environ of the running process and against README.md's
-# "Environment quirks fixed to make this run bare-metal"), so a fresh
-# instance -- or this one, the next time it needs a restart -- runs Triton
-# as a real supervisor service (auto-restart on crash, logs in
-# /var/log/portal/, part of the boot sequence) instead of a manually
-# launched process nobody but a terminal scrollback remembers how to
-# reproduce.
+# Installed and running live as a supervisor service (this file's history:
+# it started out captured-but-not-installed, documenting a manually-launched
+# process with no supervisor entry, autorestart, or place in the boot
+# sequence -- since fixed by actually installing it).
+#
+# Models are loaded ONE AT A TIME via the explicit-mode repository control
+# API below, not with --load-model flags at startup. Measured directly on
+# this box: qwen_llm's own JIT engine build transiently peaks host RAM at
+# ~14.5GB (settling back to ~8-9GB once loaded) against this container's
+# ~15GB cgroup memory.max. Loading all four models concurrently at startup
+# (the previous --load-model=* approach) overlapped that peak with
+# whisper_asr/chatterbox_tts's own concurrent startup RAM use, exceeding the
+# container's memory ceiling and getting qwen_llm's python-backend stub
+# OOM-killed -- surfaced as "Stub process 'qwen_llm_0_0' is not healthy"
+# with no Python traceback (consistent with SIGKILL, not a catchable
+# exception). Triton's /v2/repository/models/{name}/load call blocks until
+# that model's load finishes (success or failure), so looping over it
+# sequentially guarantees no two models' loading-time peaks overlap.
+# qwen_llm loads first, while baseline RAM is lowest.
 #
 # To install on a live instance:
 #   cp deploy/supervisor/speech-cascade-triton.sh /opt/supervisor-scripts/
@@ -48,7 +55,7 @@ utils=/opt/supervisor-scripts/utils
 export PYTHONHOME=/venv/main
 export PYTHONPATH=/venv/main/lib/python3.12/site-packages
 export PATH="/venv/main/bin:${PATH}"
-export LD_LIBRARY_PATH="/venv/main/lib:/workspace/speech-cascade-inference/triton_server/compat_libs/extracted/usr/lib/x86_64-linux-gnu:/venv/main/lib/python3.12/site-packages/nvidia/cublas/lib:/venv/main/lib/python3.12/site-packages/nvidia/cudnn/lib:/workspace/speech-cascade-inference/triton_server/extracted/tritonserver/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/venv/main/lib:/workspace/speech-cascade-inference/triton_server/compat_libs/extracted/usr/lib/x86_64-linux-gnu:/venv/main/lib/python3.12/site-packages/nvidia/cublas/lib:/venv/main/lib/python3.12/site-packages/nvidia/cudnn/lib:/venv/gateway/lib/python3.12/site-packages/nvidia/cu13/lib:/workspace/speech-cascade-inference/triton_server/extracted/tritonserver/lib64:${LD_LIBRARY_PATH:-}"
 
 TRITON_BIN=/workspace/speech-cascade-inference/triton_server/extracted/tritonserver/bin/tritonserver
 MODEL_REPO=/workspace/speech-cascade-inference/triton_model_repo
@@ -56,7 +63,10 @@ BACKEND_DIR=/workspace/speech-cascade-inference/triton_server/extracted/tritonse
 
 cd /workspace
 
-pty "${TRITON_BIN}" \
+# Not run through pty/unbuffer here (unlike other supervisor scripts) --
+# it needs to background cleanly under a plain $!/wait pair below, and
+# tritonserver's own log output already flushes promptly without it.
+"${TRITON_BIN}" \
   --model-repository="${MODEL_REPO}" \
   --backend-directory="${BACKEND_DIR}" \
   --http-port=18000 \
@@ -65,9 +75,23 @@ pty "${TRITON_BIN}" \
   --http-address=127.0.0.1 \
   --grpc-address=127.0.0.1 \
   --model-control-mode=explicit \
-  --load-model=nemotron_llm \
-  --load-model=whisper_asr \
-  --load-model=chatterbox_tts \
-  --load-model=voice_pipeline \
   --exit-on-error=false \
-  --log-verbose=0 2>&1
+  --log-verbose=0 2>&1 &
+TRITON_PID=$!
+
+until curl -sf -o /dev/null http://127.0.0.1:18000/v2/health/live; do
+  sleep 1
+done
+
+# qwen_llm first (baseline RAM lowest here), then the lighter models --
+# see the header comment for why this must stay sequential, not parallel.
+for model in qwen_llm whisper_asr chatterbox_tts voice_pipeline; do
+  echo "loading ${model}..."
+  if curl -sf -X POST "http://127.0.0.1:18000/v2/repository/models/${model}/load"; then
+    echo "${model} load request succeeded"
+  else
+    echo "${model} load request FAILED -- see the server log above for the reason"
+  fi
+done
+
+wait "${TRITON_PID}"
