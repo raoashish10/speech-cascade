@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 
+import torch
 import torchaudio as ta
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 
@@ -53,7 +54,19 @@ for line in sys.stdin:
         break
     try:
         t0 = time.time()
-        wav = model.generate(text)
+        # ChatterboxTurboTTS.generate() (chatterbox/tts_turbo.py) builds no
+        # autograd graph on purpose -- it's inference-only -- but never
+        # wraps itself in torch.no_grad()/inference_mode(), so PyTorch still
+        # tracks every intermediate tensor's grad-fn through the T3 backbone
+        # and S3Gen vocoder by default. Measured live (docs/
+        # chatterbox-host-ram-leak.md): host RSS grows ~3.6MB/request,
+        # unbounded, with no plateau across 200+ requests -- inside
+        # generate() specifically (confirmed by isolating it from the
+        # ta.save() call below). Wrapping just this call in
+        # inference_mode() cuts steady-state growth to ~0.1MB/request and
+        # it plateaus within ~100 requests, instead of growing forever.
+        with torch.inference_mode():
+            wav = model.generate(text)
         fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="chatterbox_")
         os.close(fd)
         ta.save(out_path, wav, model.sr)
