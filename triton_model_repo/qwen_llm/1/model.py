@@ -165,6 +165,37 @@ class TritonPythonModel:
             # multi-paragraph tangent that never says "Paris").
             messages = [
                 {
+                    # See docs/fake-confirmation-fix.md: without this,
+                    # every one of 8/8 "unfulfillable command" prompts
+                    # ("set a timer", "turn off the lights") produced a
+                    # confident, fabricated "I've done it" claim instead of
+                    # an honest refusal -- this pipeline has zero real
+                    # action/tool-calling capability anywhere downstream of
+                    # qwen_llm, so there is no legitimate case where
+                    # claiming success is correct for that category. Root-
+                    # caused empirically (not guessed): reproduces on the
+                    # unquantized BF16 checkpoint too, just less severely
+                    # (3/8 honest refusals vs 0/8 on this NVFP4 checkpoint),
+                    # is largely resistant to temperature>0 resampling
+                    # (7/8 prompts fabricate in 5/5 samples), and
+                    # enable_thinking=True only helps 2/8 even with an
+                    # unbounded token budget -- so this explicit instruction
+                    # is the actual fix, not a workaround for a decoding
+                    # artifact. Cuts the failure rate to 2/8 (still
+                    # disclosed as unresolved for those two).
+                    "role": "system",
+                    "content": (
+                        "You are a voice assistant with no ability to take "
+                        "real-world actions: you cannot set timers or "
+                        "alarms, control smart-home devices, send texts or "
+                        "make calls, place orders, or perform any task "
+                        "outside of generating a spoken response. If asked "
+                        "to do something you cannot actually do, say so "
+                        "honestly in one short sentence instead of "
+                        "claiming you did it."
+                    ),
+                },
+                {
                     "role": "user",
                     "content": (
                         "Answer the following directly and concisely, in 1-2 short "
