@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+from contextlib import contextmanager
 
 import librosa
 import numpy as np
@@ -26,6 +27,25 @@ WHISPER_SAMPLE_RATE = 16000
 N_SAMPLES_30S = WHISPER_SAMPLE_RATE * 30
 TEXT_PREFIX = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
 SPECIAL_TOKEN_RE = re.compile(r'<\|.*?\|>')
+
+# See qwen_llm/1/model.py's own copy of this helper for the full rationale
+# (deploy/PROFILING.md): labels this stage's GPU work in nsys's timeline.
+# torch.profiler can't see inside process_batch() -- it runs inside
+# TensorRT-LLM's own compiled encoder/decoder engines, not as Python-visible
+# ATen ops. Set NSYS_NVTX=0 to disable.
+_NVTX_ENABLED = os.environ.get("NSYS_NVTX", "1") != "0"
+
+
+@contextmanager
+def nvtx_range(name):
+    if _NVTX_ENABLED and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
 
 
 class TritonPythonModel:
@@ -80,22 +100,24 @@ class TritonPythonModel:
         # token budget runs out -- reproduced even for a single-item batch,
         # so it wasn't specific to concurrent/duplicate requests. Full 30s
         # padding for every sample avoids that path and decodes cleanly.
-        features = [
-            log_mel_spectrogram(
-                audio,
-                self.model.n_mels,
-                padding=N_SAMPLES_30S - audio.shape[-1],
-                device='cuda',
-                mel_filters_dir=self.assets_dir,
-            ).unsqueeze(0)
-            for audio in audios
-        ]
+        with nvtx_range("whisper_asr.feature_extraction"):
+            features = [
+                log_mel_spectrogram(
+                    audio,
+                    self.model.n_mels,
+                    padding=N_SAMPLES_30S - audio.shape[-1],
+                    device='cuda',
+                    mel_filters_dir=self.assets_dir,
+                ).unsqueeze(0)
+                for audio in audios
+            ]
 
-        mel_input_lengths = torch.tensor(
-            [f.shape[2] for f in features], dtype=torch.int32, device='cuda'
-        )
+            mel_input_lengths = torch.tensor(
+                [f.shape[2] for f in features], dtype=torch.int32, device='cuda'
+            )
 
-        transcripts = self.model.process_batch(features, mel_input_lengths, TEXT_PREFIX)
+        with nvtx_range("whisper_asr.process_batch"):
+            transcripts = self.model.process_batch(features, mel_input_lengths, TEXT_PREFIX)
 
         responses = []
         for transcript in transcripts:

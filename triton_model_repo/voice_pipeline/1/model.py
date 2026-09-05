@@ -10,8 +10,32 @@ must be reshaped to add a leading batch dim of 1, and every tensor read back
 must have that dim stripped again.
 """
 
+import os
+from contextlib import contextmanager
+
 import numpy as np
+import torch
 import triton_python_backend_utils as pb_utils
+
+# See qwen_llm/1/model.py's own copy of this helper for the full rationale
+# (deploy/PROFILING.md). Here it labels each downstream BLS call's wall-clock
+# span (including the callee's own queueing) in nsys's timeline, so the
+# three GPU-bound stages -- and voice_pipeline's own orchestration overhead
+# between them -- are visible as one sequence, not just three isolated
+# per-model traces. Set NSYS_NVTX=0 to disable.
+_NVTX_ENABLED = os.environ.get("NSYS_NVTX", "1") != "0"
+
+
+@contextmanager
+def nvtx_range(name):
+    if _NVTX_ENABLED and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
 
 
 def _batched(tensor):
@@ -108,13 +132,15 @@ class TritonPythonModel:
         if sr_tensor is not None:
             asr_inputs.append(sr_tensor)
 
-        asr_out = _run("whisper_asr", asr_inputs, ["TRANSCRIPT"])
+        with nvtx_range("voice_pipeline.whisper_asr"):
+            asr_out = _run("whisper_asr", asr_inputs, ["TRANSCRIPT"])
         transcript = _decode_str(asr_out["TRANSCRIPT"])
 
         prompt_tensor = pb_utils.Tensor(
             "PROMPT", np.array([transcript.encode("utf-8")], dtype=np.object_)
         )
-        generated_text = _run_llm_decoupled(prompt_tensor)
+        with nvtx_range("voice_pipeline.qwen_llm"):
+            generated_text = _run_llm_decoupled(prompt_tensor)
 
         text_tensor = pb_utils.Tensor(
             "TEXT", np.array([generated_text.encode("utf-8")], dtype=np.object_)
@@ -124,7 +150,8 @@ class TritonPythonModel:
         if voice_tensor is not None:
             tts_inputs.append(voice_tensor)
 
-        tts_out = _run("chatterbox_tts", tts_inputs, ["AUDIO_SAMPLES", "SAMPLE_RATE"])
+        with nvtx_range("voice_pipeline.chatterbox_tts"):
+            tts_out = _run("chatterbox_tts", tts_inputs, ["AUDIO_SAMPLES", "SAMPLE_RATE"])
 
         return pb_utils.InferenceResponse(
             output_tensors=[

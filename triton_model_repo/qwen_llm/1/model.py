@@ -20,6 +20,7 @@ import sys
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 try:
     import numpy as np
@@ -37,7 +38,32 @@ except Exception as e:
             cause = cause.__cause__
     raise
 
+import torch
 import triton_python_backend_utils as pb_utils
+
+# Marks each generation call in nsys's timeline (see deploy/PROFILING.md) --
+# torch.cuda.nvtx push/pop is a cheap call into nvToolsExt, effectively free
+# when no profiler is attached to the process. Without this, nsys shows an
+# unlabeled wall of CUDA kernels with no indication of which pipeline stage
+# produced which one. torch.profiler (used for chatterbox_tts instead --
+# see chatterbox_worker.py) can't see inside this model's execution: the
+# actual generation happens inside TensorRT-LLM's own compiled engine/MPI
+# worker, not as Python-visible ATen ops, so nsys is the only tool here that
+# shows real per-kernel timing for qwen_llm. Set NSYS_NVTX=0 to disable.
+_NVTX_ENABLED = os.environ.get("NSYS_NVTX", "1") != "0"
+
+
+@contextmanager
+def nvtx_range(name):
+    if _NVTX_ENABLED and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
 
 # Matches the engine's --max_batch_size 16 build config -- bounds the stub
 # process's thread pool so a burst of concurrent streaming sessions can't
@@ -260,14 +286,15 @@ class TritonPythonModel:
                 # repetition_penalty above).
                 stop=["<|im_end|>", "\n\n", "</think>"],
             )
-            result = self.llm.generate_async(prompt, sampling_params, streaming=True)
-            for output in result:  # blocking sync iteration -- fine on a pool thread
-                diff = output.outputs[0].text_diff
-                if diff:
-                    out_tensor = pb_utils.Tensor(
-                        "GENERATED_TEXT", np.array([diff.encode("utf-8")], dtype=np.object_)
-                    )
-                    sender.send(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
+            with nvtx_range("qwen_llm.generate"):
+                result = self.llm.generate_async(prompt, sampling_params, streaming=True)
+                for output in result:  # blocking sync iteration -- fine on a pool thread
+                    diff = output.outputs[0].text_diff
+                    if diff:
+                        out_tensor = pb_utils.Tensor(
+                            "GENERATED_TEXT", np.array([diff.encode("utf-8")], dtype=np.object_)
+                        )
+                        sender.send(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
             sender.send(None, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
         except Exception as e:
             sender.send(
