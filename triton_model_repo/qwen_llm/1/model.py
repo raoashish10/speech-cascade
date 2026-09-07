@@ -17,9 +17,16 @@ system is overloaded in milliseconds instead of after minutes of queueing."""
 import json
 import os
 import sys
-import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+
+# admission.py is a sibling file in this same model-version directory, not a
+# pip package -- same pattern whisper_asr/1/model.py uses for its own
+# vendored trtllm_whisper package. Split out specifically so the counting
+# logic is unit-testable without triton_python_backend_utils (see
+# admission.py's own docstring and tests/unit/test_admission.py).
+sys.path.insert(0, os.path.dirname(__file__))
+from admission import AdmissionGate
 
 try:
     import numpy as np
@@ -117,23 +124,15 @@ class TritonPythonModel:
             max_batch_size=16,  # raised from 8 -- see docs/nemotron-batch-size-scaling.md
         )
         self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
-        self._admitted = 0
-        self._admitted_lock = threading.Lock()
+        self._gate = AdmissionGate(MAX_ADMITTED)
 
     def execute(self, requests):
         for request in requests:
-            if self._try_admit():
+            if self._gate.try_admit():
                 self._pool.submit(self._stream_one, request)
             else:
                 self._reject(request)
         return None  # decoupled: no synchronous response list
-
-    def _try_admit(self):
-        with self._admitted_lock:
-            if self._admitted >= MAX_ADMITTED:
-                return False
-            self._admitted += 1
-            return True
 
     def _reject(self, request):
         sender = request.get_response_sender()
@@ -277,8 +276,7 @@ class TritonPythonModel:
         finally:
             # Always release the admission slot, even on error/exception above,
             # so a failure can't leak slots and permanently wedge admission.
-            with self._admitted_lock:
-                self._admitted -= 1
+            self._gate.release()
 
     def finalize(self):
         self._pool.shutdown(wait=False)

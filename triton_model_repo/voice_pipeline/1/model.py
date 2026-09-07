@@ -10,14 +10,24 @@ must be reshaped to add a leading batch dim of 1, and every tensor read back
 must have that dim stripped again.
 """
 
+import os
+import sys
+
 import numpy as np
 import triton_python_backend_utils as pb_utils
+
+# batch_shape.py is a sibling file in this same model-version directory, not
+# a pip package -- same pattern whisper_asr/1/model.py uses for its own
+# vendored trtllm_whisper package. Split out specifically so the reshape
+# logic is unit-testable without triton_python_backend_utils (see
+# batch_shape.py's own docstring and tests/unit/test_batch_shape.py).
+sys.path.insert(0, os.path.dirname(__file__))
+from batch_shape import add_batch_dim
 
 
 def _batched(tensor):
     """Add a leading batch dim of 1 before forwarding to a batched model."""
-    arr = tensor.as_numpy()
-    return pb_utils.Tensor(tensor.name(), arr.reshape(1, *arr.shape))
+    return pb_utils.Tensor(tensor.name(), add_batch_dim(tensor.as_numpy()))
 
 
 def _run(model_name, inputs, output_names):
