@@ -131,7 +131,7 @@ nvtx==0.2.16
 omegaconf==2.3.1
 onnx==1.19.1
 onnx_graphsurgeon==0.6.1
-onnxruntime-gpu==1.29.0
+# onnxruntime-gpu==1.29.0  # removed: was only used by kokoro_tts (dead) and the pre-migration whisper_asr (moved to TensorRT-LLM, see deploy/REBUILD.md "4c"). Confirmed unused: grepped the whole repo, only remaining import was scripts/test_asr.py's old pre-migration ORTModelForSpeechSeq2Seq path (rewritten separately). Not the same package as streaming_gateway's own onnxruntime (CPU-only, for Silero VAD) -- that one's untouched, separate venv.
 openai==3.3.1
 openai-harmony==0.0.4
 openai-whisper==20250625
