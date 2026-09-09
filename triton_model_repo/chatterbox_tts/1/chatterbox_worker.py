@@ -130,9 +130,21 @@ for line in sys.stdin:
                 _profiler.stop()
                 trace_path = os.path.join(_PROFILE_DIR, f"chatterbox_trace_{os.getpid()}.json")
                 _profiler.export_chrome_trace(trace_path)
+                # Printed directly to the log, not just exported to a file a
+                # headless Vast.ai instance has no easy way to open: with
+                # with_stack=True (set above), group_by_stack_n attributes
+                # each op's time to its Python call stack, so T3
+                # (t3.py: T3.inference_turbo) vs S3Gen (s3gen.py /
+                # flow_matching.py: basic_euler/solve_euler) show up as
+                # separate rows without needing to load the chrome trace
+                # anywhere. See deploy/PROFILING.md.
+                summary = _profiler.key_averages(group_by_stack_n=5).table(
+                    sort_by="self_cuda_time_total", row_limit=30
+                )
                 print(
                     f"[profiling] {_PROFILE_STEPS} steps captured, chrome trace "
-                    f"saved to {trace_path}",
+                    f"saved to {trace_path}\n[profiling] top ops by self CUDA time "
+                    f"(grouped by call stack):\n{summary}",
                     file=sys.stderr, flush=True,
                 )
                 _profiler = None
