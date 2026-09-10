@@ -1,13 +1,22 @@
 name: "chatterbox_tts"
 backend: "python"
-# max_batch_size 1, instance_group.count 1: Chatterbox's generate() has no
-# native multi-text batched call (autoregressive decode + vocoder per
-# utterance, same reasoning as kokoro_tts/magpie_tts before it), and this
-# model runs through a single persistent worker subprocess holding one CUDA
-# context (see model.py) -- concurrency has not been load-tested/tuned yet,
-# unlike kokoro_tts's measured count:4 (docs/kokoro-tts-capacity-fix.md).
-# This is a functional baseline pending that measurement.
-max_batch_size: 1
+# max_batch_size 4 + dynamic_batching: chatterbox_tts's T3 decode loop
+# profiled as kernel-launch-overhead-bound (100k+ tiny ~20-25us kernel
+# launches per request), not compute-bound -- see chatterbox_profiling/ --
+# so concurrent requests are batched through T3's decode in one shared pass
+# (chatterbox_worker.py's generate_batch(), see model.py's execute()) rather
+# than serialized one at a time as before. instance_group.count stays 1:
+# unlike kokoro_tts's replicated count:4 (docs/kokoro-tts-capacity-fix.md),
+# replicating this model isn't viable -- Chatterbox alone needs ~3GB VRAM and
+# the full 4-model pipeline already uses ~14GB of this GPU's 16GB. 4 was
+# chosen to match this project's own load_test.py default concurrency; the
+# S3Gen vocoder step is NOT batched (it wasn't the profiled bottleneck) and
+# still runs per-item after the batched T3 decode.
+max_batch_size: 4
+
+dynamic_batching {
+  max_queue_delay_microseconds: 20000
+}
 
 input [
   {
