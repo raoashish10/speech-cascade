@@ -120,6 +120,37 @@ class TritonPythonModel:
         self._admitted = 0
         self._admitted_lock = threading.Lock()
 
+        # docs/monitoring.md flags that qwen_llm is deliberately excluded
+        # from Triton's own queue/compute panels/alerts -- decoupled/
+        # streaming means those built-in per-exec timers return almost
+        # instantly and don't reflect real generation time or backend
+        # saturation for this model. But nothing replaced the missing
+        # signal: when the admission gate below actually rejects a request
+        # (the real overload condition for this model), that was previously
+        # invisible to Prometheus/Grafana/alerting entirely -- only visible
+        # as a client-side error. This closes that gap via Triton's
+        # python-backend custom metrics API, scraped at the same
+        # /metrics:18002 endpoint as every other model's built-in counters,
+        # no new exporter or scrape config needed.
+        #
+        # NOT verified live -- written without access to a running Triton
+        # instance (this environment has no GPU). MetricFamily/Metric is a
+        # documented python_backend feature, but confirm it against this
+        # project's actual installed Triton version before trusting it;
+        # if the API differs, this fails at model load (visible immediately
+        # in the server log), not silently.
+        metric_family = pb_utils.MetricFamily(
+            name="qwen_llm_admission_rejected_total",
+            description=(
+                "Requests rejected by qwen_llm's own admission-control gate "
+                "(MAX_ADMITTED in-flight-or-queued requests exceeded). "
+                "Triton's built-in per-model queue/compute metrics don't "
+                "apply to this decoupled/streaming model -- see docs/monitoring.md."
+            ),
+            kind=pb_utils.MetricFamily.COUNTER,
+        )
+        self._rejected_metric = metric_family.Metric(labels={})
+
     def execute(self, requests):
         for request in requests:
             if self._try_admit():
@@ -136,6 +167,7 @@ class TritonPythonModel:
             return True
 
     def _reject(self, request):
+        self._rejected_metric.increment(1)
         sender = request.get_response_sender()
         sender.send(
             pb_utils.InferenceResponse(
