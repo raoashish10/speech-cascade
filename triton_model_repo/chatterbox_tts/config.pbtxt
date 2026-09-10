@@ -1,13 +1,22 @@
 name: "chatterbox_tts"
 backend: "python"
-# max_batch_size 1, instance_group.count 1: Chatterbox's generate() has no
-# native multi-text batched call (autoregressive decode + vocoder per
-# utterance, same reasoning as kokoro_tts/magpie_tts before it), and this
-# model runs through a single persistent worker subprocess holding one CUDA
-# context (see model.py) -- concurrency has not been load-tested/tuned yet,
-# unlike kokoro_tts's measured count:4 (docs/kokoro-tts-capacity-fix.md).
-# This is a functional baseline pending that measurement.
-max_batch_size: 1
+# max_batch_size 4 + dynamic_batching: chatterbox_tts's T3 decode loop
+# profiled as kernel-launch-overhead-bound (100k+ tiny ~20-25us kernel
+# launches per request), not compute-bound -- see chatterbox_profiling/ --
+# so concurrent requests are batched through T3's decode in one shared pass
+# (chatterbox_worker.py's generate_batch(), see model.py's execute()) rather
+# than serialized one at a time as before. instance_group.count stays 1:
+# unlike kokoro_tts's replicated count:4 (docs/kokoro-tts-capacity-fix.md),
+# replicating this model isn't viable -- Chatterbox alone needs ~3GB VRAM and
+# the full 4-model pipeline already uses ~14GB of this GPU's 16GB. 4 was
+# chosen to match this project's own load_test.py default concurrency; the
+# S3Gen vocoder step is NOT batched (it wasn't the profiled bottleneck) and
+# still runs per-item after the batched T3 decode.
+max_batch_size: 4
+
+dynamic_batching {
+  max_queue_delay_microseconds: 20000
+}
 
 input [
   {
@@ -46,4 +55,31 @@ instance_group [
 parameters: {
   key: "ref_audio_path"
   value: { string_value: "/workspace/speech-cascade-inference/scripts/pipeline_output.wav" }
+}
+
+# vLLM T3's KV-cache reservation as a fraction of total GPU memory. 0.3 (the
+# vLLM default) was tuned with chatterbox_tts as the only model on the GPU;
+# with the full 4-model pipeline loaded (whisper_asr + qwen_llm's ~8-9GB
+# TensorRT-LLM engine + voice_pipeline's orchestrator instances all sharing
+# this one 16GB card), free VRAM at chatterbox_tts's load time is only
+# ~3GB, and 0.3 fails outright ("Free memory ... is less than desired GPU
+# memory utilization"). 0.18 is the highest value that both passes that
+# startup check and leaves enough for KV cache blocks (validated: reaches
+# WORKER_READY, serves real requests, GPU memory plateaus rather than
+# growing further after the first few calls). Deliberately a config.pbtxt
+# parameter rather than left to inherit CHATTERBOX_VLLM_GPU_MEM_UTIL from
+# whatever launched tritonserver -- this value depends on which other
+# models share the GPU, which is a deployment fact that belongs here, not
+# on the ambient shell environment of whatever started Triton.
+#
+# Caveat: at 0.18 the KV cache only supports ~1.5x concurrency for full-
+# length (2048 token) sequences -- less than config.pbtxt's own
+# dynamic_batching max_batch_size of 4 below is designed to exploit. Under
+# real concurrent pipeline load, vLLM's own scheduler may serialize/queue
+# requests beyond that internally even though Triton handed it a batch of
+# 4. Revisit if this GPU is ever upgraded or the pipeline is trimmed to
+# fewer concurrent models.
+parameters: {
+  key: "vllm_gpu_mem_util"
+  value: { string_value: "0.18" }
 }

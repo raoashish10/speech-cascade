@@ -381,6 +381,14 @@ python3 scripts/load_test.py --concurrency 4 --total-requests 20
 python3 scripts/load_test.py --concurrency 4 --total-requests 20 --model chatterbox_tts  # just one
 ```
 
+Prometheus/`load_test.py` answer *how much* time a stage takes; they don't
+show *why* — for that, this repo also wires up `torch.profiler` (op-level,
+`chatterbox_tts` only — the one plain-PyTorch stage) and Nsight Systems /
+`nsys` (kernel-level, all four models, including inside TensorRT-LLM's
+compiled engines for `qwen_llm`/`whisper_asr`, which `torch.profiler` can't
+see into). See [`deploy/PROFILING.md`](deploy/PROFILING.md) and
+`scripts/profile_nsys.sh`.
+
 **The numbers and bugs below are historical, measured on `nemotron_llm`
 before the `qwen_llm` migration** — kept as-is since they document real,
 still-relevant findings about `voice_pipeline`/`whisper_asr`/batching

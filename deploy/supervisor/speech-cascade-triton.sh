@@ -76,7 +76,15 @@ cd /workspace
   --grpc-address=127.0.0.1 \
   --model-control-mode=explicit \
   --exit-on-error=false \
-  --log-verbose=0 2>&1 &
+  --log-verbose=0 \
+  --metrics-config summary_latencies=true 2>&1 &
+  # summary_latencies=true: without it, Triton's nv_inference_*_duration_us
+  # metrics are cumulative counters -- Prometheus/Grafana can only derive
+  # averages from those, never real percentiles. This turns each into a
+  # proper Summary (nv_inference_request_summary_us etc.) with quantile
+  # labels (0.5/0.9/0.95/0.99/0.999), directly graphable/queryable for p50/
+  # p90/p99 -- see chatterbox_profiling/ for the load-test numbers this
+  # was added to surface.
 TRITON_PID=$!
 
 until curl -sf -o /dev/null http://127.0.0.1:18000/v2/health/live; do

@@ -38,9 +38,18 @@ multiple reference clips at startup and switching cached conditioning per
 request -- not built here.
 
 instance_group.count is 1 (a single persistent worker subprocess, single
-CUDA context) -- concurrency has not been load-tested/tuned for this model
-the way Kokoro's was (see docs/kokoro-tts-capacity-fix.md's count:4
-journey); this is a functional baseline, not a tuned deployment.
+CUDA context) -- replicating instances the way Kokoro's count:4 did
+(docs/kokoro-tts-capacity-fix.md) isn't viable here: Chatterbox alone needs
+~3GB VRAM and the full 4-model pipeline already uses ~14GB of this GPU's
+16GB, leaving no headroom for a second copy. Instead, concurrent requests
+are batched through this ONE instance: config.pbtxt enables dynamic_batching
+with max_batch_size > 1, so Triton itself groups multiple pending requests
+into a single execute() call below, and chatterbox_worker.py's
+generate_batch() runs them through ONE shared T3 decode pass (see its
+module docstring and chatterbox_profiling/ for why -- the autoregressive
+decode loop was profiled as kernel-launch-overhead-bound, not compute-bound,
+so batching amortizes that overhead across requests rather than shaving it
+per-request).
 """
 
 import json
@@ -52,15 +61,28 @@ import numpy as np
 import soundfile as sf
 import triton_python_backend_utils as pb_utils
 
-CHATTERBOX_PYTHON = "/venv/chatterbox/bin/python3"
-WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker.py")
-# See chatterbox_worker.py's own docstring and
-# docs/tts-replacement-investigation.md's harness-bug #3: the worker
-# subprocess must NOT inherit Triton's own LD_LIBRARY_PATH (set for
-# /venv/main's TensorRT-LLM libs) -- it needs its own venv's NPP library
-# path for torchcodec's audio-save dependency. Every turn's generation
-# would succeed while the final save silently failed if this were wrong.
-CHATTERBOX_NPP_LIB = "/venv/chatterbox/lib/python3.12/site-packages/nvidia/npp/lib"
+# Backend switch: CHATTERBOX_BACKEND=vllm (default) runs T3's decode through
+# vLLM (see chatterbox_profiling/vllm/ -- ~5-5.4x faster than the batched+
+# CUDA-graph PyTorch path, kernel fusion via torch.compile, not just launch-
+# overhead amortization). CHATTERBOX_BACKEND=pytorch falls back to the
+# original eager/CUDA-graph PyTorch worker (chatterbox_worker.py) -- kept
+# available, not deleted, in case vLLM regresses under real production load
+# in a way this investigation's profiling runs didn't surface.
+_BACKEND = os.environ.get("CHATTERBOX_BACKEND", "vllm")
+if _BACKEND == "vllm":
+    CHATTERBOX_PYTHON = "/venv/vllm/bin/python3"
+    WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker_vllm.py")
+    CHATTERBOX_NPP_LIB = None  # vLLM's own nvidia-*-cu12 wheels are self-contained; no torchcodec dependency here
+else:
+    CHATTERBOX_PYTHON = "/venv/chatterbox/bin/python3"
+    WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker.py")
+    # See chatterbox_worker.py's own docstring and
+    # docs/tts-replacement-investigation.md's harness-bug #3: the worker
+    # subprocess must NOT inherit Triton's own LD_LIBRARY_PATH (set for
+    # /venv/main's TensorRT-LLM libs) -- it needs its own venv's NPP library
+    # path for torchcodec's audio-save dependency. Every turn's generation
+    # would succeed while the final save silently failed if this were wrong.
+    CHATTERBOX_NPP_LIB = "/venv/chatterbox/lib/python3.12/site-packages/nvidia/npp/lib"
 PROTO = "@@PROTO@@"
 
 
@@ -94,10 +116,34 @@ class TritonPythonModel:
         worker_env = dict(os.environ)
         worker_env.pop("PYTHONHOME", None)
         worker_env.pop("PYTHONPATH", None)
-        worker_env["LD_LIBRARY_PATH"] = CHATTERBOX_NPP_LIB
+        if CHATTERBOX_NPP_LIB is not None:
+            worker_env["LD_LIBRARY_PATH"] = CHATTERBOX_NPP_LIB
+        else:
+            worker_env.pop("LD_LIBRARY_PATH", None)
+
+        worker_args = [CHATTERBOX_PYTHON, WORKER_SCRIPT, ref_audio_path]
+        if _BACKEND == "vllm":
+            # Registering our out-of-tree T3 model class only happens in
+            # whichever process imports chatterbox_worker_vllm.py -- vLLM's
+            # V1 engine normally spawns a SEPARATE subprocess for the actual
+            # model executor (via 'spawn', since CUDA is already
+            # initialized), which would never see that registration and
+            # fail with "architecture not supported". Keeping everything
+            # in-process sidesteps that (see chatterbox_profiling/vllm/).
+            worker_env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+            # Explicit config.pbtxt parameter, not left to inherit from
+            # whatever launched tritonserver -- see the parameter's own
+            # comment in config.pbtxt for why this needs to be lower when
+            # chatterbox_tts shares the GPU with the rest of the pipeline.
+            worker_env["CHATTERBOX_VLLM_GPU_MEM_UTIL"] = params.get("vllm_gpu_mem_util", {}).get(
+                "string_value", "0.3"
+            )
+            worker_args.append(params.get("vllm_t3_model_dir", {}).get(
+                "string_value", "/workspace/speech-cascade-inference/vllm_t3_model_dir"
+            ))
 
         self.proc = subprocess.Popen(
-            [CHATTERBOX_PYTHON, WORKER_SCRIPT, ref_audio_path],
+            worker_args,
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             text=True, bufsize=1, env=worker_env,
         )
@@ -108,27 +154,62 @@ class TritonPythonModel:
             )
 
     def execute(self, requests):
-        responses = []
+        # Triton's dynamic_batching (config.pbtxt) may hand us anywhere from
+        # 1 to max_batch_size requests here in one call -- collect all their
+        # texts and send them to the worker as ONE batch, rather than looping
+        # a round-trip per request the way this used to (see model.py's own
+        # docstring and chatterbox_worker.py's for why that left the GPU
+        # mostly idle between tiny per-request kernel launches).
+        texts = []
         for request in requests:
             text_tensor = pb_utils.get_input_tensor_by_name(request, "TEXT")
             text = text_tensor.as_numpy().flatten()[0]
             if isinstance(text, bytes):
                 text = text.decode("utf-8")
+            texts.append(text.replace("\n", " "))
 
-            self.proc.stdin.write(text.replace("\n", " ") + "\n")
-            self.proc.stdin.flush()
-            result = _read_proto_line(self.proc.stderr, self.proc)
+        self.proc.stdin.write(json.dumps(texts) + "\n")
+        self.proc.stdin.flush()
+        result = _read_proto_line(self.proc.stderr, self.proc)
 
-            if result is None or not result.startswith("OK"):
-                err = result or "worker process died"
+        if result is None or not result.startswith("OK "):
+            # Whole batch failed (e.g. the worker died, or something outside
+            # any single item's generation raised) -- every request in this
+            # call gets the same error, since we can't attribute it to one.
+            err = result or "worker process died"
+            return [
+                pb_utils.InferenceResponse(
+                    error=pb_utils.TritonError(f"chatterbox_tts failed: {err}")
+                )
+                for _ in requests
+            ]
+
+        payload = json.loads(result[len("OK "):])
+        items = payload["results"]
+        if len(items) != len(requests):
+            return [
+                pb_utils.InferenceResponse(
+                    error=pb_utils.TritonError(
+                        f"chatterbox_tts protocol error: sent {len(requests)} texts, "
+                        f"got {len(items)} results back"
+                    )
+                )
+                for _ in requests
+            ]
+
+        responses = []
+        for item in items:
+            if not item.get("ok"):
                 responses.append(
                     pb_utils.InferenceResponse(
-                        error=pb_utils.TritonError(f"chatterbox_tts failed: {err}")
+                        error=pb_utils.TritonError(
+                            f"chatterbox_tts failed: {item.get('error', 'unknown error')}"
+                        )
                     )
                 )
                 continue
 
-            _, wav_path, sample_rate, _latency_s = result.split(" ", 3)
+            wav_path, sr = item["path"], item["sr"]
             samples, sr = sf.read(wav_path, dtype="float32")
             os.remove(wav_path)
             if samples.ndim > 1:
