@@ -131,6 +131,13 @@ class TritonPythonModel:
             # fail with "architecture not supported". Keeping everything
             # in-process sidesteps that (see chatterbox_profiling/vllm/).
             worker_env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+            # Explicit config.pbtxt parameter, not left to inherit from
+            # whatever launched tritonserver -- see the parameter's own
+            # comment in config.pbtxt for why this needs to be lower when
+            # chatterbox_tts shares the GPU with the rest of the pipeline.
+            worker_env["CHATTERBOX_VLLM_GPU_MEM_UTIL"] = params.get("vllm_gpu_mem_util", {}).get(
+                "string_value", "0.3"
+            )
             worker_args.append(params.get("vllm_t3_model_dir", {}).get(
                 "string_value", "/workspace/speech-cascade-inference/vllm_t3_model_dir"
             ))

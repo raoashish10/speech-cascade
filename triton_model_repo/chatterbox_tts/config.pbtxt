@@ -56,3 +56,30 @@ parameters: {
   key: "ref_audio_path"
   value: { string_value: "/workspace/speech-cascade-inference/scripts/pipeline_output.wav" }
 }
+
+# vLLM T3's KV-cache reservation as a fraction of total GPU memory. 0.3 (the
+# vLLM default) was tuned with chatterbox_tts as the only model on the GPU;
+# with the full 4-model pipeline loaded (whisper_asr + qwen_llm's ~8-9GB
+# TensorRT-LLM engine + voice_pipeline's orchestrator instances all sharing
+# this one 16GB card), free VRAM at chatterbox_tts's load time is only
+# ~3GB, and 0.3 fails outright ("Free memory ... is less than desired GPU
+# memory utilization"). 0.18 is the highest value that both passes that
+# startup check and leaves enough for KV cache blocks (validated: reaches
+# WORKER_READY, serves real requests, GPU memory plateaus rather than
+# growing further after the first few calls). Deliberately a config.pbtxt
+# parameter rather than left to inherit CHATTERBOX_VLLM_GPU_MEM_UTIL from
+# whatever launched tritonserver -- this value depends on which other
+# models share the GPU, which is a deployment fact that belongs here, not
+# on the ambient shell environment of whatever started Triton.
+#
+# Caveat: at 0.18 the KV cache only supports ~1.5x concurrency for full-
+# length (2048 token) sequences -- less than config.pbtxt's own
+# dynamic_batching max_batch_size of 4 below is designed to exploit. Under
+# real concurrent pipeline load, vLLM's own scheduler may serialize/queue
+# requests beyond that internally even though Triton handed it a batch of
+# 4. Revisit if this GPU is ever upgraded or the pipeline is trimmed to
+# fewer concurrent models.
+parameters: {
+  key: "vllm_gpu_mem_util"
+  value: { string_value: "0.18" }
+}
