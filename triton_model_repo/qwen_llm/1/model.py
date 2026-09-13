@@ -29,6 +29,68 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(__file__))
 from admission import AdmissionGate
 
+# Backend switch for the soak-test comparison (docs/accelerated-chatterbox-vllm-fresh-deploy-and-soak-test.md
+# and its unaccelerated-pipeline follow-up): QWEN_BACKEND=trtllm (default) is
+# the existing TensorRT-LLM classic-backend path below. QWEN_BACKEND=pytorch
+# runs the SAME chat-template/sampling logic through plain HF `transformers`
+# generate() instead -- no TensorRT-LLM, no MPI, no compiled engine -- so the
+# soak test can show what TensorRT-LLM's engine actually buys end-to-end.
+# Deliberately NOT the identical NVFP4 checkpoint: `transformers` has no
+# NVFP4/ModelOpt dequant path (confirmed empirically -- it logs "Unknown
+# quantization type, got modelopt" and silently skips dequantization, which
+# would load the raw packed 4-bit bytes as if they were bf16 and produce
+# garbage regardless of GPU memory). This backend instead loads the
+# standard, unquantized Qwen/Qwen3-8B checkpoint via bitsandbytes 8-bit
+# (load_in_8bit) purely to fit this 16GB GPU alongside whisper_asr and
+# chatterbox_tts's own unaccelerated backends -- a full bf16 8B model alone
+# is ~16GB, leaving no room for the rest of the pipeline. The comparison
+# this experiment cares about is TensorRT-LLM's engine (continuous batching,
+# compiled kernels, paged KV cache) vs. plain PyTorch eager generate(), not
+# quantization format -- see the findings doc for this disclosed deviation.
+QWEN_BACKEND = os.environ.get("QWEN_BACKEND", "trtllm")
+
+# Deployment-specific fix: CPython's `_strptime` module lazily builds its
+# locale-format cache (calendar.day_abbr/month_name and friends) on first
+# use, and that lazy init is NOT thread-safe (a long-standing CPython
+# stdlib gap, not fixed as of 3.12 -- concurrent first access from two
+# threads can interleave and hand back a half-built cache entry). Triton's
+# python-backend stub is inherently multi-threaded from the moment it
+# starts (shared-memory polling, request handling, etc.), unlike a plain
+# `python3 -c`/script invocation -- so the first time anything transitively
+# calls into `_strptime` (pandas does, deep in transformers.generation's
+# import chain via candidate_generator -> sklearn -> pandas) is a real
+# race here. Symptom, exactly reproduced and root-caused on this
+# deployment: `AttributeError: 'datetime.date' object has no attribute
+# 'tb_frame'` inside stdlib calendar.py, which transformers' lazy-loader
+# then reports several frames later as the misleading "cannot import name
+# 'GenerationMixin' from 'transformers.generation'". Fix: force the cache
+# to build once, single-threaded, before any thread-racing import can
+# reach it -- this is the standard, documented workaround for this class
+# of bug (see CPython issue history for _strptime thread-safety).
+#
+# A single priming call isn't enough: something else in Triton's own stub
+# hits this cold-start path CONTINUOUSLY, not just once (confirmed
+# empirically -- a bare 20-attempt back-to-back retry loop with no delay
+# still lost every single attempt, and a failed module import isn't cached
+# in sys.modules, so each retry genuinely re-runs _strptime's module body
+# from scratch). Most likely culprit: Triton's own C++ logging emits a
+# timestamp on every log line from multiple internal threads for the whole
+# process lifetime, so the "other side" of this race never goes away on its
+# own the way a one-time cold-start collision would -- a real gap has to
+# open up between two of its calls for a Python-side attempt to land
+# cleanly. A short sleep between retries (letting the log thread's own
+# call finish first) plus a broad except (the corrupted-state failure mode
+# isn't guaranteed to always surface as AttributeError) makes this land in
+# practice; a bare tight loop does not.
+import random
+import time
+for _attempt in range(200):
+    try:
+        time.strptime("2000-01-01", "%Y-%m-%d")
+        break
+    except Exception:
+        time.sleep(0.05 + random.random() * 0.05)
+
 try:
     import numpy as np
 except Exception as e:
@@ -97,6 +159,36 @@ class TritonPythonModel:
     def initialize(self, args):
         model_config = json.loads(args["model_config"])
         params = model_config.get("parameters", {})
+
+        self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
+        self._gate = AdmissionGate(MAX_ADMITTED)
+        self._init_metrics()
+
+        if QWEN_BACKEND == "pytorch":
+            self._init_pytorch(params)
+        else:
+            self._init_trtllm(params)
+
+    def _init_pytorch(self, params):
+        # No MPI, no tensorrt_llm import, no PYTHONHOME dance -- this path
+        # never touches any of that, so none of the fragile ordering the
+        # trtllm path below needs applies here.
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+        model_dir = params.get("pytorch_model_dir", {}).get(
+            "string_value", "/workspace/speech-cascade-inference/models/Qwen3-8B-hf"
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            quantization_config=quant_config,
+            device_map="cuda",
+        )
+        self.model.eval()
+
+    def _init_trtllm(self, params):
         engine_dir = params["engine_dir"]["string_value"]
         tokenizer_dir = params["tokenizer_dir"]["string_value"]
 
@@ -149,9 +241,8 @@ class TritonPythonModel:
             max_seq_len=4096,
             max_batch_size=16,  # raised from 8 -- see docs/nemotron-batch-size-scaling.md
         )
-        self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
-        self._gate = AdmissionGate(MAX_ADMITTED)
 
+    def _init_metrics(self):
         # docs/monitoring.md flags that qwen_llm is deliberately excluded
         # from Triton's own queue/compute panels/alerts -- decoupled/
         # streaming means those built-in per-exec timers return almost
@@ -271,6 +362,17 @@ class TritonPythonModel:
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
 
+            if QWEN_BACKEND == "pytorch":
+                with nvtx_range("qwen_llm.generate"):
+                    generated_text = self._generate_pytorch(prompt)
+                if generated_text:
+                    out_tensor = pb_utils.Tensor(
+                        "GENERATED_TEXT", np.array([generated_text.encode("utf-8")], dtype=np.object_)
+                    )
+                    sender.send(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
+                sender.send(None, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+                return
+
             sampling_params = self.SamplingParams(
                 # Lowered from 256 after measuring: at 256, this checkpoint's rambling
                 # responses (see the chat-template fix's own follow-up notes) never
@@ -336,6 +438,41 @@ class TritonPythonModel:
             # Always release the admission slot, even on error/exception above,
             # so a failure can't leak slots and permanently wedge admission.
             self._gate.release()
+
+    def _generate_pytorch(self, prompt):
+        # No continuous-batching engine here: each request blocks this pool
+        # thread for its own full model.generate() call, one CUDA stream at
+        # a time -- exactly the "no TensorRT-LLM" comparison point this soak
+        # test is measuring. voice_pipeline's own BLS (_run_llm_decoupled)
+        # just concatenates every GENERATED_TEXT chunk it receives into one
+        # string before handing it to chatterbox_tts, so returning the whole
+        # answer as a single decoupled chunk (rather than a true incremental
+        # per-token stream) is functionally identical for this pipeline and
+        # for what the soak-test client measures (total wall-clock time to
+        # the final response) -- see this file's QWEN_BACKEND comment.
+        import torch
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=96,  # matches the trtllm path's max_tokens=96 above
+                do_sample=False,  # matches temperature=0 (greedy) above
+                repetition_penalty=1.15,  # matches the trtllm path's setting above
+                stop_strings=["<|im_end|>", "\n\n", "</think>"],
+                tokenizer=self.tokenizer,
+            )
+        new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+        text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        # generate()'s stop_strings keeps the matched string in the output
+        # (unlike a skip_special_tokens decode of a real EOS token) -- trim
+        # at the first stop marker so the same rambling-cutoff text reaches
+        # chatterbox_tts as the trtllm backend's `stop=[...]` produces.
+        for stop in ("<|im_end|>", "\n\n", "</think>"):
+            idx = text.find(stop)
+            if idx != -1:
+                text = text[:idx]
+        return text.strip()
 
     def finalize(self):
         self._pool.shutdown(wait=False)

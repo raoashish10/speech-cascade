@@ -48,3 +48,11 @@ parameters: {
   key: "tokenizer_dir"
   value: { string_value: "/workspace/speech-cascade-inference/models/Qwen3-8B-NVFP4" }
 }
+# Only read when QWEN_BACKEND=pytorch (model.py) -- the unaccelerated,
+# no-TensorRT-LLM comparison path. Standard unquantized Qwen/Qwen3-8B
+# checkpoint (not the NVFP4 one above -- see model.py's QWEN_BACKEND comment
+# for why), loaded via bitsandbytes 8-bit through plain HF transformers.
+parameters: {
+  key: "pytorch_model_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/Qwen3-8B-hf" }
+}
