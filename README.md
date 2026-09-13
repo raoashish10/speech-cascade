@@ -10,39 +10,24 @@ GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell, sm_120, 16GB VRAM), driver 595.84
 
 ## Layout
 
+This repo is everything git-tracked for this deployment — model weights and
+compiled engines are large binary artifacts and deliberately aren't part of
+it (see `.gitignore`); `deploy/REBUILD.md` covers where those come from and
+how to (re)produce them on an instance.
+
 ```
-speech-cascade-inference/            Deployment directory -- NOT this git repo, gitignored, lives
-                                      only on the instance (see deploy/REBUILD.md "Layout recap")
-  models/                          Downloaded/built model weights + compiled engines
-    Qwen3-8B-NVFP4/                     Pre-quantized checkpoint pulled directly from HF
-                                         (raoashish10/Qwen3-8B-NVFP4) -- not built by a script in
-                                         this repo; see deploy/REBUILD.md 4b
-    whisper-base-trtllm/                Compiled TensorRT-LLM encoder+decoder engines + assets
-                                         (mel filterbank, tokenizer vocab) -- see deploy/REBUILD.md 4c
-  triton_model_repo/                 Live copy of this repo's own triton_model_repo/ (below)
-  triton_server/
-    extracted/tritonserver/            Redistributable no-Docker Triton server build
-    compat_libs/                       Locally-extracted libssl.so.1.1 (not in Ubuntu 24.04)
-  scripts/pipeline_output.wav        chatterbox_tts's reference voice clip (voice-cloning conditioning input)
+triton_model_repo/          Triton model repository (4 models, see below):
+                             each model's model.py + config.pbtxt
+scripts/                    Standalone validation/quantization/load-testing scripts
+tests/                      pytest suite (tests/unit/, tests/integration/)
+deploy/                     Infra as code: requirements files, supervisor
+                             configs, REBUILD.md, ansible/
+streaming_gateway/          The external-facing WebSocket gateway in front of Triton
+monitoring/                 Grafana dashboards + Prometheus alert rules
+docs/                       A few narrative docs that are still git-tracked
+                             (see docs/README.md for the rest of the story)
+.github/workflows/          CI (tests.yml)
 ```
-
-This repo (`speech-cascade`, what you're reading now) holds everything
-git-tracked: each model's `model.py`/`config.pbtxt`, `scripts/`, `tests/`,
-`deploy/`. The deployment directory above is separate, gitignored (see
-`.gitignore`), and holds the large binary artifacts (weights, compiled
-engines, the extracted Triton binary) that don't belong in git — see
-`deploy/REBUILD.md` for exactly how the two relate and how to rebuild the
-second from the first on a fresh instance.
-
-`chatterbox_tts`'s own weights aren't under `models/` either -- `ChatterboxTurboTTS.from_pretrained()`
-pulls them from the HF cache (`HF_HOME`) the first time it's run, same as any
-other `from_pretrained()`-based HF model, rather than a locally-checked-in
-`.nemo`/ONNX-style checkpoint.
-
-`/opt/supervisor-scripts/speech-cascade-triton.sh` and
-`/etc/supervisor/conf.d/speech-cascade-triton.conf` run the server as a
-managed service (outside this folder, per this instance's convention for
-supervisor-managed apps).
 
 ## The four Triton models
 
@@ -214,9 +199,9 @@ audio) without also handing them raw access to run/reload arbitrary models,
 which is a materially bigger blast radius than a single voice endpoint.
 Exposing Triton's ports too would widen the attack surface for no added
 capability, so they stay internal-only, reachable only via `curl
-localhost:1800{0,1,2}` on the box itself or over an SSH tunnel (top-level
-agent guide, §7). See `streaming_gateway/README.md` for how the gateway
-itself is exposed, on external port `10100`.
+localhost:1800{0,1,2}` on the box itself or over an SSH tunnel. See
+`streaming_gateway/README.md` for how the gateway itself is exposed, on
+external port `10100`.
 
 ## External access
 
@@ -226,27 +211,9 @@ open port — anyone with the URL but not the token gets rejected before the
 WebSocket upgrade even completes, whereas an unauthenticated open port would
 be reachable by literally anyone.
 
-**System-level wiring (not tracked in this repo, lives on the instance):**
-
-```yaml
-# /etc/portal.yaml — added under `applications:`
-Streaming Gateway:
-  hostname: localhost
-  external_port: 10100
-  internal_port: 18010
-  open_path: /ws/stream
-  name: Streaming Gateway
-```
-```bash
-supervisorctl restart caddy   # picks up the new portal.yaml entry
-```
-This is the only system-level change; the gateway process itself is
-unchanged (still `uvicorn ... --host 127.0.0.1 --port 18010`, run by the
-existing `speech-cascade-gateway` supervisor service). To reproduce on a
-fresh instance: add that YAML block to `/etc/portal.yaml` and restart caddy
-— see `streaming_gateway/README.md` for the exact `python3 -c` one-liner
-used to do this safely (load-modify-dump, so other portal.yaml entries are
-preserved).
+Getting a fresh instance's edge (Caddy/portal config) wired up to expose the
+gateway is an instance-level step, not something this repo's own files
+drive — see `streaming_gateway/README.md` for that part.
 
 **Connecting from outside the box:**
 
