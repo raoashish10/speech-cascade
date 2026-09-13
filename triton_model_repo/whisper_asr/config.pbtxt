@@ -61,3 +61,10 @@ parameters: {
   key: "assets_dir"
   value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base-trtllm/assets" }
 }
+# Only read when WHISPER_BACKEND=pytorch (model.py) -- the unaccelerated,
+# no-TensorRT-LLM comparison path. Plain HF transformers checkpoint of the
+# same openai/whisper-base model the TensorRT-LLM engine above was built from.
+parameters: {
+  key: "pytorch_model_dir"
+  value: { string_value: "/workspace/speech-cascade-inference/models/whisper-base-hf" }
+}

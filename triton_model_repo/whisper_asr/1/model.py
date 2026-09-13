@@ -11,14 +11,63 @@ import re
 import sys
 from contextlib import contextmanager
 
+# Deployment-specific fix -- see qwen_llm/1/model.py's identical block for
+# the full root-cause writeup: CPython's `_strptime` lazily builds a
+# locale-format cache on first use, and that lazy init is not thread-safe.
+# Triton's python-backend stub is multi-threaded from the moment it starts,
+# so the first transitive call into `_strptime` (pandas, deep in
+# transformers' import chain, imported below via trtllm_whisper) can race
+# and corrupt the cache -- symptom: a misleading "cannot import name
+# 'GenerationMixin' from 'transformers.generation'" several frames removed
+# from the real AttributeError inside stdlib calendar.py. Priming it here,
+# single-threaded, before any of those imports, avoids the race entirely.
+#
+# A single priming call isn't enough: something else in Triton's own stub
+# hits this cold-start path CONTINUOUSLY, not just once (confirmed
+# empirically against qwen_llm's identical fix -- a bare tight retry loop
+# with no delay lost every attempt). Most likely culprit: Triton's own C++
+# logging emits a timestamp on every log line from multiple internal
+# threads for the whole process lifetime, so a real gap has to open up
+# between two of its calls for a Python-side attempt to land cleanly. A
+# short sleep between retries plus a broad except (the corrupted-state
+# failure mode isn't guaranteed to always surface as AttributeError) is
+# what actually makes this land in practice.
+import random
+import time
+for _attempt in range(200):
+    try:
+        time.strptime("2000-01-01", "%Y-%m-%d")
+        break
+    except Exception:
+        time.sleep(0.05 + random.random() * 0.05)
+
 import librosa
 import numpy as np
 import torch
 import triton_python_backend_utils as pb_utils
 
+# Backend switch for the soak-test comparison (see qwen_llm/1/model.py's
+# identical QWEN_BACKEND comment for the full rationale): WHISPER_BACKEND=
+# trtllm (default) is the existing TensorRT-LLM engine path below.
+# WHISPER_BACKEND=pytorch runs the same openai/whisper-base checkpoint
+# through plain HF `transformers` (WhisperForConditionalGeneration.generate())
+# instead -- no compiled TensorRT engines, no separate encoder/decoder
+# engine build step. Checked BEFORE the trtllm_whisper import below: that
+# package transitively imports tensorrt_llm -> mpi4py.MPI, which spawns an
+# `orted` MPI singleton daemon as an import side effect (see qwen_llm/1/
+# model.py's PYTHONHOME comment for the full mechanism) -- the pytorch
+# backend has no use for any of that and skips the import entirely rather
+# than pay its cost/risk for nothing.
+WHISPER_BACKEND = os.environ.get("WHISPER_BACKEND", "trtllm")
+
 sys.path.insert(0, os.path.dirname(__file__))
-from trtllm_whisper.whisper_model import WhisperTRTLLM
-from trtllm_whisper.whisper_utils import log_mel_spectrogram
+if WHISPER_BACKEND != "pytorch":
+    # See qwen_llm/1/model.py's identical os.environ.pop("PYTHONHOME", ...)
+    # comment: must happen before tensorrt_llm is imported (transitively, via
+    # trtllm_whisper below), not just before WhisperTRTLLM(...) is constructed.
+    os.environ.pop("PYTHONHOME", None)
+    from trtllm_whisper.whisper_model import WhisperTRTLLM
+    from trtllm_whisper.whisper_utils import log_mel_spectrogram
 
 # Whisper's encoder was trained on 16kHz mono audio; anything else must be
 # resampled before feature extraction or the model mishears speed/pitch.
@@ -52,6 +101,25 @@ class TritonPythonModel:
     def initialize(self, args):
         model_config = json.loads(args["model_config"])
         params = model_config.get("parameters", {})
+
+        if WHISPER_BACKEND == "pytorch":
+            self._init_pytorch(params)
+        else:
+            self._init_trtllm(params, model_config)
+
+    def _init_pytorch(self, params):
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        model_dir = params.get("pytorch_model_dir", {}).get(
+            "string_value", "/workspace/speech-cascade-inference/models/whisper-base-hf"
+        )
+        self.processor = WhisperProcessor.from_pretrained(model_dir)
+        self.pt_model = WhisperForConditionalGeneration.from_pretrained(
+            model_dir, dtype=torch.float16
+        ).to("cuda")
+        self.pt_model.eval()
+
+    def _init_trtllm(self, params, model_config):
         engine_dir = params["engine_dir"]["string_value"]
         assets_dir = params["assets_dir"]["string_value"]
         max_batch_size = model_config.get("max_batch_size", 8) or 8
@@ -90,6 +158,17 @@ class TritonPythonModel:
                 audio = librosa.resample(audio, orig_sr=input_sample_rate, target_sr=WHISPER_SAMPLE_RATE)
             audios.append(audio)
 
+        if WHISPER_BACKEND == "pytorch":
+            with nvtx_range("whisper_asr.generate"):
+                transcripts = self._transcribe_pytorch(audios)
+            responses = []
+            for transcript in transcripts:
+                out_tensor = pb_utils.Tensor(
+                    "TRANSCRIPT", np.array([transcript.encode("utf-8")], dtype=np.object_)
+                )
+                responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
+            return responses
+
         # Pad every sample to the full 30s window Whisper was trained/built
         # for ("max" padding strategy -- the TensorRT-LLM example's own
         # default). Padding only to the longest-in-batch instead (its
@@ -127,6 +206,20 @@ class TritonPythonModel:
             )
             responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
         return responses
+
+    def _transcribe_pytorch(self, audios):
+        # Same 16kHz-mono-in / batched-generate contract as the trtllm path
+        # above, but through plain HF transformers -- WhisperFeatureExtractor
+        # (inside self.processor) handles the fixed 30s-window padding
+        # itself, no need to replicate log_mel_spectrogram's manual padding.
+        inputs = self.processor(audios, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt")
+        input_features = inputs.input_features.to("cuda", dtype=torch.float16)
+        with torch.inference_mode():
+            generated_ids = self.pt_model.generate(
+                input_features, language="english", task="transcribe"
+            )
+        transcripts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+        return [SPECIAL_TOKEN_RE.sub('', t).strip() for t in transcripts]
 
     def finalize(self):
         pass
