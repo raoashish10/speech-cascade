@@ -129,7 +129,25 @@ for line in sys.stdin:
                         speech_tokens=speech_tokens, ref_dict=model.conds.gen, n_cfm_timesteps=2,
                     )
                 wav = wav.squeeze(0).detach().cpu().numpy()
-                watermarked_wav = model.watermarker.apply_watermark(wav, sample_rate=model.sr)
+                # Host-RAM leak fix (found via this soak test -- see
+                # docs/accelerated-chatterbox-vllm-fresh-deploy-and-soak-test.md):
+                # PerthImplicitWatermarker.apply_watermark() defaults to
+                # device="cpu" and runs a real nn.Module forward pass
+                # (self.perth_net.encoder(...)) with no torch.no_grad()/
+                # inference_mode() of its own. Called here outside any such
+                # context (unlike every other tensor op in this file), it
+                # built a full CPU-resident autograd graph on every single
+                # request -- reclaimable only by Python's cyclic GC, not
+                # plain refcounting, which under sustained load couldn't
+                # keep pace with the allocation rate. Measured: ~5.4-5.5 MB
+                # of host RAM leaked per request, constant across
+                # concurrency 1 and 4, that drove this container from a
+                # healthy baseline to its actual ~45GiB cgroup ceiling
+                # within about 25 minutes of sustained load. GPU memory
+                # stayed completely flat throughout -- consistent with this
+                # being a host-only (CPU autograd), not GPU, leak.
+                with torch.inference_mode():
+                    watermarked_wav = model.watermarker.apply_watermark(wav, sample_rate=model.sr)
 
                 fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="chatterbox_")
                 os.close(fd)
