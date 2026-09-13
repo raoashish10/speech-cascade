@@ -123,19 +123,35 @@ for line in sys.stdin:
             raise ValueError(f"expected a non-empty JSON array of texts, got {line!r}")
 
         t0 = time.time()
-        # ChatterboxTurboTTS.generate_batch() (chatterbox/tts_turbo.py)
-        # builds no autograd graph on purpose -- it's inference-only -- but
-        # never wraps itself in torch.no_grad()/inference_mode(), so PyTorch
+        # The installed chatterbox-tts==0.1.7 (PyPI) release's ChatterboxTurboTTS
+        # exposes only a single-item generate(text, ...) -- no generate_batch,
+        # no use_cuda_graph -- unlike what an earlier revision of this worker
+        # assumed (whatever venv that was validated against had a patched/
+        # forked build with those extras; the public package doesn't). Loops
+        # single-item generate() calls instead: strictly more "unaccelerated"
+        # than a hypothetical batched-eager path anyway, which is the whole
+        # point of this backend for the soak-test comparison (see
+        # chatterbox_tts/1/model.py's CHATTERBOX_BACKEND comment).
+        #
+        # generate() builds no autograd graph on purpose -- it's inference-only --
+        # but never wraps itself in torch.no_grad()/inference_mode(), so PyTorch
         # still tracks every intermediate tensor's grad-fn through the T3
-        # backbone and S3Gen vocoder by default. Measured live (docs/
-        # chatterbox-host-ram-leak.md) for the old single-item generate():
-        # host RSS grows ~3.6MB/request, unbounded, with no plateau across
-        # 200+ requests, inside generate() specifically. Wrapping just this
-        # call in inference_mode() cuts steady-state growth to ~0.1MB/request
-        # and it plateaus within ~100 requests, instead of growing forever --
-        # same reasoning applies here, just per-batch instead of per-item.
-        with torch.inference_mode(), nvtx_range("chatterbox.generate_batch"):
-            wavs = model.generate_batch(texts, use_cuda_graph=_USE_CUDA_GRAPH)
+        # backbone, S3Gen vocoder, AND the internal watermarker call by
+        # default. Measured live (docs/chatterbox-host-ram-leak.md, and
+        # independently rediscovered in chatterbox_worker_vllm.py's own fix):
+        # host RSS grows unbounded per request without this wrapper. Wrapping
+        # the whole loop in inference_mode() covers every one of those calls
+        # (thread-local context, inherited by everything generate() calls
+        # internally) and cuts steady-state growth to a small, plateauing
+        # amount instead of growing forever.
+        wavs = []
+        with torch.inference_mode(), nvtx_range("chatterbox.generate"):
+            for text in texts:
+                try:
+                    wav = model.generate(text)
+                    wavs.append(wav.squeeze(0).detach().cpu().numpy())
+                except Exception:
+                    wavs.append(None)
         elapsed = time.time() - t0
 
         results = []
