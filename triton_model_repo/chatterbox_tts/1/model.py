@@ -72,7 +72,21 @@ _BACKEND = os.environ.get("CHATTERBOX_BACKEND", "vllm")
 if _BACKEND == "vllm":
     CHATTERBOX_PYTHON = "/venv/vllm/bin/python3"
     WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker_vllm.py")
-    CHATTERBOX_NPP_LIB = None  # vLLM's own nvidia-*-cu12 wheels are self-contained; no torchcodec dependency here
+    # Instance-specific quirk (this deployment, not upstream): this base image
+    # ships a system-wide libcudnn9 (9.10.2, predates this deployment) at
+    # /usr/lib/x86_64-linux-gnu/libcudnn.so.9. With LD_LIBRARY_PATH unset,
+    # the dynamic linker's default cache resolves libcudnn.so.9 there instead
+    # of vLLM's own bundled, newer cuDNN (torch's cudnn backend then raises
+    # "cuDNN version incompatibility: PyTorch was compiled against (9,20,0)
+    # but found runtime version (9,10,2)" the moment ChatterboxTurboTTS's
+    # voice-encoder LSTM calls flatten_parameters()). Point LD_LIBRARY_PATH
+    # at vLLM's own venv-bundled cudnn/cublas so they take priority over the
+    # system copy -- same pattern the pytorch backend below already uses for
+    # its own NPP dependency, just a different library.
+    CHATTERBOX_WORKER_LD_LIBRARY_PATH = (
+        "/venv/vllm/lib/python3.12/site-packages/nvidia/cudnn/lib:"
+        "/venv/vllm/lib/python3.12/site-packages/nvidia/cublas/lib"
+    )
 else:
     CHATTERBOX_PYTHON = "/venv/chatterbox/bin/python3"
     WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker.py")
@@ -82,7 +96,7 @@ else:
     # /venv/main's TensorRT-LLM libs) -- it needs its own venv's NPP library
     # path for torchcodec's audio-save dependency. Every turn's generation
     # would succeed while the final save silently failed if this were wrong.
-    CHATTERBOX_NPP_LIB = "/venv/chatterbox/lib/python3.12/site-packages/nvidia/npp/lib"
+    CHATTERBOX_WORKER_LD_LIBRARY_PATH = "/venv/chatterbox/lib/python3.12/site-packages/nvidia/npp/lib"
 PROTO = "@@PROTO@@"
 
 
@@ -116,8 +130,8 @@ class TritonPythonModel:
         worker_env = dict(os.environ)
         worker_env.pop("PYTHONHOME", None)
         worker_env.pop("PYTHONPATH", None)
-        if CHATTERBOX_NPP_LIB is not None:
-            worker_env["LD_LIBRARY_PATH"] = CHATTERBOX_NPP_LIB
+        if CHATTERBOX_WORKER_LD_LIBRARY_PATH is not None:
+            worker_env["LD_LIBRARY_PATH"] = CHATTERBOX_WORKER_LD_LIBRARY_PATH
         else:
             worker_env.pop("LD_LIBRARY_PATH", None)
 
