@@ -53,7 +53,60 @@ utils=/opt/supervisor-scripts/utils
 # onnxruntime's CUDA EP to find cuBLAS/cuDNN 12.x (shipped inside the
 # venv's own nvidia-* pip packages) instead of the system's cuBLAS 13.x. ---
 export PYTHONHOME=/venv/main
-export PYTHONPATH=/venv/main/lib/python3.12/site-packages
+# Instance-specific fix, discovered during this deployment: a plain
+# `python3.12 -m venv /venv/main` never contains a full stdlib copy (only
+# site-packages) -- forcing PYTHONHOME=/venv/main (quirk #3) then leaves
+# Triton's python-backend stub (which always dynamically loads its OWN
+# bundled libpython3.12.so.1.0 via an $ORIGIN RUNPATH, regardless of
+# PYTHONHOME/PYTHONPATH) unable to find `encodings` at all ("failed to get
+# the Python codec of the filesystem encoding"). Worse: that bundled
+# libpython (built on Red Hat/GCC-11.2.1 per its embedded build string) does
+# NOT statically link several modules (_struct, _posixsubprocess, _ctypes,
+# _datetime) that every distro's own CPython build here treats as
+# compiled-in builtins -- so no local Python distribution has them as
+# loadable .so files except conda-forge's (which builds almost everything
+# as separate .so modules by policy). The exact conda-forge *version*
+# matters, not just that it's conda-forge: an initial fix using
+# conda-forge's latest (3.12.14) mismatched the bundled libpython's own
+# patch version (3.12.3) at the C-API level for anything with its own
+# capsule/struct-layout ABI -- worked fine for _struct/_posixsubprocess
+# (plain functions), but corrupted _ctypes (undefined symbol:
+# _PyErr_SetLocaleString) and, far more subtly, _datetime: datetime.date
+# objects loaded fine and imported fine, but calling .strftime() on one
+# produced garbage ("'datetime.date' object has no attribute 'tb_frame'"),
+# which stdlib calendar.py hits on first use building its locale-name
+# cache, which transformers.generation's lazy-loader then reports several
+# frames later as the wildly misleading "cannot import name
+# 'GenerationMixin' from 'transformers.generation'". Cost real time to
+# root-cause specifically because it looked exactly like a threading race
+# (intermittent-seeming, deep in an unrelated-looking import chain) rather
+# than a version-pinned ABI mismatch -- it is 100% deterministic once you
+# know to reproduce it directly (`datetime.date(2001,1,1).strftime('%a')`)
+# rather than through transformers' own confusing error surface. Fixed by
+# pinning conda-forge's python to the *exact* same version, not just
+# distribution, as the bundled libpython: `mamba create -p
+# /workspace/py312_dynload_exact python=3.12.3 --no-deps -c conda-forge`.
+# Workspace-persistent but not provisioned by anything; recreate the same
+# way after a recycle/destroy. Ubuntu's own lib-dynload is kept first in
+# priority purely for the modules it does ship as real files (e.g.
+# _ssl) -- redundant with the exact-match conda env for anything both
+# provide, but harmless either way since they're now the same ABI.
+# nvidia-cutlass-dsl (a tensorrt_llm dependency needed for its Blackwell
+# fused-MoE CUTLASS DSL custom ops) ships as a .pth file
+# (nvidia_cutlass_dsl.pth) pointing at a nested python_packages/ dir --
+# .pth files are only processed by `site.addsitedir()` for a directory
+# discovered through NORMAL site-packages resolution (derived from
+# sys.prefix), and forcing PYTHONHOME to a bare venv here means that normal
+# resolution path never actually runs, so the .pth file is silently never
+# read. Symptom: `import cutlass` -> ModuleNotFoundError, which
+# tensorrt_llm's own try/except around it swallows into
+# IS_CUTLASS_DSL_AVAILABLE=False, which THEN surfaces many frames later and
+# confusingly as "cannot import name
+# 'Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner'" (a class
+# defined inside an `if IS_CUTLASS_DSL_AVAILABLE:` block, so it simply never
+# exists when the flag is False). Fixed by adding the .pth file's target
+# directory to PYTHONPATH directly, bypassing .pth processing entirely.
+export PYTHONPATH="/usr/lib/python3.12:/usr/lib/python3.12/lib-dynload:/workspace/py312_dynload_exact/lib/python3.12/lib-dynload:/venv/main/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages:/venv/main/lib/python3.12/site-packages"
 export PATH="/venv/main/bin:${PATH}"
 export LD_LIBRARY_PATH="/venv/main/lib:/workspace/speech-cascade-inference/triton_server/compat_libs/extracted/usr/lib/x86_64-linux-gnu:/venv/main/lib/python3.12/site-packages/nvidia/cublas/lib:/venv/main/lib/python3.12/site-packages/nvidia/cudnn/lib:/venv/gateway/lib/python3.12/site-packages/nvidia/cu13/lib:/workspace/speech-cascade-inference/triton_server/extracted/tritonserver/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -95,7 +148,7 @@ done
 # see the header comment for why this must stay sequential, not parallel.
 for model in qwen_llm whisper_asr chatterbox_tts voice_pipeline; do
   echo "loading ${model}..."
-  if curl -sf -X POST "http://127.0.0.1:18000/v2/repository/models/${model}/load"; then
+  if curl -sf -X POST "http://127.0.0.1:18000/v2/repository/models/${model}/load" -d '{}'; then
     echo "${model} load request succeeded"
   else
     echo "${model} load request FAILED -- see the server log above for the reason"
