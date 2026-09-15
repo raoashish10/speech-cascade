@@ -22,6 +22,9 @@ __pycache__/
 deploy/ansible/group_vars/all/vault.yml
 deploy/ansible/inventory.ini
 
+# Docker deployment secrets -- only .env.example is tracked.
+.env
+
 # Investigation/narrative docs -- archived to S3 instead of git going
 # forward (see docs/README.md and scripts/archive_docs_to_s3.sh). Only the
 # pointer README stays tracked.

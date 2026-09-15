@@ -1,0 +1,87 @@
+# Two services, matching the two isolated processes README.md already
+# describes (Triton + the streaming gateway) -- just containerized and
+# talking over the Docker network instead of both binding 127.0.0.1 on the
+# same bare-metal box. See docs/DOCKER.md for the full rundown, including
+# what this deliberately does NOT replace (a GPU host + nvidia-container-toolkit
+# still has to exist under this).
+#
+# UNVERIFIED end-to-end (no GPU / no Docker-in-Docker in the environment
+# this was written in) -- see docker/triton/Dockerfile's header.
+
+services:
+  triton:
+    build:
+      context: .
+      dockerfile: docker/triton/Dockerfile
+    image: speech-cascade-triton
+    # Not published to the host on purpose -- reachable only from other
+    # containers on this compose network (i.e. `gateway`, by service name
+    # `triton`), the same "internal-only" property README.md describes for
+    # the bare-metal deployment's 127.0.0.1-bound ports.
+    expose:
+      - "18000"
+      - "18001"
+      - "18002"
+    environment:
+      S3_BUCKET_URI: "${S3_BUCKET_URI:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
+    volumes:
+      - inference-data:/workspace/speech-cascade-inference/models
+    # Requires nvidia-container-toolkit on the host (`nvidia-ctk runtime
+    # configure --runtime=docker` or equivalent) -- this is what every GPU
+    # provider from the "which provider" discussion (RunPod, SaladCloud,
+    # Lambda Labs, ...) either preinstalls on their Docker-native
+    # images/templates or documents as a setup step. `count: 1` assumes a
+    # single-GPU host, matching the current RTX 5070 Ti instance -- bump
+    # this (or switch to `device_ids`) for a multi-GPU box.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:18000/v2/health/ready"]
+      # Triton takes ~5-6 minutes to become ready (TensorRT-LLM import +
+      # sequential engine load across all 4 models) -- README.md's
+      # "Managing the service" section gives this same number for the
+      # bare-metal deployment.
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
+    image: speech-cascade-gateway
+    depends_on:
+      triton:
+        condition: service_healthy
+    environment:
+      TRITON_URL: triton:18001
+      GATEWAY_MAX_SESSIONS: "${GATEWAY_MAX_SESSIONS:-4}"
+      # Required in this deployment shape -- there's no Vast.ai Caddy auth
+      # edge in front of the gateway here. See docs/DOCKER.md "Auth"
+      # section and streaming_gateway/server.py. Leave empty only if
+      # something else in front of this (your own reverse proxy, a
+      # provider's own auth edge) is already handling it.
+      GATEWAY_AUTH_TOKEN: "${GATEWAY_AUTH_TOKEN:-}"
+    ports:
+      - "${GATEWAY_PORT:-18010}:18010"
+    restart: unless-stopped
+
+volumes:
+  # Holds models/ (weights + compiled TensorRT engines) -- restored from S3
+  # by the triton container's entrypoint on first boot if S3_BUCKET_URI is
+  # set, or populate it yourself (e.g. `docker compose run --rm triton
+  # bash` and copy files in, or an from-scratch build per
+  # deploy/REBUILD.md section 4). Deliberately a named volume, not baked
+  # into the image -- these are large, GPU-arch-pinned artifacts you don't
+  # want in an image layer.
+  inference-data:

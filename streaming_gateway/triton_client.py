@@ -6,10 +6,16 @@ and decoupled (streaming), so it takes no batch dim and uses stream_infer()
 instead of a unary infer() call.
 """
 
+import os
+
 import numpy as np
 import tritonclient.grpc.aio as grpcclient
 
-TRITON_URL = "localhost:18001"
+# "localhost:18001" is only correct when the gateway and Triton share a
+# network namespace (the bare-metal deployment, both on 127.0.0.1). In the
+# Docker deployment (docker-compose.yml) they're separate containers, so
+# TRITON_URL is set to "triton:18001" (the compose service name) instead.
+TRITON_URL = os.environ.get("TRITON_URL", "localhost:18001")
 
 _client: grpcclient.InferenceServerClient | None = None
 
