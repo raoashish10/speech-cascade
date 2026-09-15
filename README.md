@@ -44,19 +44,12 @@ docs/                       A few narrative/investigation docs
   wrapping a runtime or orchestrating other models, as opposed to a raw
   compiled-graph backend loading a model file with no custom code.
 
-One non-obvious wrinkle when writing `voice_pipeline`: the models it calls
-all declare `max_batch_size > 0` (an implicit leading batch dimension), but
-`voice_pipeline` itself is unbatched (`max_batch_size: 0`). Every tensor
-forwarded to a callee needs an explicit batch dim of 1 added before the
-call (`arr.reshape(1, *arr.shape)`) — Triton doesn't do this automatically
-for BLS-constructed requests. The asymmetric part: tensors coming *back*
-from a BLS call do **not** carry that batch dimension — they're exactly
-what the callee's own `execute()` constructed per-request, before any
-wire-level batch aggregation. Getting this backwards produces confusing
-failures ("batch size does not match other inputs" if you forget to add it
-on the way in, silently wrong data — e.g. a whole audio array collapsed to
-its first sample — if you strip a batch dim on the way out that was never
-there).
+One gotcha when working on `voice_pipeline`: it has to manually add a batch
+dimension to every tensor it sends to the other three models, and manually
+strip it back off every tensor it gets back — Triton doesn't do this for
+you here, and getting either direction wrong causes confusing failures
+(rejected requests, or silently corrupted audio). See the comments in
+`triton_model_repo/voice_pipeline/1/model.py` for the details.
 
 ## Process architecture (what's actually running)
 
