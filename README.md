@@ -33,15 +33,16 @@ docs/                       A few narrative/investigation docs
 | `chatterbox_tts` | python | ResembleAI's Chatterbox-Turbo (`ChatterboxTurboTTS`), run as a subprocess in its own isolated venv (`/venv/chatterbox`). T3's autoregressive decode is batched across concurrent requests and served via vLLM by default (`CHATTERBOX_BACKEND=vllm`; `pytorch` kept as an instant rollback); S3Gen's flow-matching vocoder still runs per-item in plain PyTorch, unbatched — see `deploy/PROFILING.md` and the `config.pbtxt` comments for why | `TEXT` (string) + optional `VOICE` (string, currently ignored — single fixed reference voice) -> `AUDIO_SAMPLES` (float32[]) + `SAMPLE_RATE` (int32) |
 | `voice_pipeline` | python | Calls the three above via Triton's in-process BLS API (`pb_utils.InferenceRequest`), turning any downstream admission rejection into a clean per-request error instead of a crash | `AUDIO_SAMPLES` + optional `SAMPLE_RATE`/`VOICE` -> `TRANSCRIPT`, `GENERATED_TEXT`, `AUDIO_SAMPLES`, `SAMPLE_RATE` |
 
-The first three use Triton's **python backend** as a thin wrapper around a
-Python-level runtime (TensorRT-LLM's `LLM` API, vendored TensorRT-LLM Whisper
-runtime, a subprocess running ResembleAI's `ChatterboxTurboTTS`) rather than
-Triton's native `onnxruntime`/`tensorrt` backends directly.
-`voice_pipeline` is pure orchestration — no model weights of its own, no GPU
-instance needed — chaining the other three into one audio-in/audio-out
-request/response. That's what "Triton BLS" means: business-logic-scripting
-models, either wrapping a runtime or orchestrating other models, as opposed
-to a raw compiled-graph backend loading a model file with no custom code.
+- The first three use Triton's **python backend** as a thin wrapper around a
+  Python-level runtime (TensorRT-LLM's `LLM` API, vendored TensorRT-LLM
+  Whisper runtime, a subprocess running ResembleAI's `ChatterboxTurboTTS`)
+  rather than Triton's native `onnxruntime`/`tensorrt` backends directly.
+- `voice_pipeline` is pure orchestration — no model weights of its own, no
+  GPU instance needed — chaining the other three into one audio-in/audio-out
+  request/response.
+- That's what "Triton BLS" means: business-logic-scripting models, either
+  wrapping a runtime or orchestrating other models, as opposed to a raw
+  compiled-graph backend loading a model file with no custom code.
 
 One non-obvious wrinkle when writing `voice_pipeline`: the models it calls
 all declare `max_batch_size > 0` (an implicit leading batch dimension), but
