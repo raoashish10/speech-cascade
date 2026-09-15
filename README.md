@@ -10,11 +10,6 @@ GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell, sm_120, 16GB VRAM), driver 595.84
 
 ## Layout
 
-This repo is everything git-tracked for this deployment — model weights and
-compiled engines are large binary artifacts and deliberately aren't part of
-it (see `.gitignore`); `deploy/REBUILD.md` covers where those come from and
-how to (re)produce them on an instance.
-
 ```
 triton_model_repo/          Triton model repository (4 models, see below):
                              each model's model.py + config.pbtxt
@@ -24,7 +19,7 @@ deploy/                     Infra as code: requirements files, supervisor
                              configs, REBUILD.md, ansible/
 streaming_gateway/          The external-facing WebSocket gateway in front of Triton
 monitoring/                 Grafana dashboards + Prometheus alert rules
-docs/                       A few narrative docs that are still git-tracked
+docs/                       A few narrative/investigation docs
                              (see docs/README.md for the rest of the story)
 .github/workflows/          CI (tests.yml)
 ```
@@ -211,9 +206,8 @@ open port — anyone with the URL but not the token gets rejected before the
 WebSocket upgrade even completes, whereas an unauthenticated open port would
 be reachable by literally anyone.
 
-Getting a fresh instance's edge (Caddy/portal config) wired up to expose the
-gateway is an instance-level step, not something this repo's own files
-drive — see `streaming_gateway/README.md` for that part.
+See `streaming_gateway/README.md` for how a fresh instance's edge
+(Caddy/portal config) gets wired up to expose the gateway.
 
 **Connecting from outside the box:**
 
