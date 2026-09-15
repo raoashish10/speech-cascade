@@ -2,8 +2,8 @@
 
 A voice pipeline (ASR -> LLM -> TTS) served entirely through NVIDIA Triton
 Inference Server, running bare-metal on this instance (no Docker — this
-container can't run Docker-in-Docker). Matches the v1 architecture diagram:
-Triton BLS python-backend models wrapping each stage, all GPU-accelerated.
+container can't run Docker-in-Docker): Triton BLS python-backend models
+wrapping each stage, all GPU-accelerated.
 
 GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell, sm_120, 16GB VRAM), driver 595.84
 (CUDA 13.2 max). CUDA 12.8 and 13.2 toolkits are both installed system-wide.
@@ -39,10 +39,9 @@ runtime, a subprocess running ResembleAI's `ChatterboxTurboTTS`) rather than
 Triton's native `onnxruntime`/`tensorrt` backends directly.
 `voice_pipeline` is pure orchestration — no model weights of its own, no GPU
 instance needed — chaining the other three into one audio-in/audio-out
-request/response, matching what the diagram's arrows actually show. That's
-what "Triton BLS" means: business-logic-scripting models, either wrapping a
-runtime or orchestrating other models, as opposed to a raw compiled-graph
-backend loading a model file with no custom code.
+request/response. That's what "Triton BLS" means: business-logic-scripting
+models, either wrapping a runtime or orchestrating other models, as opposed
+to a raw compiled-graph backend loading a model file with no custom code.
 
 One non-obvious wrinkle when writing `voice_pipeline`: the models it calls
 all declare `max_batch_size > 0` (an implicit leading batch dimension), but
