@@ -52,32 +52,36 @@ FROM ${TRITON_BASE_IMAGE}
 # this (it's just never wired into deploy/ansible/playbook.yml's fresh-venv
 # install, which apparently hasn't hit this particular resolver conflict).
 #
-# Just dropping the numpy== pin (first attempt) isn't enough: with numpy
-# left fully unconstrained across ~200 other exact-pinned packages, pip's
+# Just dropping the numpy== pin isn't enough on its own: with numpy left
+# fully unconstrained across ~200 other exact-pinned packages, pip's
 # resolver has to backtrack across every one of their individual numpy
 # ranges while librosa alone pulls toward >=2.1.0 -- confirmed the hard
 # way too, pip gives up with "resolution-too-deep" (dependency graph too
 # complex). Dropping librosa as well removes the actual outlier forcing
 # that backtrack, so numpy settles near 1.26.x on its own from the other
-# ~198 packages' (compatible) constraints. Then both are force-installed
+# ~198 packages' (compatible) constraints. Both are then force-installed
 # with --no-deps: librosa==1.0.0 ignoring its own numpy>=2.1.0 claim, then
-# numpy==1.26.4 pinned back down in case anything upstream nudged it --
-# same "ignore the now-stale metadata constraint, it still works at
-# runtime" trade-off numpy_override.txt's own existence implies.
+# numpy==1.26.4 pinned back down -- same "ignore the now-stale metadata
+# constraint, it still works at runtime" trade-off numpy_override.txt's
+# own existence implies.
+#
+# `python3 -m pip`, NOT bare `pip`, throughout: this image's `pip` has
+# shebang #!/usr/bin/python, a DIFFERENT interpreter from /usr/local/bin/
+# python3 (the one Triton's python backend and the assertion below both
+# actually use) -- confirmed the hard way, after multiple rounds of a
+# numpy_override that reported "already satisfied 1.26.4" while the
+# runtime `import numpy` kept resolving to 2.5.3 from an entirely
+# separate site-packages. Bare `pip install` silently installs into the
+# wrong Python's dist-packages; `python3 -m pip install` runs pip inside
+# the actual interpreter that matters, so it lands in the site-packages
+# that imports actually resolve from.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
 COPY deploy/numpy_override.txt /tmp/numpy_override.txt
-# numpy_override runs LAST, not right after librosa -- confirmed the hard
-# way that `pip install awscli` (no --no-deps; its own deps are already
-# satisfied here, so this isn't about awscli specifically) still nudges
-# numpy to 2.5.3 even after it was correctly pinned back to 1.26.4 in
-# between. Rather than chase exactly which transitive resolve does it,
-# numpy_override now runs after every other pip install in this RUN, so
-# whatever happens upstream, it's the last word before the assertion.
 RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
-    && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
-    && pip install --no-cache-dir --no-deps librosa==1.0.0 \
-    && pip install --no-cache-dir awscli \
-    && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
+    && python3 -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
+    && python3 -m pip install --no-cache-dir --no-deps librosa==1.0.0 \
+    && python3 -m pip install --no-cache-dir awscli \
+    && python3 -m pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
 
 # Chatterbox TTS runs in its own isolated venv, launched as a subprocess by
