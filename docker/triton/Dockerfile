@@ -44,8 +44,22 @@ FROM ${TRITON_BASE_IMAGE}
 # doesn't ship this exact pin pre-installed, so pip actually has to fetch
 # it, unlike the packages above it in the file that resolve as "already
 # satisfied").
+#
+# numpy==1.26.4 and librosa==1.0.0 are BOTH pinned in requirements-main.txt,
+# but on this base image (Python 3.12) pip's resolver reports librosa 1.0.0
+# itself requires numpy>=2.1.0 -- a hard ResolutionImpossible, confirmed the
+# hard way, not a hypothetical. deploy/numpy_override.txt exists for exactly
+# this (it's just never wired into deploy/ansible/playbook.yml's fresh-venv
+# install, which apparently hasn't hit this particular resolver conflict).
+# Fix: install everything else first letting numpy float to whatever
+# satisfies librosa, then force numpy back down with --no-deps -- same
+# "ignore the now-stale librosa metadata constraint, it still works at
+# runtime" trade-off numpy_override.txt's own existence implies.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main.txt \
+COPY deploy/numpy_override.txt /tmp/numpy_override.txt
+RUN grep -v '^numpy==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
+    && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
+    && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
     && pip install --no-cache-dir awscli \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
 
@@ -58,9 +72,15 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
 RUN (python3.12 -m venv /venv/chatterbox || python3 -m venv /venv/chatterbox)
 COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
 # Same +cu128 wheel-index requirement as requirements-main.txt above --
-# torch/torchaudio/torchcodec here are pinned to +cu128 builds too.
+# torch/torchaudio/torchcodec here are pinned to +cu128 builds too. Same
+# numpy==1.26.4-vs-resolver defensive split as requirements-main.txt above
+# (this file pins numpy==1.26.4 too, alongside librosa/numba/scipy, which
+# hit the same class of conflict there) -- applied preemptively here rather
+# than waiting for a second failed build to prove it's needed too.
 RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox.txt
+    && grep -v '^numpy==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
 
 # config.pbtxt files across triton_model_repo/ use absolute paths under
 # /workspace/speech-cascade-inference/... (e.g. qwen_llm's engine_dir,
