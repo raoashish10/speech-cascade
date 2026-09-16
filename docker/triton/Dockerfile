@@ -90,6 +90,15 @@ RUN echo "/usr/local/lib/python3.12/dist-packages" > /usr/local/lib/python3.12/s
 # note on why python3 itself can't do network installs here. Bare pip
 # installs into dist-packages, which the top-of-file .pth bridge now
 # makes visible to python3's imports and to the assertion below too.
+#
+# The .pth bridge alone still isn't enough for numpy specifically: this
+# base image's site-packages already ships its OWN numpy 2.5.3 (NVIDIA's
+# own install, presumably, since it predates anything we've done), and a
+# .pth-appended path is searched AFTER what's already in site-packages --
+# so python3's `import numpy` kept resolving the stale 2.5.3 first no
+# matter what dist-packages had, confirmed the hard way across attempt 8.
+# Deleting that stale copy is the only way to make the correct
+# dist-packages one (numpy_override, just above) actually win the import.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
 COPY deploy/numpy_override.txt /tmp/numpy_override.txt
 RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
@@ -97,6 +106,7 @@ RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requiremen
     && pip install --no-cache-dir --no-deps librosa==1.0.0 \
     && pip install --no-cache-dir awscli \
     && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
+    && rm -rf /usr/local/lib/python3.12/site-packages/numpy /usr/local/lib/python3.12/site-packages/numpy.libs /usr/local/lib/python3.12/site-packages/numpy-*.dist-info \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
 
 # Chatterbox TTS runs in its own isolated venv, launched as a subprocess by
