@@ -51,14 +51,24 @@ FROM ${TRITON_BASE_IMAGE}
 # hard way, not a hypothetical. deploy/numpy_override.txt exists for exactly
 # this (it's just never wired into deploy/ansible/playbook.yml's fresh-venv
 # install, which apparently hasn't hit this particular resolver conflict).
-# Fix: install everything else first letting numpy float to whatever
-# satisfies librosa, then force numpy back down with --no-deps -- same
-# "ignore the now-stale librosa metadata constraint, it still works at
+#
+# Just dropping the numpy== pin (first attempt) isn't enough: with numpy
+# left fully unconstrained across ~200 other exact-pinned packages, pip's
+# resolver has to backtrack across every one of their individual numpy
+# ranges while librosa alone pulls toward >=2.1.0 -- confirmed the hard
+# way too, pip gives up with "resolution-too-deep" (dependency graph too
+# complex). Dropping librosa as well removes the actual outlier forcing
+# that backtrack, so numpy settles near 1.26.x on its own from the other
+# ~198 packages' (compatible) constraints. Then both are force-installed
+# with --no-deps: librosa==1.0.0 ignoring its own numpy>=2.1.0 claim, then
+# numpy==1.26.4 pinned back down in case anything upstream nudged it --
+# same "ignore the now-stale metadata constraint, it still works at
 # runtime" trade-off numpy_override.txt's own existence implies.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
 COPY deploy/numpy_override.txt /tmp/numpy_override.txt
-RUN grep -v '^numpy==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
+RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
     && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
+    && pip install --no-cache-dir --no-deps librosa==1.0.0 \
     && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
     && pip install --no-cache-dir awscli \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
@@ -73,13 +83,15 @@ RUN (python3.12 -m venv /venv/chatterbox || python3 -m venv /venv/chatterbox)
 COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
 # Same +cu128 wheel-index requirement as requirements-main.txt above --
 # torch/torchaudio/torchcodec here are pinned to +cu128 builds too. Same
-# numpy==1.26.4-vs-resolver defensive split as requirements-main.txt above
-# (this file pins numpy==1.26.4 too, alongside librosa/numba/scipy, which
-# hit the same class of conflict there) -- applied preemptively here rather
-# than waiting for a second failed build to prove it's needed too.
+# numpy/librosa resolver split as requirements-main.txt above (this file
+# pins numpy==1.26.4 and librosa==0.11.0 -- older than main's 1.0.0 pin,
+# but excluded here too rather than betting a 130-package requirements
+# file won't also hit "resolution-too-deep" the way the 233-package one
+# did).
 RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
-    && grep -v '^numpy==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
+    && grep -v -E '^(numpy|librosa)==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
     && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps librosa==0.11.0 \
     && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
 
 # config.pbtxt files across triton_model_repo/ use absolute paths under
