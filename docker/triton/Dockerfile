@@ -33,6 +33,25 @@
 ARG TRITON_BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.2.1
 FROM ${TRITON_BASE_IMAGE}
 
+# This image ships two Python 3.12 builds that don't agree with each
+# other, confirmed the hard way across several failed attempts here:
+# /usr/local/bin/python3 (what Triton's python backend and everything
+# below actually runs as `python3`) has a broken _ssl -- its bundled
+# _ssl.cpython-312-x86_64-linux-gnu.so wants OPENSSL_3.3.0 symbols that
+# /lib/x86_64-linux-gnu/libssl.so.3 (what's actually installed) doesn't
+# have, so `python3 -m pip` can't reach any HTTPS index at all. Bare
+# `pip` (shebang #!/usr/bin/python -- a separate, Debian-provided 3.12
+# build with working SSL) installs fine, but into dist-packages, which
+# plain `python3`'s sys.path doesn't include by default (only
+# site-packages) -- so those installs were invisible to python3 and to
+# the assertion checks below, across multiple earlier attempts.
+# Bridging the two via a standard `site`-module .pth file (both are
+# literally cpython 3.12, so this is ABI-safe) lets bare `pip` keep doing
+# the actual network installs while python3 -- and therefore Triton
+# itself at runtime, not just this build -- can import everything it
+# puts in dist-packages.
+RUN echo "/usr/local/lib/python3.12/dist-packages" > /usr/local/lib/python3.12/site-packages/dist-packages-bridge.pth
+
 # Only installs what requirements-main.txt pins that the base image doesn't
 # already ship matched versions of -- pip install is idempotent for
 # anything already satisfied. The numpy<2 assertion mirrors README.md
@@ -65,23 +84,19 @@ FROM ${TRITON_BASE_IMAGE}
 # constraint, it still works at runtime" trade-off numpy_override.txt's
 # own existence implies.
 #
-# `python3 -m pip`, NOT bare `pip`, throughout: this image's `pip` has
-# shebang #!/usr/bin/python, a DIFFERENT interpreter from /usr/local/bin/
-# python3 (the one Triton's python backend and the assertion below both
-# actually use) -- confirmed the hard way, after multiple rounds of a
-# numpy_override that reported "already satisfied 1.26.4" while the
-# runtime `import numpy` kept resolving to 2.5.3 from an entirely
-# separate site-packages. Bare `pip install` silently installs into the
-# wrong Python's dist-packages; `python3 -m pip install` runs pip inside
-# the actual interpreter that matters, so it lands in the site-packages
-# that imports actually resolve from.
+# Bare `pip`, not `python3 -m pip`: `pip`'s shebang is #!/usr/bin/python,
+# a separate, working-SSL cpython 3.12 build from /usr/local/bin/python3
+# (the one Triton and the assertion below run as) -- see the top-of-file
+# note on why python3 itself can't do network installs here. Bare pip
+# installs into dist-packages, which the top-of-file .pth bridge now
+# makes visible to python3's imports and to the assertion below too.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
 COPY deploy/numpy_override.txt /tmp/numpy_override.txt
 RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
-    && python3 -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
-    && python3 -m pip install --no-cache-dir --no-deps librosa==1.0.0 \
-    && python3 -m pip install --no-cache-dir awscli \
-    && python3 -m pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
+    && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
+    && pip install --no-cache-dir --no-deps librosa==1.0.0 \
+    && pip install --no-cache-dir awscli \
+    && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
 
 # Chatterbox TTS runs in its own isolated venv, launched as a subprocess by
@@ -90,7 +105,15 @@ RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requiremen
 # the main TensorRT-LLM stack above, same reason deploy/REBUILD.md keeps it
 # isolated on bare metal. Do not `pip install chatterbox-tts` into the
 # image's main environment instead of building this.
-RUN (python3.12 -m venv /venv/chatterbox || python3 -m venv /venv/chatterbox)
+# Created FROM /usr/bin/python, NOT /usr/local/bin/python3.12 -- the
+# latter is the one with the broken _ssl (see the top-of-file note), and
+# a venv built on top of a broken-SSL interpreter inherits that same
+# break (a venv references its base interpreter's lib-dynload C
+# extensions, it doesn't get a fresh working _ssl for free). Both are
+# literally cpython 3.12 so this is ABI-identical for everything the
+# venv installs afterward -- it's specifically the _ssl.so/libssl
+# mismatch being sidestepped, not a version difference.
+RUN /usr/bin/python -m venv /venv/chatterbox
 COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
 # Same +cu128 wheel-index requirement as requirements-main.txt above --
 # torch/torchaudio/torchcodec here are pinned to +cu128 builds too. Same
@@ -98,17 +121,14 @@ COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
 # pins numpy==1.26.4 and librosa==0.11.0 -- older than main's 1.0.0 pin,
 # but excluded here too rather than betting a 130-package requirements
 # file won't also hit "resolution-too-deep" the way the 233-package one
-# did).
-# /venv/chatterbox/bin/python -m pip, not bin/pip, for the same reason as
-# the main block above -- a venv's own pip should be self-consistent with
-# its own python, but that's an assumption at this point, not something
-# re-verified after the bare-pip/python3 split found in the main env; -m
-# pip costs nothing extra and removes the doubt.
-RUN /venv/chatterbox/bin/python -m pip install --no-cache-dir --upgrade pip \
+# did). Plain `bin/pip`, not `bin/python -m pip` -- this venv's own pip
+# is already self-consistent with its own (working-SSL) python now that
+# the venv itself is built on the working interpreter.
+RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
     && grep -v -E '^(numpy|librosa)==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
-    && /venv/chatterbox/bin/python -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
-    && /venv/chatterbox/bin/python -m pip install --no-cache-dir --no-deps librosa==0.11.0 \
-    && /venv/chatterbox/bin/python -m pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
+    && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps librosa==0.11.0 \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
 
 # config.pbtxt files across triton_model_repo/ use absolute paths under
 # /workspace/speech-cascade-inference/... (e.g. qwen_llm's engine_dir,
