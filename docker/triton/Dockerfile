@@ -134,9 +134,17 @@ COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
 # did). Plain `bin/pip`, not `bin/python -m pip` -- this venv's own pip
 # is already self-consistent with its own (working-SSL) python now that
 # the venv itself is built on the working interpreter.
+#
+# chatterbox-tts==0.1.7 also excluded from the main pass, confirmed the
+# hard way: its own metadata hard-pins torch==2.6.0, directly conflicting
+# with this file's torch==2.11.0+cu128 pin (a newer CUDA build presumably
+# chosen deliberately). Installed after with --no-deps, same trade-off as
+# numpy/librosa -- ignore chatterbox-tts's stale torch constraint, it
+# still works at runtime against the newer pin.
 RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
-    && grep -v -E '^(numpy|librosa)==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
+    && grep -v -E '^(numpy|librosa|chatterbox-tts)==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
     && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps chatterbox-tts==0.1.7 \
     && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps librosa==0.11.0 \
     && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
 
