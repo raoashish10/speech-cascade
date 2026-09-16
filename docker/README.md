@@ -15,14 +15,31 @@ builds on one of those images instead of reassembling the toolchain by
 hand, which is what makes this portable to any GPU host with Docker +
 `nvidia-container-toolkit` — not just this one Vast.ai instance.
 
-**UNVERIFIED end-to-end**: written and reviewed, but never built or run
-against a real GPU (the environment this was written in has neither a GPU
-nor Docker-in-Docker). Same posture as `deploy/REBUILD.md`'s own "Known
-gaps" section — treat the first real build as the actual verification, not
-this directory's existence. See `docker/triton/Dockerfile`'s header for the
-specific things to double-check first (the exact NGC base image tag, and
-whether `python3 -m venv` inside it produces a complete stdlib the way
-README.md quirk #3 says bare Ubuntu's doesn't).
+**Build status**: both images now build successfully and are pushed to
+`ghcr.io/raoashish10/speech-cascade-gateway:latest` and
+`ghcr.io/raoashish10/speech-cascade-triton:latest` — verified by actually
+building them (not just reading the Dockerfile) on a Runpod CPU pod,
+since Runpod pods don't support Docker-in-Docker (the sandbox blocks the
+`unshare()`/`clone()` syscalls nested containers need — confirmed the hard
+way; `kaniko`, which builds via chroot instead of a daemon, was used in
+place of `docker build`). That process found and fixed 8 real bugs in
+`docker/triton/Dockerfile` — missing `--extra-index-url` for `+cu128`
+torch wheels, a `numpy`/`librosa` pip resolver conflict, a
+`resolution-too-deep` error, a genuinely broken `_ssl` module in this NGC
+image's `/usr/local/bin/python3` (bridged around with a `.pth` file), and
+a `chatterbox-tts` pin conflict, among others — see the Dockerfile's own
+inline comments for the full detail on each.
+
+**Still unverified**: running either image against a real GPU. Building
+confirms the toolchain/dependency graph resolves; it does not confirm
+`tritonserver` actually starts, TensorRT-LLM loads, or the four models
+reach `READY` against real weights/engines — none of that was exercised
+here (no GPU was used for the build, deliberately, since nothing in
+either Dockerfile needs one). Treat the first real `docker compose up`
+against a GPU host as the actual runtime verification. See
+`docker/triton/Dockerfile`'s header for other things worth double-checking
+first (the exact NGC base image tag against `requirements-main.txt`'s
+`tensorrt_llm==1.2.1` pin, etc.).
 
 ## Quick start
 
