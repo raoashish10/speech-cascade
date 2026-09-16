@@ -66,11 +66,18 @@ FROM ${TRITON_BASE_IMAGE}
 # runtime" trade-off numpy_override.txt's own existence implies.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
 COPY deploy/numpy_override.txt /tmp/numpy_override.txt
+# numpy_override runs LAST, not right after librosa -- confirmed the hard
+# way that `pip install awscli` (no --no-deps; its own deps are already
+# satisfied here, so this isn't about awscli specifically) still nudges
+# numpy to 2.5.3 even after it was correctly pinned back to 1.26.4 in
+# between. Rather than chase exactly which transitive resolve does it,
+# numpy_override now runs after every other pip install in this RUN, so
+# whatever happens upstream, it's the last word before the assertion.
 RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
     && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
     && pip install --no-cache-dir --no-deps librosa==1.0.0 \
-    && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
     && pip install --no-cache-dir awscli \
+    && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
 
 # Chatterbox TTS runs in its own isolated venv, launched as a subprocess by
