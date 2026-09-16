@@ -13,24 +13,40 @@
 # PYTHONHOME/PYTHONPATH/LD_LIBRARY_PATH gymnastics -- those were bare-metal
 # fixes for a mismatched toolchain that shouldn't exist here.
 #
-# UNVERIFIED: not built or run against a real GPU (this development
-# environment has neither a GPU nor Docker-in-Docker). Treat the first
-# build on real hardware as the actual verification -- same spirit as
-# deploy/REBUILD.md's own "Known gaps" section, not a claim this already
-# works. Before relying on this, at minimum:
-#   - confirm TRITON_BASE_IMAGE against
-#     https://catalog.ngc.nvidia.com/orgs/nvidia/tensorrt-llm/containers/release
-#     for the tag that actually matches deploy/requirements-main.txt's
-#     tensorrt_llm==1.2.1 pin (and ships tritonserver + the python backend,
-#     not just the bare tensorrt_llm wheel)
-#   - confirm `python3 -m venv` inside that image produces a *complete*
-#     stdlib (README.md quirk #3's root cause on bare Ubuntu was a venv
-#     that didn't) -- if not, the chatterbox venv below needs the same
-#     conda-forge-pinned-to-the-bundled-libpython-version workaround
-#     deploy/supervisor/speech-cascade-triton.sh documents, which is not
-#     replicated here
+# BASE IMAGE, confirmed the hard way: `nvcr.io/nvidia/tensorrt-llm/release`
+# (the previous base here) is a bare TensorRT-LLM dev/runtime image -- it
+# has PyTorch, CUDA, and the tensorrt_llm Python package, but NOT NVIDIA's
+# Triton Inference Server binary at all. Deployed and run for real on a
+# Runpod GPU pod: entrypoint.sh's `tritonserver` invocation failed with
+# "command not found". (Its TRITON_* env vars, e.g. TRITON_PTXAS_PATH, are
+# for OpenAI's Triton -- the PyTorch kernel-JIT compiler pip package --
+# not NVIDIA Triton Inference Server; same name, unrelated projects, easy
+# to mistake for evidence tritonserver was present.) The actual combined
+# image is a separate NGC repo, `nvcr.io/nvidia/tritonserver`, tagged
+# `<date>-trtllm-python-py3`. `26.03-trtllm-python-py3` through
+# `26.07-trtllm-python-py3` all report identical TensorRT (10.14.1.48+
+# cuda13.0) and cuBLAS (13.2.0.9) versions to tensorrt-llm/release:1.2.1
+# (checked via `skopeo inspect --override-os linux --override-arch amd64`
+# against nvcr.io directly) -- 26.03 picked as the earliest exact match,
+# on the theory NVIDIA keeps one CUDA/TensorRT/TensorRT-LLM combination
+# stable across several monthly Triton releases before bumping it.
+# Inferred from matching CUDA-stack version labels, not by directly
+# confirming the bundled tensorrt_llm Python package version -- treat the
+# next real build/run against this tag as the actual confirmation.
+#
+# UNVERIFIED beyond that: this specific tag hasn't been built/run yet (the
+# entrypoint failure above was against the old, wrong base image). At
+# minimum, re-verify after switching:
+#   - the tensorrt_llm Python package version actually installed here
+#     matches deploy/requirements-main.txt's tensorrt_llm==1.2.1 pin
+#   - whether this image has the SAME two-Python-interpreters/broken-_ssl
+#     situation documented below, a different variant of it, or neither --
+#     it's a different NGC image, those fixes' exact mechanics may not
+#     carry over unchanged
+#   - `python3 -m venv` inside it produces a *complete* stdlib (README.md
+#     quirk #3's root cause on bare Ubuntu was a venv that didn't)
 
-ARG TRITON_BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.2.1
+ARG TRITON_BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3
 FROM ${TRITON_BASE_IMAGE}
 
 # This image ships two Python 3.12 builds that don't agree with each
