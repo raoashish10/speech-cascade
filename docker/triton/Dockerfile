@@ -99,11 +99,16 @@ COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
 # but excluded here too rather than betting a 130-package requirements
 # file won't also hit "resolution-too-deep" the way the 233-package one
 # did).
-RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
+# /venv/chatterbox/bin/python -m pip, not bin/pip, for the same reason as
+# the main block above -- a venv's own pip should be self-consistent with
+# its own python, but that's an assumption at this point, not something
+# re-verified after the bare-pip/python3 split found in the main env; -m
+# pip costs nothing extra and removes the doubt.
+RUN /venv/chatterbox/bin/python -m pip install --no-cache-dir --upgrade pip \
     && grep -v -E '^(numpy|librosa)==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps librosa==0.11.0 \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
+    && /venv/chatterbox/bin/python -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
+    && /venv/chatterbox/bin/python -m pip install --no-cache-dir --no-deps librosa==0.11.0 \
+    && /venv/chatterbox/bin/python -m pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
 
 # config.pbtxt files across triton_model_repo/ use absolute paths under
 # /workspace/speech-cascade-inference/... (e.g. qwen_llm's engine_dir,
