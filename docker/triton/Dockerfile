@@ -38,8 +38,14 @@ FROM ${TRITON_BASE_IMAGE}
 # anything already satisfied. The numpy<2 assertion mirrors README.md
 # quirk #10 (several packages in this list silently upgrade numpy if
 # installed carelessly, which breaks TensorRT-LLM's compiled bindings).
+# --extra-index-url is required: torch==2.9.1+cu128's "+cu128" local
+# version tag only exists on PyTorch's own wheel index, not PyPI -- a
+# plain `pip install` 404s on it (confirmed the hard way: the base image
+# doesn't ship this exact pin pre-installed, so pip actually has to fetch
+# it, unlike the packages above it in the file that resolve as "already
+# satisfied").
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-main.txt \
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main.txt \
     && pip install --no-cache-dir awscli \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
 
@@ -51,8 +57,10 @@ RUN pip install --no-cache-dir -r /tmp/requirements-main.txt \
 # image's main environment instead of building this.
 RUN (python3.12 -m venv /venv/chatterbox || python3 -m venv /venv/chatterbox)
 COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
+# Same +cu128 wheel-index requirement as requirements-main.txt above --
+# torch/torchaudio/torchcodec here are pinned to +cu128 builds too.
 RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
-    && /venv/chatterbox/bin/pip install --no-cache-dir -r /tmp/requirements-chatterbox.txt
+    && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox.txt
 
 # config.pbtxt files across triton_model_repo/ use absolute paths under
 # /workspace/speech-cascade-inference/... (e.g. qwen_llm's engine_dir,
