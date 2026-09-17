@@ -139,8 +139,16 @@ solves the toolchain-matching problem, not the engine-portability one.
   the alert-notifier and Triton-state-exporter supervisor services) isn't
   containerized here yet — still only documented for the bare-metal/
   supervisor deployment.
-- No CI build/push of these images (`.github/workflows/tests.yml` only runs
-  the CPU-only unit tests, same as before).
+- The triton image has never been built by a tool that produces a *correct*
+  image. kaniko (used during development, because Runpod pods can't run
+  Docker-in-Docker) silently drops files written by `RUN pip install` --
+  the build reports success, in-`RUN` assertions pass, and the pushed image
+  is missing exactly the packages the Dockerfile added. The recipe itself is
+  verified: running its identical pip sequence by hand on the same base
+  image produces a working environment, and that environment ran the full
+  pipeline end to end. `.github/workflows/build-images.yml` builds with real
+  BuildKit instead, but the triton half may exceed a standard runner's disk
+  at ~27GB -- see that file's own header for the fallbacks.
 - `docker/triton/entrypoint.sh`'s sequential model-load order carries over
   the bare-metal OOM workaround (see its own comments) without
   re-verifying the memory ceiling that caused it against this image/host.
