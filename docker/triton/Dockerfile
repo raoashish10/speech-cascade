@@ -52,53 +52,43 @@
 ARG TRITON_BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3
 FROM ${TRITON_BASE_IMAGE}
 
-ENV PATH="/opt/tritonserver/bin:${PATH}"
-
-# Deployed and run for real against a GPU pod (no model weights mounted --
-# this checks the environment, not actual inference), confirmed the hard
-# way: tritonserver itself starts fine (the fix above works), but three of
-# the four models fail to load. Two more real bugs, plus one deferred:
+# /opt/tritonserver/bin is ALREADY on this base image's PATH (verified via
+# `skopeo inspect --config`) -- no PATH override needed here.
+#
+# Everything below was found by running this stack interactively on a GPU
+# pod against this exact base image, not by guessing between rebuilds:
 #
 # 1. chatterbox_tts/1/model.py defaults CHATTERBOX_BACKEND to "vllm",
 #    needing a /venv/vllm this Dockerfile never builds -- confirmed:
 #    "FileNotFoundError: ... /venv/vllm/bin/python3". Building that venv
 #    isn't enough on its own either: the vllm path also needs
-#    vllm_t3_model_dir (an exported/converted copy of chatterbox's T3 GPT2
-#    backbone for vLLM's out-of-tree model loader), which doesn't exist
-#    anywhere in this repo and has no documented recipe -- see
+#    vllm_t3_model_dir (an exported copy of chatterbox's T3 GPT2 backbone
+#    for vLLM's out-of-tree loader), which doesn't exist anywhere in this
+#    repo and has no documented recipe -- see
 #    scripts/export_chatterbox_t3_for_vllm.py for a from-scratch
-#    reconstruction (written by reading vllm_t3/'s own code, since
-#    chatterbox_worker_vllm.py's "see deploy notes" points at notes that
-#    don't exist here), itself UNVERIFIED against a real run. Falling back
-#    to CHATTERBOX_BACKEND=pytorch here -- the /venv/chatterbox path this
-#    Dockerfile already builds and this session already validated -- to
-#    unblock everything else; building /venv/vllm + wiring the export
-#    script in is real follow-up work, not done here.
+#    reconstruction, itself UNVERIFIED. Falling back to the pytorch
+#    backend, which uses the /venv/chatterbox this file already builds.
 #
-# 2. qwen_llm and voice_pipeline both fail identically: "ValueError:
-#    libcublas.so.*[0-9] not found in the system path", raised from
-#    torch/__init__.py's _preload_cuda_deps() at import time. Standard
-#    pip-installed-torch symptom: the nvidia-cublas-cu12 (and friends)
-#    wheels bundle their own .so files under site-packages/nvidia/*/lib,
-#    but nothing puts that directory on the dynamic linker's search path
-#    by default in this image. Fixed by adding every nvidia-*-cu12
-#    package's lib dir this build actually installs (per the pip install
-#    log) to LD_LIBRARY_PATH.
+# 2. OPAL_PREFIX: tensorrt_llm imports mpi4py, and MPI_Init_thread aborted
+#    with "opal_init:startup:internal-failure". Root cause: this image's
+#    OpenMPI was built with prefix /build-result/hpcx-v2.25.1-.../ompi but
+#    is actually installed at /usr/local/mpi, so OPAL cannot find its own
+#    runtime data files (the giveaway: it tried to open help text under
+#    that nonexistent /build-result path). Setting OPAL_PREFIX to the real
+#    install location fixes it -- verified directly:
+#    `OPAL_PREFIX=/usr/local/mpi python3 -c "from mpi4py import MPI; ..."`
+#    goes from fatal abort to "MPI OK". This is README.md quirk #1 (MPI)
+#    reappearing inside an NGC container, contrary to this file's original
+#    assumption that none of those quirks apply here.
 #
-# whisper_asr's separate "ModuleNotFoundError: No module named 'librosa'"
-# is NOT explained by either of the above -- confirmed it isn't a one-off
-# startup race (reloading it via POST .../models/whisper_asr/load fails
-# identically), and librosa is genuinely installed (verified: it's the
-# real, full package, not an empty/broken wheel). Every other model's
-# stub that logged its own sys.path included the site-packages dir where
-# librosa lives; whisper_asr's stub never logged its sys.path, so there's
-# no direct evidence of what's actually different about it. Explicitly
-# adding the site-packages dir to PYTHONPATH is a defensive attempt at a
-# fix, not a confirmed root-cause fix -- flag this as UNVERIFIED and worth
-# re-checking on the next real run rather than assumed solved.
+# Deliberately NOT set: PYTHONPATH and a hand-rolled LD_LIBRARY_PATH for
+# the pip nvidia-*-cu12 lib dirs. Both were earlier guesses at the
+# librosa/libcublas load failures; running the identical pip sequence
+# interactively on this base image showed torch 2.9.1+cu128 and librosa
+# both import fine with the base image's own env, so neither override is
+# needed and both risk shadowing the base image's settings.
 ENV CHATTERBOX_BACKEND="pytorch"
-ENV PYTHONPATH="/opt/venv-tritonserver/lib/python3.12/site-packages"
-ENV LD_LIBRARY_PATH="/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/curand/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cusolver/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cusparse/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cusparselt/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/nvtx/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/nvjitlink/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cuda_cupti/lib:${LD_LIBRARY_PATH}"
+ENV OPAL_PREFIX="/usr/local/mpi"
 
 # Only installs what requirements-main.txt pins that the base image doesn't
 # already ship matched versions of -- pip install is idempotent for
@@ -129,6 +119,17 @@ ENV LD_LIBRARY_PATH="/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/
 # own existence implies. numpy_override runs LAST (after awscli too), not
 # right after librosa -- confirmed on the previous base image that a
 # later, unrelated pip install can still nudge numpy again in between.
+# TENSORRT, confirmed the hard way on a real GPU pod: PyPI's
+# `tensorrt==10.14.1.48.post1` and `tensorrt_cu13==...post1` (both pinned in
+# requirements-main.txt) are METADATA-ONLY wheels -- dist-info and nothing
+# else, zero module files (`pip show -f tensorrt` lists only dist-info
+# entries). Installing them makes pip uninstall the base image's real,
+# working `tensorrt 10.14.1.48` and leave nothing in its place, so
+# `import tensorrt` -- and therefore all of tensorrt_llm, and therefore
+# qwen_llm -- dies with ModuleNotFoundError. The real wheels live on
+# NVIDIA's own index, not PyPI, so the module is restored explicitly from
+# pypi.nvidia.com after the main install. The trailing `import tensorrt`
+# check exists so this can never regress silently again.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
 COPY deploy/numpy_override.txt /tmp/numpy_override.txt
 RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
@@ -136,7 +137,9 @@ RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requiremen
     && pip install --no-cache-dir --no-deps librosa==1.0.0 \
     && pip install --no-cache-dir awscli \
     && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
-    && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'"
+    && pip install --no-cache-dir --force-reinstall --no-deps --extra-index-url https://pypi.nvidia.com tensorrt-cu13==10.14.1.48 \
+    && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'" \
+    && python3 -c "import tensorrt; print('tensorrt', tensorrt.__version__)"
 
 # Chatterbox TTS runs in its own isolated venv, launched as a subprocess by
 # triton_model_repo/chatterbox_tts/1/model.py at the hardcoded path
