@@ -30,16 +30,32 @@ image's `/usr/local/bin/python3` (bridged around with a `.pth` file), and
 a `chatterbox-tts` pin conflict, among others — see the Dockerfile's own
 inline comments for the full detail on each.
 
-**Still unverified**: running either image against a real GPU. Building
-confirms the toolchain/dependency graph resolves; it does not confirm
-`tritonserver` actually starts, TensorRT-LLM loads, or the four models
-reach `READY` against real weights/engines — none of that was exercised
-here (no GPU was used for the build, deliberately, since nothing in
-either Dockerfile needs one). Treat the first real `docker compose up`
-against a GPU host as the actual runtime verification. See
-`docker/triton/Dockerfile`'s header for other things worth double-checking
-first (the exact NGC base image tag against `requirements-main.txt`'s
-`tensorrt_llm==1.2.1` pin, etc.).
+**Verified end-to-end on a real GPU** (RTX PRO 4500 Blackwell, sm_120,
+Runpod): all four models reach Triton state `READY` and the full
+`voice_pipeline` ensemble round-trips speech -> ASR -> LLM -> TTS -> speech.
+A 11.0s input clip produced a correct transcript, a coherent LLM reply, and
+7.0s of generated 24kHz audio in 13.2s wall time, with weights/engines built
+from scratch (no S3) per `scripts/build_models_from_scratch.sh`.
+
+Environment bugs found and fixed by that GPU run, none of which a
+successful `docker build` would have caught:
+- the original base image (`nvcr.io/nvidia/tensorrt-llm/release`) shipped no
+  `tritonserver` binary at all -- switched to
+  `nvcr.io/nvidia/tritonserver:<date>-trtllm-python-py3`
+- `OPAL_PREFIX` (this image's OpenMPI can't find its own runtime data, which
+  kills `tensorrt_llm` and therefore `qwen_llm`)
+- PyPI's pinned `tensorrt`/`tensorrt_cu13` wheels are metadata-only and
+  *delete* the base image's working `tensorrt` module -- restored from
+  NVIDIA's index
+- `chatterbox_tts` defaults to a `CHATTERBOX_BACKEND=vllm` path needing a
+  `/venv/vllm` and a model export that don't exist in this repo; pinned to
+  the `pytorch` backend instead
+
+**Still unverified**: the `vllm` chatterbox backend (~5x faster per its own
+docstring) -- see `scripts/export_chatterbox_t3_for_vllm.py`, a from-scratch
+reconstruction of the missing T3 export step, never run. Also the
+`gateway` container against a live `triton` (only the triton half was
+exercised directly), and sustained/concurrent load.
 
 ## Quick start
 
