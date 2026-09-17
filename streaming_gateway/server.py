@@ -32,6 +32,15 @@ Triton's own HTTP/gRPC/metrics ports stay localhost-only and are not
 exposed externally; this gateway is the sanctioned external surface, and
 proxying raw Triton access would just widen the attack surface without
 adding a capability this endpoint doesn't already provide end-to-end.
+
+Docker deployment (docker/, docker-compose.yml)
+-------------------------------------------------
+There's no Caddy edge in that deployment shape, so this process checks
+GATEWAY_AUTH_TOKEN itself (see _check_auth below) instead of trusting an
+upstream proxy to have done it -- same `?token=`/`Authorization: Bearer`
+convention as above, just enforced here rather than by Caddy. Leave
+GATEWAY_AUTH_TOKEN unset to skip the check (e.g. bare-metal-behind-Caddy,
+or your own reverse proxy already handles it).
 """
 
 import asyncio
@@ -64,10 +73,33 @@ MAX_CONCURRENT_SESSIONS = int(os.environ.get("GATEWAY_MAX_SESSIONS", "4"))
 _active_sessions = 0
 _sessions_lock = asyncio.Lock()
 
+# Shared-secret check, only meaningful when nothing upstream (Vast.ai's
+# Caddy edge, or your own reverse proxy) already does it -- see the module
+# docstring's "Docker deployment" section. Empty/unset disables the check
+# entirely, preserving today's bare-metal-behind-Caddy behavior.
+GATEWAY_AUTH_TOKEN = os.environ.get("GATEWAY_AUTH_TOKEN", "")
+
+
+def _check_auth(websocket: WebSocket) -> bool:
+    if not GATEWAY_AUTH_TOKEN:
+        return True
+    token = websocket.query_params.get("token")
+    if not token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[len("bearer "):]
+    return token == GATEWAY_AUTH_TOKEN
+
 
 @app.websocket("/ws/stream")
 async def stream(websocket: WebSocket):
     global _active_sessions
+
+    if not _check_auth(websocket):
+        # Reject before accept() -- same as Caddy rejecting with 401 before
+        # the upgrade completes, not a WS-level close after the fact.
+        await websocket.close(code=1008, reason="unauthorized")
+        return
 
     await websocket.accept()
 

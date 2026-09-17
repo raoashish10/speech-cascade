@@ -5,6 +5,11 @@ Inference Server, running bare-metal on this instance (no Docker — this
 container can't run Docker-in-Docker). Matches the v1 architecture diagram:
 Triton BLS python-backend models wrapping each stage, all GPU-accelerated.
 
+A containerized alternative to this bare-metal deployment (portable to any
+GPU host with Docker + `nvidia-container-toolkit`, not tied to Vast.ai) is
+in [`docker/`](docker/README.md) — UNVERIFIED end-to-end, see that
+directory's README before relying on it.
+
 GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell, sm_120, 16GB VRAM), driver 595.84
 (CUDA 13.2 max). CUDA 12.8 and 13.2 toolkits are both installed system-wide.
 
