@@ -54,6 +54,52 @@ FROM ${TRITON_BASE_IMAGE}
 
 ENV PATH="/opt/tritonserver/bin:${PATH}"
 
+# Deployed and run for real against a GPU pod (no model weights mounted --
+# this checks the environment, not actual inference), confirmed the hard
+# way: tritonserver itself starts fine (the fix above works), but three of
+# the four models fail to load. Two more real bugs, plus one deferred:
+#
+# 1. chatterbox_tts/1/model.py defaults CHATTERBOX_BACKEND to "vllm",
+#    needing a /venv/vllm this Dockerfile never builds -- confirmed:
+#    "FileNotFoundError: ... /venv/vllm/bin/python3". Building that venv
+#    isn't enough on its own either: the vllm path also needs
+#    vllm_t3_model_dir (an exported/converted copy of chatterbox's T3 GPT2
+#    backbone for vLLM's out-of-tree model loader), which doesn't exist
+#    anywhere in this repo and has no documented recipe -- see
+#    scripts/export_chatterbox_t3_for_vllm.py for a from-scratch
+#    reconstruction (written by reading vllm_t3/'s own code, since
+#    chatterbox_worker_vllm.py's "see deploy notes" points at notes that
+#    don't exist here), itself UNVERIFIED against a real run. Falling back
+#    to CHATTERBOX_BACKEND=pytorch here -- the /venv/chatterbox path this
+#    Dockerfile already builds and this session already validated -- to
+#    unblock everything else; building /venv/vllm + wiring the export
+#    script in is real follow-up work, not done here.
+#
+# 2. qwen_llm and voice_pipeline both fail identically: "ValueError:
+#    libcublas.so.*[0-9] not found in the system path", raised from
+#    torch/__init__.py's _preload_cuda_deps() at import time. Standard
+#    pip-installed-torch symptom: the nvidia-cublas-cu12 (and friends)
+#    wheels bundle their own .so files under site-packages/nvidia/*/lib,
+#    but nothing puts that directory on the dynamic linker's search path
+#    by default in this image. Fixed by adding every nvidia-*-cu12
+#    package's lib dir this build actually installs (per the pip install
+#    log) to LD_LIBRARY_PATH.
+#
+# whisper_asr's separate "ModuleNotFoundError: No module named 'librosa'"
+# is NOT explained by either of the above -- confirmed it isn't a one-off
+# startup race (reloading it via POST .../models/whisper_asr/load fails
+# identically), and librosa is genuinely installed (verified: it's the
+# real, full package, not an empty/broken wheel). Every other model's
+# stub that logged its own sys.path included the site-packages dir where
+# librosa lives; whisper_asr's stub never logged its sys.path, so there's
+# no direct evidence of what's actually different about it. Explicitly
+# adding the site-packages dir to PYTHONPATH is a defensive attempt at a
+# fix, not a confirmed root-cause fix -- flag this as UNVERIFIED and worth
+# re-checking on the next real run rather than assumed solved.
+ENV CHATTERBOX_BACKEND="pytorch"
+ENV PYTHONPATH="/opt/venv-tritonserver/lib/python3.12/site-packages"
+ENV LD_LIBRARY_PATH="/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/curand/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cusolver/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cusparse/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cusparselt/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/nvtx/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/nvjitlink/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/opt/venv-tritonserver/lib/python3.12/site-packages/nvidia/cuda_cupti/lib:${LD_LIBRARY_PATH}"
+
 # Only installs what requirements-main.txt pins that the base image doesn't
 # already ship matched versions of -- pip install is idempotent for
 # anything already satisfied. The numpy<2 assertion mirrors README.md
