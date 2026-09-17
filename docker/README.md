@@ -43,6 +43,24 @@ first (the exact NGC base image tag against `requirements-main.txt`'s
 
 ## Quick start
 
+Weights and compiled engines are **not** in the image -- they live in the
+`inference-data` volume `docker-compose.yml` mounts at
+`/workspace/speech-cascade-inference/models`. Populate it either by
+restoring from S3 (set `S3_BUCKET_URI`, see `docker/triton/entrypoint.sh`)
+or from scratch with no S3 at all:
+
+```bash
+docker compose run --rm triton bash /workspace/speech-cascade/scripts/build_models_from_scratch.sh
+```
+
+That script downloads the Qwen NVFP4 checkpoint and builds whisper's
+TensorRT-LLM engines on whatever GPU it runs on -- verified end-to-end on
+an RTX PRO 4500 (both models reached Triton state `READY`). Engines stay
+out of the image on purpose: they're GPU-architecture-specific, so baking
+them in would tie the image to one card. `chatterbox_tts` additionally
+needs its reference voice clip (`ref_audio_path`), which is a deployment
+artifact you supply yourself.
+
 ```bash
 cp .env.example .env   # fill in S3 creds (or skip and populate the volume yourself) + GATEWAY_AUTH_TOKEN
 docker compose up --build
