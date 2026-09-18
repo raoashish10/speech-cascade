@@ -296,12 +296,50 @@ Fetching 12 files: 100% [00:32]
 was the Hub download and ~45s the two engine builds. Mounting a volume at
 that path makes it a one-time cost per volume instead of per start.
 
+### Startup cost, measured
+
+| | cold (new pod) | warm (stop -> start) |
+|---|---|---|
+| image pull + extract | 4-11 min | **skipped** |
+| HF bootstrap | 2m43s | **skipped** |
+| four models to `READY` | ~4 min | ~4 min |
+| **total** | **11-18 min** | **4m07s** |
+
+Two things worth knowing about those numbers:
+
+- **The pull dominates cold start and is almost entirely the base image.**
+  It varies by datacenter: the same image pulled in 4m14s in `EU-RO-1` and
+  was still retrying after 25 minutes in `EUR-IS-1`. Pin
+  `dataCenterIds` to somewhere you have pulled before; that is worth more
+  than any further image slimming, since ~22 of the ~24GB is the NGC base.
+- **A stopped pod keeps its container disk**, at least across a
+  `stop` -> `start` on the same machine: the warm restart above did *not*
+  re-run the bootstrap (Triton began loading 115s in, less than the 163s the
+  bootstrap alone takes) and `models/` was still populated. Runpod's API
+  describes container disk as "ephemeral, wiped on restart", so do not rely
+  on this surviving a reschedule onto a different host -- but stopping
+  rather than terminating clearly does avoid both the pull and the bootstrap.
+
+The remaining ~4 min is the models themselves and is not container overhead:
+TensorRT-LLM's import, qwen's engine build (~32s) and 6.1GB engine load,
+whisper's two engines, and chatterbox's ~3GB model. The bare-metal
+deployment pays the same cost -- `README.md` documents "~5-6 min" for a
+supervisor restart. `entrypoint.sh` loads the four serially on purpose (see
+its own comment about an OOM-killed stub); parallelising is the obvious
+lever if this ever needs to be faster, and has not been tried against this
+image.
+
 Set `S3_BUCKET_URI` instead to restore a prebuilt tree, which is faster but
 needs somewhere to have built it first.
 
 `chatterbox_tts` additionally needs its reference voice clip
 (`ref_audio_path`) -- a deployment artifact you supply yourself, and it must
 be **longer than 5 seconds** or the model refuses to load.
+
+**Verified**: a pod from the published image with no clip and nothing
+mounted reaches all four models `READY`, including `chatterbox_tts`, and
+round-trips the pipeline (`"Testing 123."` -> LLM reply -> 3.40s of 24kHz
+audio). The voice is chatterbox's built-in one.
 
 **You no longer need to supply one just to get the model up.**
 `chatterbox-turbo`'s checkpoint includes `conds.pt`, a built-in voice that
