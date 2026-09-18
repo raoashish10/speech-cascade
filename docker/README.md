@@ -396,6 +396,116 @@ load, same cost `README.md`'s "Managing the service" section documents for
 the bare-metal deployment) — `gateway` waits on `service_healthy` before
 starting.
 
+## Two-pod deployment on Runpod (verified)
+
+`docker-compose.yml` runs both containers on one host. A Runpod pod is a
+single container, so the same separation there means two pods. **Verified end
+to end** — the run below is the first time the gateway has ever talked to a
+live Triton in any deployment.
+
+The security property to preserve is the one compose gives for free: Triton
+has **no authentication of any kind**, and is protected purely by being
+unreachable. Compose does that with `expose:` instead of `ports:`. On Runpod
+the equivalent is global networking, which is account-scoped and gives each
+pod a `POD_ID.runpod.internal` name on a private network isolated from the
+internet.
+
+**Triton pod** — the important part is that `ports` is *empty*. Declaring a
+port is what publishes it.
+
+```jsonc
+{
+  "name": "sc-triton",
+  "image": "ghcr.io/<owner>/speech-cascade-triton:latest",
+  "registry": "<registry-credential-id>",     // GHCR is private
+  "cloud": "SECURE", "dataCenterIds": ["EU-RO-1"],
+  "disk": 120,
+  "globalNetworking": true,
+  "gpu": { "id": "NVIDIA RTX PRO 4500 Blackwell", "count": 1 }
+}
+```
+
+Returns `internalDns: l99q36jthfbsmi.runpod.internal`, `ip: 10.0.98.128`,
+`ports: []`.
+
+**Gateway pod** — public port for clients, Triton addressed privately.
+
+```jsonc
+{
+  "name": "sc-gateway",
+  "image": "ghcr.io/<owner>/speech-cascade-gateway:latest",
+  "registry": "<registry-credential-id>",
+  "cloud": "SECURE", "dataCenterIds": ["EU-RO-1"],
+  "disk": 20,
+  "globalNetworking": true,
+  "ports": ["18010/http"],
+  "gpu": { "id": "NVIDIA RTX 2000 Ada Generation", "count": 1 },
+  "env": {
+    "TRITON_URL": "<triton-pod-id>.runpod.internal:18001",
+    "GATEWAY_API_KEYS": "<key_id>:<sha256>:<name>",
+    "GATEWAY_MAX_SESSIONS": "4",
+    "GATEWAY_MAX_SESSIONS_PER_KEY": "2"
+  }
+}
+```
+
+### The gateway pod needs a GPU it never uses
+
+Global networking is **NVIDIA-GPU-pods-only**; CPU pods cannot join it
+(Runpod's API enforces this, and their docs say so). The gateway is a
+CPU-only ~400MB service, so its GPU is purely a licence to be on the private
+network. Pick the cheapest available rather than matching Triton's card:
+RTX 2000 Ada at **$0.24/hr** against the RTX PRO 4500's $0.72. If that idle
+GPU ever matters, the alternatives are running both processes in one pod, or
+putting the gateway on a cheap CPU host elsewhere and tunnelling in
+(WireGuard/Tailscale userspace mode) — neither of which has been tried here.
+
+Also note the private network runs at **100 Mbps**. Gateway-to-Triton traffic
+is raw audio both ways (~0.5MB per short turn, more for long utterances), so
+it is not free, just cheap at this size.
+
+### Verified
+
+Auth, from outside, against the public gateway endpoint:
+
+```
+no credential       : rejected at handshake (403)
+wrong secret        : rejected at handshake (403)
+unknown key id      : rejected at handshake (403)
+valid key (header)  : CONNECTED
+```
+
+Rejected *before* the WebSocket upgrade completes, the same property Caddy
+provides on bare metal. Then the full turn, client -> public gateway ->
+private network -> Triton -> back:
+
+```
+[speech_start]
+[transcript] Testing 1, 2, 3.
+One, two, three.
+[tts_chunk #1] 'One, two, three.' -> sentence_001.wav (t+13.18s)
+[turn_end] full response: 'One, two, three.'
+```
+
+### One gap this shape introduces
+
+`docker-compose.yml` has `depends_on: triton: condition: service_healthy`, so
+the gateway does not start until Triton is ready. **There is no equivalent
+across two pods.** The gateway comes up in ~35s, Triton in ~11 minutes, and
+in between the gateway happily accepts authenticated connections and fails
+them with whatever Triton is currently missing:
+
+```
+ipv4:10.0.98.128:18001: Failed to connect          (Triton not listening yet)
+Request for unknown model: 'whisper_asr'           (Triton up, models loading)
+'chatterbox_tts' has no available versions         (loads third, still going)
+```
+
+Every one of those is a clear error rather than a hang, and a retrying client
+gets through, but a real deployment should gate on Triton's
+`/v2/health/ready` — either a readiness probe on the gateway or a startup
+wait in its entrypoint. Not implemented.
+
 ## What's different from the bare-metal deployment
 
 | | Bare metal (`deploy/`) | Docker (`docker/`) |
