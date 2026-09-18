@@ -142,47 +142,56 @@ the budget.
 
 **What to target, in order:**
 
-1. ~~Emit audio before the whole sentence is synthesised~~ — **done, see
-   below.** Streaming S3Gen's output rather than chunking its input remains
-   available and would approach the ~144ms floor; PR #33's note that S3Gen's
-   flow-matching vocoder still runs per-item and unbatched describes where
-   the remaining time goes.
-2. **`UtteranceVAD(min_silence_duration_ms=800)` → 400ms** — one config
-   value, now the single largest remaining item at 49% of perceived TTFA.
-   The trade is premature endpointing on hesitant speakers, so it wants
-   testing.
+1. **Emit audio before the whole sentence is synthesised** — ~1.1s, and
+   still the largest item. **Do this by streaming S3Gen's output, not by
+   chunking its input**: input chunking was tried, measured and reverted,
+   see below. PR #33's note that S3Gen's flow-matching vocoder still runs
+   per-item and unbatched describes exactly where the time goes.
+2. ~~`UtteranceVAD(min_silence_duration_ms=800)` → 400ms~~ — **done**, and
+   it is arithmetic rather than a measurement: the window is dead time
+   before the pipeline may start, so halving it removes 400ms from perceived
+   TTFA directly. What is *not* established is the cost; see below.
 3. **Nothing else.** ASR at 74ms, prefill at 16ms and decode at 9.6ms/delta
-   are inside the noise of a single TTS chunk.
+   are inside the noise of a single TTS call.
 
-### Clause chunking: measured A/B
+### Clause chunking: tried, measured, reverted
 
-`split_for_tts()` splits a sentence at clause boundaries so TTS returns the
-first clause instead of the whole sentence. Ten warm turns per arm, **same
-pod, same GPU, same clip**, toggled with `GATEWAY_TTS_CHUNKING`:
+Splitting a sentence at clause boundaries before synthesis worked, and the
+numbers were good. Ten warm turns per arm, same pod, same GPU, same clip:
 
 | median | whole sentence | clause-chunked | change |
 |---|---:|---:|---:|
-| `tts_first_ms` | 1686ms | **561ms** | −1125ms (3.0×) |
-| `ttfa_from_vad_end_ms` | 1970ms | **843ms** | −1127ms (2.3×) |
-| `ttfa_from_speech_end_ms` | 2770ms | **1643ms** | −1127ms (1.7×) |
+| `tts_first_ms` | 1686ms | 561ms | −1125ms (3.0×) |
+| `ttfa_from_vad_end_ms` | 1970ms | 843ms | −1127ms (2.3×) |
+| `ttfa_from_speech_end_ms` | 2770ms | 1643ms | −1127ms (1.7×) |
 
-The measured sentence splits once, at `blue | because`. Two costs, both
-measured rather than assumed:
+The measured costs were also small: the inter-chunk gap was 30ms (chunk 1
+was 1.56s of audio, chunk 2 arrived 1.59s later), and total spoken audio
+grew 5.86s → 6.26s, +7%, from two sets of utterance padding.
 
-- **The gap is 30ms.** Chunk 1 is 1.56s of audio and chunk 2 arrives 1.59s
-  after it, so playback is effectively continuous — the ~144ms fixed cost
-  plus chunk 2's synthesis finishes well inside chunk 1's playback. This is
-  the RTF-0.30 headroom doing its job, and it is why chunk size ratios did
-  not need engineering: at a clause boundary even a real gap degrades to a
-  pause a speaker would have made.
-- **The reply takes 0.40s longer to finish speaking** (5.86s → 6.26s of
-  total audio, +7%), because two utterances carry two sets of leading and
-  trailing padding. Starting 1127ms sooner for 400ms more total speech is
-  the trade, and for a conversational turn it is clearly the right one.
+**It was reverted anyway, because the mechanism does not generalise.**
+Finding clause boundaries without a parser meant a hand-maintained list of
+English clause-introducing words, and that approach fails in ways the
+latency numbers cannot show:
 
-What is *not* measured is prosody. Each chunk gets its own intonation
-contour, and whether the reset at a clause boundary is audible is a
-listening judgement, not a number. That is the reason for the env toggle.
+- **It cannot distinguish homographs.** `so` and `yet` are clause
+  connectors *and* degree adverbs — "was **so** long that everyone fell
+  asleep", "I haven't seen him **yet**". Cutting before those lands
+  mid-phrase, which is the one thing the design promised never to do. Both
+  had to be removed from the list after the fact, which is the tell: the
+  list was not derivable, only patchable.
+- **It is English-only**, and a per-language word list is a maintenance
+  burden that grows with every locale.
+- **The safety argument rested entirely on the cut points being genuine
+  clause boundaries.** Once the boundary detector is unreliable, the
+  argument for why the intonation reset and the playback gap are acceptable
+  goes with it — and neither of those failures shows up in `tts_first_ms`.
+
+The right version of this optimisation is upstream: have chatterbox emit
+audio as S3Gen produces it, which is language-agnostic, needs no boundary
+detection, and approaches the measured ~144ms fixed floor rather than
+stopping at 561ms. The measurements above stand as evidence for how much is
+there to win.
 
 **A design assumption this disproved.** `session.py` synthesises per
 sentence so TTS for sentence 1 can overlap the LLM generating sentence 2.
