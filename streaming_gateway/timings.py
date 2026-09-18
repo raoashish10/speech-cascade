@@ -1,13 +1,16 @@
 """Per-turn latency breakdown for the voice pipeline.
 
-Exists because every latency discussion about this project so far has been
-conducted on inferred numbers. The TTS stage is measured (0.26s per sentence
-with CHATTERBOX_BACKEND=vllm, 0.81s with pytorch, both on an RTX PRO 4500),
-and the whole warm `voice_pipeline` round-trip is measured (~3.25s), but the
-ASR and LLM halves of the remainder have only ever been estimated by
-subtracting one from the other. That is not good enough to decide what to
-optimise: it is entirely possible that ASR is 2s and the LLM is 0.4s, or the
-reverse, and those point at completely different work.
+Exists because every latency discussion about this project was conducted on
+inferred numbers -- the ASR and LLM halves of the budget had only ever been
+estimated by subtracting one measured figure from another.
+
+It has since been run against the two-pod deployment, and the inference was
+wrong in a way worth recording here so nobody re-derives it: ASR is 88ms and
+LLM prefill is 18ms, together under 5% of time-to-first-audio, while TTS is
+1812ms, or 82%. Time between deltas is 9.7ms with an 11.6ms worst case over
+30 turns. streaming_gateway/README.md has the full table and what it implies
+about what to optimise; the short version is that everything except TTS (and
+the VAD silence window) is inside the noise.
 
 WHAT TTFA MEANS HERE. Two different clocks matter and they differ by most of
 a second:
@@ -24,8 +27,13 @@ Reporting only the first would flatter the system by ~800ms and hide the
 single largest tunable in the stack. Reporting only the second would make
 pipeline work look pointless. Both are emitted.
 
-The marks are deliberately coarse -- one per pipeline stage boundary, not
-per token. Fine-grained timing belongs in deploy/PROFILING.md's nsys/
+Stage marks are deliberately coarse -- one per pipeline stage boundary. The
+one exception is the LLM's output stream, which is timed per delta, because
+time-between-tokens is a separate user-visible property from TTFT and neither
+predicts the other: a fast first token followed by a stall still sounds
+broken. See record_llm_delta() for what a "delta" is and is not.
+
+Finer-grained timing than this belongs in deploy/PROFILING.md's nsys/
 torch.profiler flow; this is the always-on breakdown that answers "where did
 this turn's latency go" for every turn in production.
 """
@@ -45,6 +53,19 @@ FIRST_AUDIO = "first_audio"          # first audio chunk sent -> TTFA
 TURN_END = "turn_end"
 
 
+def _percentile(ordered: list[float], pct: float) -> float:
+    """Nearest-rank percentile over an already-sorted list.
+
+    Nearest-rank rather than interpolating: these samples are counted in the
+    tens per turn, and an interpolated p95 of 12 samples invents a value that
+    never occurred. Every number reported here is one that actually happened.
+    """
+    if not ordered:
+        raise ValueError("percentile of an empty sample")
+    rank = max(1, -(-len(ordered) * pct // 100))  # ceil, integer-only
+    return ordered[int(rank) - 1]
+
+
 @dataclass
 class TurnTimings:
     """Records stage boundaries for one turn and reports the breakdown.
@@ -55,6 +76,25 @@ class TurnTimings:
 
     vad_silence_ms: float = 0.0
     _marks: dict[str, float] = field(default_factory=dict)
+    _llm_deltas: list[float] = field(default_factory=list)
+
+    def record_llm_delta(self) -> None:
+        """Record the arrival of one streamed LLM delta, for TBT.
+
+        WHAT A DELTA IS. qwen_llm sends one InferenceResponse per TensorRT-LLM
+        streaming step, carrying that step's `text_diff` -- but only `if diff`,
+        so steps whose token adds no decodable text (byte-level BPE
+        continuation bytes, for instance) are dropped before they reach the
+        wire. A delta is therefore *at least* one token and occasionally more,
+        which makes these figures a slight over-estimate of true
+        time-between-tokens. `llm_deltas` is reported alongside so the gap
+        between deltas and tokens stays visible rather than assumed away.
+
+        Also marks LLM_FIRST_DELTA, so a caller cannot record the stream
+        without also establishing TTFT.
+        """
+        self.mark(LLM_FIRST_DELTA)
+        self._llm_deltas.append(time.monotonic())
 
     def mark(self, name: str) -> None:
         """Record a stage boundary. First write wins.
@@ -73,6 +113,35 @@ class TurnTimings:
         if start in self._marks and end in self._marks:
             return (self._marks[end] - self._marks[start]) * 1000.0
         return None
+
+    def _tbt_gaps_ms(self) -> list[float]:
+        """Inter-delta gaps. N deltas give N-1 gaps; the wait for the FIRST
+        delta is TTFT and is deliberately not one of them -- folding it in
+        would let a slow prefill masquerade as slow decode."""
+        d = self._llm_deltas
+        return [(b - a) * 1000.0 for a, b in zip(d, d[1:])]
+
+    def _llm_stream_stats(self) -> dict[str, float]:
+        gaps = self._tbt_gaps_ms()
+        if not gaps:
+            # One delta (or none): a count is still worth reporting, but there
+            # is no interval to characterise.
+            return {"llm_deltas": float(len(self._llm_deltas))} if self._llm_deltas else {}
+        ordered = sorted(gaps)
+        decode_ms = (self._llm_deltas[-1] - self._llm_deltas[0]) * 1000.0
+        return {
+            "llm_deltas": float(len(self._llm_deltas)),
+            # Decode wall time, first delta to last -- the span the gaps
+            # partition. TTFT is excluded by construction.
+            "llm_decode_ms": decode_ms,
+            "llm_tbt_mean_ms": sum(gaps) / len(gaps),
+            "llm_tbt_p50_ms": _percentile(ordered, 50),
+            # p95 and max are the ones that matter for perceived smoothness:
+            # a mean of 30ms hides a single 900ms stall, and the stall is what
+            # a listener hears. Reported separately for exactly that reason.
+            "llm_tbt_p95_ms": _percentile(ordered, 95),
+            "llm_tbt_max_ms": ordered[-1],
+        }
 
     def breakdown(self) -> dict[str, float]:
         """Stage durations in ms, omitting stages this turn never reached."""
@@ -95,6 +164,7 @@ class TurnTimings:
             "ttfa_from_vad_end_ms": self._delta_ms(TURN_START, FIRST_AUDIO),
             "turn_total_ms": self._delta_ms(TURN_START, TURN_END),
         }
+        stages.update(self._llm_stream_stats())
         out = {k: round(v, 1) for k, v in stages.items() if v is not None}
 
         # What the user experiences: everything above plus the trailing
@@ -108,9 +178,16 @@ class TurnTimings:
         """One log line, ordered so the pipeline reads left to right."""
         b = self.breakdown()
         order = [
-            "vad_silence_ms", "asr_ms", "llm_ttft_ms", "llm_to_sentence_ms",
+            "vad_silence_ms", "asr_ms", "llm_ttft_ms",
+            "llm_tbt_p50_ms", "llm_tbt_p95_ms", "llm_tbt_max_ms",
+            "llm_to_sentence_ms",
             "tts_first_ms", "ttfa_from_vad_end_ms", "ttfa_from_speech_end_ms",
             "turn_total_ms",
         ]
-        return " ".join(f"{k.removesuffix('_ms')}={b[k]:.0f}ms"
-                        for k in order if k in b)
+        parts = [f"{k.removesuffix('_ms')}={b[k]:.0f}ms" for k in order if k in b]
+        if "llm_deltas" in b:
+            # Not a duration, so it does not get the ms formatting -- but the
+            # TBT figures are uninterpretable without knowing how many
+            # intervals they were computed over.
+            parts.insert(3, f"llm_deltas={b['llm_deltas']:.0f}")
+        return " ".join(parts)

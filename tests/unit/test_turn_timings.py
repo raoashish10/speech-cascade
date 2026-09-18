@@ -128,6 +128,88 @@ def test_summary_omits_stages_a_turn_never_reached():
     assert "tts_first" not in s
 
 
+def _with_deltas(times, vad_silence_ms=800.0):
+    t = _timings_at(vad_silence_ms=vad_silence_ms, clock=FULL_TURN)
+    t._llm_deltas = list(times)
+    return t.breakdown()
+
+
+def test_tbt_excludes_the_wait_for_the_first_delta():
+    """TTFT is prefill; folding it into TBT would let slow prefill read as
+    slow decode. 4 deltas -> 3 gaps, and none of them is the TTFT wait."""
+    b = _with_deltas([100.65, 100.68, 100.71, 100.74])
+    assert b["llm_deltas"] == 4
+    assert b["llm_tbt_mean_ms"] == 30.0
+    assert b["llm_decode_ms"] == 90.0
+    assert b["llm_ttft_ms"] == 250.0  # unchanged by the delta stream
+
+
+def test_a_single_stall_is_caught_only_by_max():
+    """The case the whole p95/max split exists for -- and the reason max is
+    reported at all rather than trusting p95 to cover the tail.
+
+    One 900ms stall among 20 gaps: the mean barely moves, and p95 does not
+    move AT ALL, because nearest-rank p95 of 20 samples is the 19th and the
+    stall is the 20th. At per-turn sample sizes a percentile cannot see a
+    single outlier -- but a single outlier is exactly what a listener hears.
+    Read max first when judging smoothness; p95 only becomes meaningful
+    aggregated across many turns."""
+    gaps = [100.0 + 0.03 * i for i in range(20)]   # 19 gaps at 30ms
+    gaps.append(gaps[-1] + 0.9)                     # one 900ms stall
+    b = _with_deltas(gaps)
+    assert b["llm_tbt_mean_ms"] < 75.0
+    assert b["llm_tbt_p95_ms"] == 30.0     # invisible here
+    assert b["llm_tbt_max_ms"] == 900.0    # the thing a listener hears
+
+
+def test_percentiles_are_values_that_actually_occurred():
+    """Nearest-rank, not interpolated: p50 of these is a real sample."""
+    b = _with_deltas([100.0, 100.01, 100.03, 100.06, 100.10])
+    for key in ("llm_tbt_p50_ms", "llm_tbt_p95_ms", "llm_tbt_max_ms"):
+        assert b[key] in (10.0, 20.0, 30.0, 40.0), (key, b[key])
+
+
+def test_one_delta_reports_a_count_but_no_intervals():
+    b = _with_deltas([100.65])
+    assert b["llm_deltas"] == 1
+    assert "llm_tbt_mean_ms" not in b
+    assert "llm_decode_ms" not in b
+
+
+def test_a_turn_with_no_llm_stream_reports_no_tbt_keys():
+    b = _timings_at(clock=FULL_TURN).breakdown()
+    assert not [k for k in b if "tbt" in k or k == "llm_deltas"]
+
+
+def test_recording_a_delta_also_establishes_ttft():
+    """A caller cannot time the stream without timing its start."""
+    t = TurnTimings()
+    t.mark(TURN_START)
+    t.mark(ASR_DONE)
+    t.record_llm_delta()
+    assert t.has(LLM_FIRST_DELTA)
+    assert "llm_ttft_ms" in t.breakdown()
+
+
+def test_first_delta_mark_is_not_moved_by_later_deltas():
+    t = TurnTimings()
+    t.mark(ASR_DONE)
+    t.record_llm_delta()
+    first = t._marks[LLM_FIRST_DELTA]
+    t.record_llm_delta()
+    t.record_llm_delta()
+    assert t._marks[LLM_FIRST_DELTA] == first
+    assert len(t._llm_deltas) == 3
+
+
+def test_summary_puts_tbt_next_to_ttft_with_its_sample_count():
+    s = _timings_at(clock=FULL_TURN)
+    s._llm_deltas = [100.65, 100.68, 100.71]
+    line = s.summary()
+    assert "llm_deltas=3" in line
+    assert line.index("llm_ttft=") < line.index("llm_deltas=") < line.index("llm_tbt_p50=")
+
+
 def test_marks_use_a_monotonic_clock():
     """Durations must not be able to go negative on a wall-clock adjustment."""
     t = TurnTimings()

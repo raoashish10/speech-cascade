@@ -14,17 +14,17 @@ self.turn_task below.
 
 import asyncio
 import logging
+import os
 import time
 
 import numpy as np
 
 from . import triton_client as tc
-from .sentence import SentenceAccumulator
+from .sentence import SentenceAccumulator, split_for_tts
 from .timings import (
     ASR_DONE,
     FIRST_AUDIO,
     FIRST_SENTENCE,
-    LLM_FIRST_DELTA,
     TURN_END,
     TURN_START,
     TurnTimings,
@@ -43,6 +43,17 @@ MIN_SPEECH_MS = 350
 # LocalVox uses different caps for barge-in (8s) vs. dictation (15s); this
 # project has neither distinction, so one sane cap covers both cases.
 MAX_UTTERANCE_SEC = 15.0
+
+# Split long sentences at clause boundaries before synthesising, so the first
+# audio comes back after the first clause rather than the whole sentence --
+# measured at 82% of time-to-first-audio. See sentence.py's split_for_tts()
+# for the rules and why they are conservative.
+#
+# Togglable because it is the kind of change that has to be A/B measured on
+# real hardware rather than argued about, and because the two costs (an extra
+# ~144ms fixed synthesis cost per chunk, and one intonation reset per split)
+# land on quality rather than on the number this optimises.
+TTS_CHUNKING = os.environ.get("GATEWAY_TTS_CHUNKING", "1") != "0"
 
 
 class StreamingSession:
@@ -133,18 +144,20 @@ class StreamingSession:
 
             worker = asyncio.create_task(tts_worker())
             async for delta in tc.generate_stream(transcript):
-                timings.mark(LLM_FIRST_DELTA)
+                # Records the arrival time AND marks LLM_FIRST_DELTA, so TTFT
+                # and time-between-tokens come from the same observation point.
+                timings.record_llm_delta()
                 await self._send_json({"type": "llm_delta", "text": delta})
                 for sentence in accumulator.push(delta):
                     timings.mark(FIRST_SENTENCE)
-                    await tts_queue.put(sentence)
+                    await _queue_sentence(tts_queue, sentence)
             trailing = accumulator.flush()
             if trailing:
                 # A short reply with no sentence punctuation reaches TTS only
                 # here, via the flush -- mark it so those turns still report a
                 # sentence boundary instead of a hole in the breakdown.
                 timings.mark(FIRST_SENTENCE)
-                await tts_queue.put(trailing)
+                await _queue_sentence(tts_queue, trailing)
             await tts_queue.put(None)
             await worker
             timings.mark(TURN_END)
@@ -156,6 +169,15 @@ class StreamingSession:
             # got, and how long it took to get there, is most of diagnosing it.
             log.warning("turn failed after %s: %s", timings.summary(), e)
             await self._send_json({"type": "error", "message": str(e)})
+
+
+async def _queue_sentence(tts_queue: asyncio.Queue, sentence: str):
+    """Enqueue one sentence for TTS, split at clause boundaries if enabled.
+
+    Order matters and is preserved: a single worker drains this queue
+    sequentially, so chunks are synthesised and sent in speaking order."""
+    for chunk in (split_for_tts(sentence) if TTS_CHUNKING else [sentence]):
+        await tts_queue.put(chunk)
 
 
 def _b64(audio: np.ndarray) -> str:
