@@ -17,22 +17,30 @@ name: build-images
 # base image, where it produces a fully working environment. Hence: real
 # BuildKit here, not kaniko.
 #
-# DISK CAVEAT, read before assuming this works: the triton image is ~27GB
-# compressed and considerably larger unpacked. A standard GitHub-hosted
-# runner starts with roughly 14GB free; the cleanup step below reclaims
-# ~30GB more by deleting preinstalled toolchains this repo never uses. That
-# may still not be enough. If the triton job dies with "no space left on
-# device", the options are (a) a larger runner, (b) slimming the image --
-# it currently carries two near-complete torch stacks, because
-# chatterbox-tts's pins conflict with TensorRT-LLM's and live in a separate
-# venv (see docker/triton/Dockerfile), or (c) a self-hosted runner. The
-# gateway job is ~400MB and has no such problem.
+# DISK: the triton image is large and the first attempt at this job died
+# with "No space left on device". It has since been slimmed from ~40GB
+# unpacked (~27GB compressed) to ~24GB unpacked by removing ~19GB of
+# duplicate CUDA userspace -- both pip installs were replaying `pip freeze`
+# dumps from a CUDA 12.8 box onto a CUDA 13.1 base image, so each installed
+# its own complete cu12 wheel set beside the CUDA 13 libraries the base
+# already ships. See docker/triton/Dockerfile and deploy/image-exclude-*.txt
+# for the measurements.
+#
+# A standard GitHub-hosted runner starts with roughly 14GB free and the
+# cleanup step below reclaims ~30GB more, so ~24GB should now fit -- with
+# little enough headroom that the "Disk after build" step is worth reading
+# on any failure. If it still dies for want of space, the remaining options
+# are (a) a larger runner, (b) a self-hosted runner, or (c) a smaller base
+# image: ~22GB of the ~24GB is the NGC base itself, so nothing else in this
+# repo can move the number much.
+#
+# The gateway job is ~400MB and has no such problem.
 
 on:
   workflow_dispatch:
     inputs:
       build_triton:
-        description: "Build the large triton image (~27GB, may exhaust runner disk)"
+        description: "Build the large triton image (~24GB unpacked, tight on a standard runner)"
         type: boolean
         default: true
 

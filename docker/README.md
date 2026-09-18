@@ -51,11 +51,61 @@ successful `docker build` would have caught:
   `/venv/vllm` and a model export that don't exist in this repo; pinned to
   the `pytorch` backend instead
 
-**Still unverified**: the `vllm` chatterbox backend (~5x faster per its own
-docstring) -- see `scripts/export_chatterbox_t3_for_vllm.py`, a from-scratch
-reconstruction of the missing T3 export step, never run. Also the
-`gateway` container against a live `triton` (only the triton half was
-exercised directly), and sustained/concurrent load.
+**Image size**: the triton image went from ~40GB unpacked (~27GB
+compressed) to ~24GB unpacked. ~19GB of it was duplicate CUDA userspace:
+`deploy/requirements-main.txt` and `deploy/requirements-chatterbox.txt` are
+`pip freeze` dumps from the old CUDA 12.8 bare-metal box, and replaying them
+verbatim onto a CUDA 13.1 base image made each of the two environments
+install its own complete `nvidia-*-cu12` wheel set beside the CUDA 13
+libraries the base already ships as system libraries. Measured on a pod:
+
+| | before | after |
+|---|---|---|
+| base image | 22 GB | 22 GB |
+| main pip install | +9.7 GB | **+0.4 GB** |
+| `/venv/chatterbox` | +8.0 GB | **+2.1 GB** |
+
+Both installs now use `--no-deps` against the freeze (which is already
+dependency-closed, so there is nothing to resolve) minus an explicit
+exclusion list -- `deploy/image-exclude-main.txt` and
+`deploy/image-exclude-chatterbox.txt`, applied by
+`deploy/filter_requirements.py`. Those files carry the per-package reasoning;
+the short version is that the base image already provides torch, tensorrt,
+tensorrt_llm, triton and all of CUDA 13. Dropping the resolver also removed
+the `numpy`/`librosa` `ResolutionImpossible` and `resolution-too-deep`
+workarounds and the `tensorrt` metadata-only-wheel repair step, since none of
+those failure modes can occur without dependency resolution.
+
+What's left is mostly irreducible without changing base images: ~22GB of the
+~24GB is the NGC base itself (`tensorrt_llm` 3.5GB, `flash_attn`'s single
+1.7GB `.so`, torch, CUDA 13, Triton).
+
+**Still unverified**: the slimmed install has not been run on a GPU. Every
+check that doesn't need `libcuda.so.1` was run against the base image on a
+Runpod CPU pod -- the filtered installs succeed, `tensorrt` resolves to the
+base image's real 10.14.1.48 (not PyPI's metadata-only stub), the chatterbox
+venv's `torch`/`torchaudio` are CUDA 13 builds with zero unresolved shared
+libraries under `ldd`, and `torchaudio`'s compiled ops, `chatterbox`, `perth`
+and `s3gen` all import -- but a CPU host can't import `tensorrt_llm` or run a
+CUDA kernel, so the four-model GPU run that validated the earlier, fatter
+recipe has not been repeated. Treat the next GPU deployment as that
+verification.
+
+Also still unverified, unchanged from before: the `vllm` chatterbox backend
+(~5x faster per its own docstring) -- see
+`scripts/export_chatterbox_t3_for_vllm.py`, a from-scratch reconstruction of
+the missing T3 export step, never run. Also the `gateway` container against a
+live `triton` (only the triton half was exercised directly), and
+sustained/concurrent load.
+
+**One accepted behavior change** from the slimming: `torchcodec` is no longer
+installed in `/venv/chatterbox`, and `torchaudio` 2.11 implements
+`torchaudio.load`/`save` via torchcodec, so those two functions now raise
+`ImportError` there. Nothing in `chatterbox`, `perth` or
+`triton_model_repo/chatterbox_tts/` calls them, and `librosa.load`/`soundfile`
+(which the code does use) work normally. Adding the wheel back isn't
+sufficient either -- torchcodec needs FFmpeg shared libraries the base image
+doesn't ship.
 
 ## Quick start
 
@@ -147,8 +197,11 @@ solves the toolchain-matching problem, not the engine-portability one.
   verified: running its identical pip sequence by hand on the same base
   image produces a working environment, and that environment ran the full
   pipeline end to end. `.github/workflows/build-images.yml` builds with real
-  BuildKit instead, but the triton half may exceed a standard runner's disk
-  at ~27GB -- see that file's own header for the fallbacks.
+  BuildKit instead. Its first triton run died with "No space left on
+  device"; the image has since been slimmed from ~40GB to ~24GB unpacked
+  (see "Image size" above), which should fit a standard runner, but that
+  build has not been re-run yet -- so there is still no confirmed-good
+  triton image in GHCR.
 - `docker/triton/entrypoint.sh`'s sequential model-load order carries over
   the bare-metal OOM workaround (see its own comments) without
   re-verifying the memory ceiling that caused it against this image/host.

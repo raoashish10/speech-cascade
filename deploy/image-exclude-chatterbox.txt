@@ -1,0 +1,68 @@
+# Packages in deploy/requirements-chatterbox.txt that docker/triton/Dockerfile
+# must NOT install into /venv/chatterbox.
+#
+# WHY: /venv/chatterbox exists to isolate chatterbox-tts's conflicting
+# dependency pins from the main TensorRT-LLM stack. It does NOT need its own
+# copy of CUDA. Measured on a real pod, the venv was 8.0GB, of which:
+#
+#   nvidia/*    4.7 GB   a second full CUDA 12.8 wheel set
+#   torch       1.6 GB   a second full torch
+#   triton      0.6 GB   a second OpenAI-Triton
+#   everything chatterbox actually needs   ~1.1 GB
+#
+# So ~6.9GB of the 8.0GB was a duplicate GPU stack. The Dockerfile now points
+# this venv at the main environment's torch with a .pth bridge instead (see
+# the chatterbox RUN there), keeping the venv for exactly what it was for:
+# chatterbox-tts's own conflicting non-torch pins.
+#
+# This is the same trade-off the Dockerfile already makes elsewhere and is not
+# a new kind of risk: chatterbox-tts==0.1.7 hard-pins torch==2.6.0, which this
+# deployment has always overridden (it is installed --no-deps against a much
+# newer torch). Having already decided not to honor that pin, honoring it
+# twice -- once per venv -- buys nothing.
+#
+# --- provided by the main environment via the .pth bridge -----------------
+# The base image ships torch 2.10.0a0+b4e4ee81d3.nv25.12 (NVIDIA's CUDA 13
+# build) and triton 3.5.1. torchaudio is NOT in the base image and is
+# installed explicitly by the Dockerfile at a version matching that torch --
+# it is deliberately excluded here so the +cu128 pin below cannot drag the
+# cu12 stack back in.
+torch
+torchaudio
+torchcodec
+triton
+
+# The cu12 wheel set -- the base image provides CUDA 13.1 system libraries.
+nvidia-cublas-cu12
+nvidia-cuda-cupti-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-cufile-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-cusparselt-cu12
+nvidia-nccl-cu12
+nvidia-npp-cu12
+nvidia-nvjitlink-cu12
+nvidia-nvshmem-cu12
+nvidia-nvtx-cu12
+
+# --- dev / UI tooling: no place in a serving image ------------------------
+# gradio is chatterbox-tts's optional demo UI; nothing in this repo or in the
+# installed chatterbox package imports it (checked, not assumed).
+#
+# DELIBERATELY NOT EXCLUDED, because the installed chatterbox package really
+# does import them: diffusers (5 modules), pydub, matplotlib.
+gradio
+gradio_client
+safehttpx
+ffmpy
+pre_commit
+virtualenv
+distlib
+identify
+nodeenv
+cfgv
