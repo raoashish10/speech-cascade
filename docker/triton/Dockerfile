@@ -44,10 +44,28 @@
 # chain: the numpy/librosa/chatterbox-tts pip-resolver conflicts, which are
 # about these packages' own declared metadata, not the interpreter.
 #
-# UNVERIFIED beyond the tritonserver-binary-exists check: whether it
-# actually starts and loads all four models against real weights/engines
-# (no weights were mounted for that check) is still to be confirmed against
-# a real GPU run of this rebuilt image.
+# IMAGE SIZE: this image is large but no longer gratuitously so. It was
+# ~40GB unpacked (~27GB compressed), of which ~19GB was duplicate CUDA
+# userspace: both pip installs below were replaying `pip freeze` dumps from
+# a CUDA 12.8 bare-metal box onto a CUDA 13.1 base image, so each one
+# installed its own complete cu12 wheel set next to the CUDA 13 libraries
+# the base already provides. Installing those freezes with --no-deps minus
+# an explicit exclusion list (deploy/image-exclude-*.txt) brings it to
+# ~24GB unpacked. The two RUN blocks below carry the measurements and the
+# reasoning; the assertions at the end of each are regression guards, so a
+# future edit that reintroduces a cu12 stack fails the build instead of
+# quietly adding 9GB.
+#
+# What remains is mostly irreducible without changing base images:
+# ~22GB of that ~24GB is the base image itself (tensorrt_llm 3.5GB,
+# flash_attn's single 1.7GB .so, torch, CUDA 13, Triton).
+#
+# UNVERIFIED for the slimmed install: actual GPU execution. Every check
+# that does not need libcuda.so.1 was run against this base image on a
+# Runpod CPU pod (see the two RUN blocks), but a CPU host cannot import
+# tensorrt_llm or run a CUDA kernel, so the four-model GPU run that
+# validated the earlier, fatter recipe has not been repeated against this
+# one. Treat the next GPU deployment as that verification.
 
 ARG TRITON_BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3
 FROM ${TRITON_BASE_IMAGE}
@@ -84,62 +102,85 @@ FROM ${TRITON_BASE_IMAGE}
 # Deliberately NOT set: PYTHONPATH and a hand-rolled LD_LIBRARY_PATH for
 # the pip nvidia-*-cu12 lib dirs. Both were earlier guesses at the
 # librosa/libcublas load failures; running the identical pip sequence
-# interactively on this base image showed torch 2.9.1+cu128 and librosa
-# both import fine with the base image's own env, so neither override is
-# needed and both risk shadowing the base image's settings.
+# interactively on this base image showed torch and librosa both import
+# fine with the base image's own env, so neither override is needed and
+# both risk shadowing the base image's settings. There are no
+# nvidia-*-cu12 lib dirs to point at any more in any case -- see the
+# install strategy below. The base image's own
+# LD_LIBRARY_PATH=/usr/local/tensorrt/lib:... is load-bearing though:
+# `import tensorrt` fails with "libnvonnxparser.so.10: cannot open shared
+# object file" without it, which is easy to mistake for a broken install
+# when testing over ssh (where the image's env isn't applied) rather than
+# in the container.
 ENV CHATTERBOX_BACKEND="pytorch"
 ENV OPAL_PREFIX="/usr/local/mpi"
 
-# Only installs what requirements-main.txt pins that the base image doesn't
-# already ship matched versions of -- pip install is idempotent for
-# anything already satisfied. The numpy<2 assertion mirrors README.md
-# quirk #10 (several packages in this list silently upgrade numpy if
-# installed carelessly, which breaks TensorRT-LLM's compiled bindings).
-# --extra-index-url is required: torch==2.9.1+cu128's "+cu128" local
-# version tag only exists on PyTorch's own wheel index, not PyPI.
+# INSTALL STRATEGY: --no-deps against a filtered freeze.
 #
-# numpy==1.26.4 and librosa==1.0.0 are BOTH pinned in requirements-main.txt,
-# but pip's resolver here reports librosa 1.0.0 itself requires
-# numpy>=2.1.0 -- a hard ResolutionImpossible, confirmed the hard way, not
-# a hypothetical. deploy/numpy_override.txt exists for exactly this (it's
-# just never wired into deploy/ansible/playbook.yml's fresh-venv install,
-# which apparently hasn't hit this particular resolver conflict).
+# deploy/requirements-main.txt is a `pip freeze` dump, which means it is
+# already closed under dependencies -- every transitive dependency is in the
+# file, pinned. The correct way to install a freeze is therefore --no-deps:
+# pip installs exactly what is listed and resolves nothing. Doing that here
+# is not a micro-optimization, it fixes three separate problems at once.
 #
-# Just dropping the numpy== pin isn't enough on its own: with numpy left
-# fully unconstrained across ~200 other exact-pinned packages, pip's
-# resolver has to backtrack across every one of their individual numpy
-# ranges while librosa alone pulls toward >=2.1.0 -- confirmed the hard
-# way too, pip gives up with "resolution-too-deep" (dependency graph too
-# complex). Dropping librosa as well removes the actual outlier forcing
-# that backtrack, so numpy settles near 1.26.x on its own from the other
-# ~198 packages' (compatible) constraints. Both are then force-installed
-# with --no-deps: librosa==1.0.0 ignoring its own numpy>=2.1.0 claim, then
-# numpy==1.26.4 pinned back down -- same "ignore the now-stale metadata
-# constraint, it still works at runtime" trade-off numpy_override.txt's
-# own existence implies. numpy_override runs LAST (after awscli too), not
-# right after librosa -- confirmed on the previous base image that a
-# later, unrelated pip install can still nudge numpy again in between.
-# TENSORRT, confirmed the hard way on a real GPU pod: PyPI's
-# `tensorrt==10.14.1.48.post1` and `tensorrt_cu13==...post1` (both pinned in
-# requirements-main.txt) are METADATA-ONLY wheels -- dist-info and nothing
-# else, zero module files (`pip show -f tensorrt` lists only dist-info
-# entries). Installing them makes pip uninstall the base image's real,
-# working `tensorrt 10.14.1.48` and leave nothing in its place, so
-# `import tensorrt` -- and therefore all of tensorrt_llm, and therefore
-# qwen_llm -- dies with ModuleNotFoundError. The real wheels live on
-# NVIDIA's own index, not PyPI, so the module is restored explicitly from
-# pypi.nvidia.com after the main install. The trailing `import tensorrt`
-# check exists so this can never regress silently again.
+# 1. SIZE. Letting pip resolve dependencies meant torch==2.9.1+cu128 dragged
+#    in a complete parallel CUDA 12.8 userspace as wheels -- onto a base
+#    image that is CUDA 13.1 throughout. Measured on a real pod: this RUN
+#    used to grow site-packages from 9.3GB to 19GB, of which ~4.2GB was
+#    site-packages/nvidia/* (cu12 libs duplicating CUDA 13 system libs) and
+#    ~3.9GB was site-packages/tensorrt_libs (duplicating
+#    /usr/local/tensorrt/lib). With --no-deps plus the exclusion list, the
+#    same RUN adds 379MB. See deploy/image-exclude-main.txt for the full
+#    accounting and the reasoning behind every exclusion.
+#
+# 2. THE RESOLVER FIGHTS. Everything the previous revision of this file did
+#    with grep and numpy_override.txt existed to work around pip's resolver:
+#    librosa 1.0.0 declares numpy>=2.1.0 while this deployment pins
+#    numpy==1.26.4 (ResolutionImpossible), and dropping both pins to escape
+#    that made pip backtrack across ~200 other exact pins until it gave up
+#    with "resolution-too-deep". With --no-deps there is no resolver, so
+#    there is nothing to fight: numpy lands at exactly the 1.26.4 the freeze
+#    pins and librosa at exactly 1.0.0, and numpy cannot drift, so
+#    deploy/numpy_override.txt is no longer needed here at all. The
+#    librosa/numpy combination itself is unchanged from the version that ran
+#    the full pipeline end to end -- `pip check` still reports librosa's
+#    numpy>=2.1.0 claim as unsatisfied, deliberately, exactly as before.
+#
+# 3. THE TENSORRT BOOBY TRAP. requirements-main.txt pins PyPI's
+#    `tensorrt==10.14.1.48.post1`, which is a METADATA-ONLY wheel: dist-info
+#    and nothing else. Installing it made pip uninstall the base image's
+#    real, working tensorrt and leave nothing behind, so `import tensorrt`
+#    -- and therefore tensorrt_llm, and therefore qwen_llm -- died with
+#    ModuleNotFoundError. Earlier revisions repaired that afterwards by
+#    force-reinstalling tensorrt-cu13 from pypi.nvidia.com, which is where
+#    3.9GB of the duplicate tensorrt_libs came from. tensorrt* is now simply
+#    excluded, so the damage never happens and the repair step is gone.
+#
+# awscli is not in the freeze (docker/triton/entrypoint.sh's optional S3
+# restore needs it) so it is installed with its dependencies, after the
+# frozen set -- this is the order that was actually verified, and the numpy
+# assertion below covers the one thing that order could disturb.
+#
+# VERIFIED on a Runpod CPU pod against this exact base image: the filtered
+# install returns 0, and numpy/tensorrt/torch/librosa/transformers/
+# soundfile/datasets all import. `import tensorrt` gives the base image's
+# real 10.14.1.48 rather than a metadata-only stub. tensorrt_llm is NOT
+# import-checked here on purpose: it needs libcuda.so.1, which no GPU-less
+# build host (CPU pod or CI runner) has, so asserting it would break the
+# build everywhere it currently succeeds.
 COPY deploy/requirements-main.txt /tmp/requirements-main.txt
-COPY deploy/numpy_override.txt /tmp/numpy_override.txt
-RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requirements-main-nonumpy.txt \
-    && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-main-nonumpy.txt \
-    && pip install --no-cache-dir --no-deps librosa==1.0.0 \
-    && pip install --no-cache-dir awscli \
-    && pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt \
-    && pip install --no-cache-dir --force-reinstall --no-deps --extra-index-url https://pypi.nvidia.com tensorrt-cu13==10.14.1.48 \
+COPY deploy/image-exclude-main.txt /tmp/image-exclude-main.txt
+COPY deploy/filter_requirements.py /tmp/filter_requirements.py
+RUN python3 /tmp/filter_requirements.py \
+        /tmp/requirements-main.txt /tmp/image-exclude-main.txt \
+        > /tmp/requirements-main-filtered.txt \
+    && pip install --no-cache-dir --no-compile --no-deps -r /tmp/requirements-main-filtered.txt \
+    && pip install --no-cache-dir --no-compile awscli \
     && python3 -c "import numpy; assert numpy.__version__.startswith('1.26'), f'numpy drifted to {numpy.__version__}, see README.md quirk #10'" \
-    && python3 -c "import tensorrt; print('tensorrt', tensorrt.__version__)"
+    && python3 -c "import tensorrt; assert not tensorrt.__version__.endswith('post1'), 'tensorrt is PyPI metadata-only stub, see deploy/image-exclude-main.txt'; print('tensorrt', tensorrt.__version__)" \
+    && python3 -c "import torch; assert torch.version.cuda.startswith('13'), f'expected the base image CUDA 13 torch, got cuda {torch.version.cuda}'; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
+    && python3 -c "import librosa, transformers, soundfile, datasets, tritonclient; print('librosa', librosa.__version__, '| transformers', transformers.__version__)" \
+    && python3 -c "import glob, os, site; sp = site.getsitepackages()[0]; cu12 = [os.path.basename(p) for p in glob.glob(os.path.join(sp, 'nvidia_*_cu12-*.dist-info'))]; assert not cu12, f'CUDA 12 wheels reappeared ({len(cu12)}, e.g. {cu12[:3]}) -- something bypassed deploy/image-exclude-main.txt'; assert not os.path.isdir(os.path.join(sp, 'tensorrt_libs')), 'tensorrt_libs reappeared: 3.9GB duplicate of /usr/local/tensorrt/lib'; print('no duplicate CUDA stack')"
 
 # Chatterbox TTS runs in its own isolated venv, launched as a subprocess by
 # triton_model_repo/chatterbox_tts/1/model.py at the hardcoded path
@@ -147,28 +188,81 @@ RUN grep -v -E '^(numpy|librosa)==' /tmp/requirements-main.txt > /tmp/requiremen
 # the main TensorRT-LLM stack above, same reason deploy/REBUILD.md keeps it
 # isolated on bare metal. Do not `pip install chatterbox-tts` into the
 # image's main environment instead of building this.
-RUN python3 -m venv /venv/chatterbox
 COPY deploy/requirements-chatterbox.txt /tmp/requirements-chatterbox.txt
-# Same +cu128 wheel-index requirement as requirements-main.txt above --
-# torch/torchaudio/torchcodec here are pinned to +cu128 builds too. Same
-# numpy/librosa resolver split as requirements-main.txt above (this file
-# pins numpy==1.26.4 and librosa==0.11.0 -- older than main's 1.0.0 pin,
-# but excluded here too rather than betting a 130-package requirements
-# file won't also hit "resolution-too-deep" the way the 233-package one
-# did).
+COPY deploy/image-exclude-chatterbox.txt /tmp/image-exclude-chatterbox.txt
+# Same --no-deps-against-a-filtered-freeze strategy as the main install
+# above, and it collapses the same set of special cases: with no resolver,
+# numpy lands at the pinned 1.26.4, librosa at 0.11.0 and chatterbox-tts at
+# 0.1.7 straight from the freeze, so the grep exclusions and the separate
+# --no-deps passes this RUN used to need are all gone.
 #
-# chatterbox-tts==0.1.7 also excluded from the main pass, confirmed the
-# hard way: its own metadata hard-pins torch==2.6.0, directly conflicting
-# with this file's torch==2.11.0+cu128 pin (a newer CUDA build presumably
-# chosen deliberately). Installed after with --no-deps, same trade-off as
-# numpy/librosa -- ignore chatterbox-tts's stale torch constraint, it
-# still works at runtime against the newer pin.
-RUN /venv/chatterbox/bin/pip install --no-cache-dir --upgrade pip \
-    && grep -v -E '^(numpy|librosa|chatterbox-tts)==' /tmp/requirements-chatterbox.txt > /tmp/requirements-chatterbox-nonumpy.txt \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements-chatterbox-nonumpy.txt \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps chatterbox-tts==0.1.7 \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps librosa==0.11.0 \
-    && /venv/chatterbox/bin/pip install --no-cache-dir --no-deps -r /tmp/numpy_override.txt
+# THE CUDA BUILD IS DELIBERATELY cu130, NOT THE PINNED cu128. This is the
+# one place the version pins are not taken verbatim, and it is where ~6GB
+# of the image went. requirements-chatterbox.txt pins torch==2.11.0+cu128,
+# so this venv used to install a second complete CUDA 12.8 userspace
+# (4.7GB of nvidia/* wheels) plus a second torch (1.6GB) and a second
+# OpenAI-Triton (0.6GB) -- 6.9GB of an 8.0GB venv was a duplicate GPU
+# stack, on an image whose base already provides CUDA 13.1 as system
+# libraries. Installing the SAME pinned versions from PyTorch's cu130
+# index instead, with --no-deps so no nvidia-* wheels come along, lets
+# torch link the base image's CUDA 13 libs: the venv drops to 2.0GB.
+#
+# Why not share the main environment's torch instead (the obvious move,
+# and tried first): the base image ships torch 2.10.0a0+...nv25.12, an
+# NVIDIA pre-release build, and there is no torchaudio built against it --
+# every released torchaudio fails to load libtorchaudio.so against it.
+# chatterbox genuinely needs torchaudio's compiled ops (s3gen imports it,
+# xvector.py uses torchaudio.compliance.kaldi, perth uses
+# torchaudio.transforms), so the venv needs a matched torch+torchaudio
+# pair, and a stock cu130 pair is the smallest one that exists.
+#
+# VERIFIED on a Runpod CPU pod against this exact base image:
+#   - torch 2.11.0+cu130 (torch.version.cuda == 13.0), torchaudio
+#     2.11.0+cu130, chatterbox, chatterbox.models.s3gen and perth all
+#     import; Spectrogram and compliance.kaldi.fbank produce correct
+#     shapes on real tensors
+#   - `ldd` on libtorch_cuda.so, libtorch_global_deps.so and
+#     libtorchaudio.so reports ZERO unresolved libraries -- the base
+#     image's CUDA 13 libs satisfy them with no bundled wheels
+#   - the cu13 libs `pip check` reports as "not installed"
+#     (cusparseLt, nccl, nvshmem) are all present as system libraries
+#     (/usr/local/cuda-13.1/targets/x86_64-linux/lib, /usr/lib/x86_64-linux-gnu)
+#   - triton is excluded and stays excluded: nothing in chatterbox, perth
+#     or s3tokenizer calls torch.compile or imports triton (grepped, not
+#     assumed), and nothing uses torch.distributed
+# Still GPU-unverifiable on a CPU host: actual CUDA kernel execution, which
+# needs libcuda.so.1.
+#
+# KNOWN BEHAVIOR CHANGE, accepted: torchcodec is excluded, and in
+# torchaudio 2.11 `torchaudio.load`/`torchaudio.save` are implemented via
+# torchcodec, so they now raise ImportError in this venv. Nothing calls
+# them -- not chatterbox, not perth, not triton_model_repo/chatterbox_tts
+# (checked) -- and librosa.load/soundfile, which the code does use, work
+# fine. Restoring them is not just a matter of adding the wheel back: a
+# cu130 torchcodec still fails to load libtorchcodec_core4.so because the
+# base image ships no FFmpeg shared libraries, so it would mean apt-getting
+# FFmpeg to enable an API this deployment never calls.
+#
+# chatterbox-tts==0.1.7's own metadata hard-pins torch==2.6.0 and
+# torchaudio==2.6.0. That pin has always been overridden here (installed
+# --no-deps against a much newer torch) and still is; `pip check` reports
+# it, deliberately. It also declares gradio, its optional demo UI, as a
+# hard requirement -- excluded, since nothing in the package imports it.
+RUN python3 -m venv /venv/chatterbox \
+    && python3 /tmp/filter_requirements.py \
+        /tmp/requirements-chatterbox.txt /tmp/image-exclude-chatterbox.txt \
+        > /tmp/requirements-chatterbox-filtered.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-compile --no-deps \
+        -r /tmp/requirements-chatterbox-filtered.txt \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-compile --no-deps \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        torch==2.11.0+cu130 torchaudio==2.11.0+cu130 \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-compile --no-deps \
+        cuda-bindings==13.0.3 cuda-toolkit==13.0.2 cuda-pathfinder==1.6.1 \
+    && /venv/chatterbox/bin/python3 -c "import torch, torchaudio; assert torch.version.cuda.startswith('13'), f'chatterbox venv got a non-CUDA-13 torch ({torch.version.cuda}); it would need its own 4.7GB cu12 wheel set'; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__)" \
+    && /venv/chatterbox/bin/python3 -c "import torch, torchaudio.compliance.kaldi as kaldi; from torchaudio.transforms import Spectrogram, InverseSpectrogram, TimeStretch; assert Spectrogram()(torch.randn(16000)).shape[0] == 201; assert kaldi.fbank(torch.randn(1, 16000)).shape[1] == 23; print('torchaudio compiled ops OK')" \
+    && /venv/chatterbox/bin/python3 -c "import chatterbox, perth; from chatterbox.models.s3gen import s3gen; print('chatterbox + perth import OK')" \
+    && /venv/chatterbox/bin/python3 -c "import glob, os, site; sp = site.getsitepackages()[0]; cu12 = [os.path.basename(p) for p in glob.glob(os.path.join(sp, 'nvidia_*_cu12-*.dist-info'))]; assert not cu12, f'CUDA 12 wheels reappeared in the chatterbox venv ({len(cu12)}, e.g. {cu12[:3]}) -- see deploy/image-exclude-chatterbox.txt'; print('no duplicate CUDA stack')"
 
 # config.pbtxt files across triton_model_repo/ use absolute paths under
 # /workspace/speech-cascade-inference/... (e.g. qwen_llm's engine_dir,

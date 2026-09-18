@@ -1,0 +1,109 @@
+# Packages in deploy/requirements-main.txt that docker/triton/Dockerfile must
+# NOT install, because the NGC base image already ships a matched equivalent
+# (or because they have no business in a serving image).
+#
+# WHY THIS FILE EXISTS -- measured, not guessed. deploy/requirements-main.txt
+# is a `pip freeze` dump from the old bare-metal box, which was CUDA 12.8.
+# The base image (nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3) is
+# CUDA 13.1 throughout, with everything below installed as *system* libraries:
+#
+#   CUDA_VERSION=13.1.0.036     CUBLAS_VERSION=13.2.0.9
+#   CUDNN_VERSION=9.17.0.29     NCCL_VERSION=2.28.9+cuda13.0
+#   TRT_VERSION=10.14.1.48      TRT_ROOT=/usr/local/tensorrt
+#   LD_LIBRARY_PATH=/usr/local/tensorrt/lib:/usr/local/cuda/compat/lib:...
+#
+# (read off the image config with `skopeo inspect --override-os linux
+# --override-arch amd64 docker://nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3`)
+#
+# Replaying the freeze verbatim onto that base -- what this Dockerfile did
+# until now -- pinned torch==2.9.1+cu128 and therefore installed a complete
+# parallel CUDA 12.8 userspace as pip wheels. Measured on a real pod:
+#
+#   site-packages/nvidia/*    4.2 GB  cu12 libs duplicating CUDA 13 system libs
+#   site-packages/tensorrt_libs  3.9 GB  duplicating /usr/local/tensorrt/lib
+#   torch                     1.7 GB  rewriting the base's own torch
+#   tensorrt_llm              3.5 GB  rewriting the base's own tensorrt_llm
+#
+# The last two cost nothing in *visible* disk (they overwrite) but ~5GB in
+# *image* size, because an overwritten file still ships in the lower layer.
+# Total: the main pip install grew site-packages from 9.3GB to 19GB.
+#
+# There is a second, subtler payoff. requirements-main.txt pins PyPI's
+# `tensorrt==10.14.1.48.post1`, which is a METADATA-ONLY wheel -- installing
+# it made pip uninstall the base image's real, working tensorrt module and
+# leave nothing behind, killing tensorrt_llm and therefore qwen_llm. Earlier
+# revisions of the Dockerfile repaired that afterwards by force-reinstalling
+# tensorrt-cu13 from pypi.nvidia.com. Excluding tensorrt* here means the
+# damage never happens, so the repair step is gone too.
+#
+# --- base image already provides these (CUDA 13 / matched toolchain) -------
+torch
+torchvision
+torchao
+triton
+tensorrt
+tensorrt_cu13
+tensorrt_cu13_bindings
+tensorrt_cu13_libs
+tensorrt_llm
+
+# xgrammar is pinned BY tensorrt_llm, exactly. requirements-main.txt pins
+# 0.1.32 because the bare-metal box ran tensorrt_llm 1.2.1; the base image
+# ships tensorrt_llm 1.2.0, which requires xgrammar==0.1.25. Installing the
+# freeze's 0.1.32 on top makes `pip check` report tensorrt_llm's requirement
+# violated -- caught by actually running pip check on a pod, not predicted.
+# Keeping the base's matched pair is the point of this whole file.
+xgrammar
+
+# The cu12 wheel set. Every one of these is the CUDA 12.8 build of a library
+# the base image ships as a CUDA 13 system library.
+nvidia-cublas-cu12
+nvidia-cuda-cupti-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-cufile-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-cusparselt-cu12
+nvidia-nccl-cu12
+nvidia-nvjitlink-cu12
+nvidia-nvshmem-cu12
+nvidia-nvtx-cu12
+
+# NCCL 2.28.9 is already present as a cuda13.0 system library
+# (NCCL_VERSION=2.28.9+cuda13.0); this is the same version as a wheel.
+nvidia-nccl-cu13
+
+# --- dev / notebook / test tooling: no place in a serving image -----------
+# Verified absent from every import in this repo and from the installed
+# chatterbox/perth/tensorrt_llm/modelopt packages before listing here.
+#
+# DELIBERATELY NOT IN THIS LIST, despite looking equally unused -- each one
+# is really imported, checked rather than assumed:
+#   datasets   - tensorrt_llm/models/convert_utils.py and
+#                tensorrt_llm/layers/embedding.py import it, and
+#                convert_checkpoint.py is on the whisper engine-build path
+#                (scripts/build_models_from_scratch.sh). Also imported by
+#                nvidia-modelopt's dataset_utils.
+#   matplotlib - librosa.display imports it
+#   diffusers  - imported by chatterbox (5 modules)
+black
+debugpy
+ipykernel
+ipython
+ipython_pygments_lexers
+ipywidgets
+jedi
+jupyter_client
+jupyter_core
+jupyterlab_widgets
+matplotlib-inline
+meson
+parso
+plotly
+pytest
+pytest-asyncio
+widgetsnbextension
