@@ -19,9 +19,10 @@ a second:
                         what the pipeline can actually influence.
   ttfa_from_speech_end - from the moment the user actually stopped talking.
                         This is what the user perceives, and it is larger by
-                        UtteranceVAD's min_silence_duration_ms (800ms by
-                        default), because that much trailing silence has to
-                        elapse before end-of-speech can be declared at all.
+                        UtteranceVAD's min_silence_duration_ms (400ms by
+                        default, env GATEWAY_VAD_SILENCE_MS), because that
+                        much trailing silence has to elapse before
+                        end-of-speech can be declared at all.
 
 Reporting only the first would flatter the system by ~800ms and hide the
 single largest tunable in the stack. Reporting only the second would make
