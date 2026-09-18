@@ -35,6 +35,23 @@ ORIG_TO_NEW_PREFIX = {
 # parameter to receive it. Anything else unmapped is a bug.
 EXPECTED_UNUSED_PREFIXES = ("text_head.",)
 
+# Parameters that legitimately receive no weight, in the other direction.
+#
+# vLLM's GPT2Model always constructs `wte`, GPT2's own token-embedding table,
+# but T3 never uses it: text tokens go through text_emb and sampled speech
+# tokens through speech_emb (see embed_input_ids), and prompts arrive as
+# embeddings rather than ids. The reference implementation makes the same
+# judgement more bluntly -- it DELETES t3.tfmr.wte -- which is why the
+# checkpoint has 299 tensors but a t3 state_dict export has 298.
+#
+# Confirmed empirically rather than assumed: exporting and loading for real
+# leaves exactly this one parameter unfilled and nothing else.
+#
+# This list is not a place to silence inconvenient failures. Every entry must
+# be a parameter that is provably never read; anything else left random
+# produces a model that runs and sounds wrong.
+EXPECTED_UNFILLED_PARAMS = ("model.wte.weight",)
+
 # HF GPT2 causal-mask buffers, not weights.
 IGNORED_SUBSTRINGS = (".attn.bias", ".attn.masked_bias")
 

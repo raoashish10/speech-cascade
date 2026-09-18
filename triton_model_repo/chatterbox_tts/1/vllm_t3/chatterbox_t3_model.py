@@ -29,7 +29,11 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from configuration_chatterbox import ChatterboxTurboConfig
-from weight_mapping import EXPECTED_UNUSED_PREFIXES, ORIG_TO_NEW_PREFIX
+from weight_mapping import (
+    EXPECTED_UNFILLED_PARAMS,
+    EXPECTED_UNUSED_PREFIXES,
+    ORIG_TO_NEW_PREFIX,
+)
 
 SPEECH_VOCAB_SIZE = 6561  # excludes SOS/EOS
 EOS_TOKEN = 6562
@@ -161,7 +165,9 @@ class ChatterboxTurboT3ForGeneration(nn.Module):
                 "not 'fix' this by widening EXPECTED_UNUSED_PREFIXES without "
                 "establishing that the weight really is unused."
             )
-        unfilled = sorted(set(params_dict) - loaded_params)
+        unfilled = sorted(
+            set(params_dict) - loaded_params - set(EXPECTED_UNFILLED_PARAMS)
+        )
         if unfilled:
             raise ValueError(
                 f"{len(unfilled)} parameter(s) in {type(self).__name__} got no "

@@ -76,16 +76,16 @@ FROM ${TRITON_BASE_IMAGE}
 # Everything below was found by running this stack interactively on a GPU
 # pod against this exact base image, not by guessing between rebuilds:
 #
-# 1. chatterbox_tts/1/model.py defaults CHATTERBOX_BACKEND to "vllm",
-#    needing a /venv/vllm this Dockerfile never builds -- confirmed:
-#    "FileNotFoundError: ... /venv/vllm/bin/python3". Building that venv
-#    isn't enough on its own either: the vllm path also needs
-#    vllm_t3_model_dir (an exported copy of chatterbox's T3 GPT2 backbone
-#    for vLLM's out-of-tree loader), which doesn't exist anywhere in this
-#    repo and has no documented recipe -- see
-#    scripts/export_chatterbox_t3_for_vllm.py for a from-scratch
-#    reconstruction, itself UNVERIFIED. Falling back to the pytorch
-#    backend, which uses the /venv/chatterbox this file already builds.
+# 1. chatterbox_tts/1/model.py defaults CHATTERBOX_BACKEND to "vllm", which
+#    needs two things this image originally lacked: a /venv/vllm, and
+#    vllm_t3_model_dir (chatterbox's T3 GPT2 backbone re-exported for vLLM's
+#    out-of-tree loader). Missing either produced
+#    "FileNotFoundError: ... /venv/vllm/bin/python3" on a real pod, and the
+#    export step had no recipe anywhere in this repo. Both now exist -- the
+#    venv below, and scripts/export_chatterbox_t3_for_vllm.py wired into
+#    scripts/build_models_from_scratch.sh -- and the whole path is verified
+#    on a GPU (see the /venv/vllm block for the numbers). /venv/chatterbox
+#    remains as the CHATTERBOX_BACKEND=pytorch fallback.
 #
 # 2. OPAL_PREFIX: tensorrt_llm imports mpi4py, and MPI_Init_thread aborted
 #    with "opal_init:startup:internal-failure". Root cause: this image's
@@ -112,7 +112,13 @@ FROM ${TRITON_BASE_IMAGE}
 # object file" without it, which is easy to mistake for a broken install
 # when testing over ssh (where the image's env isn't applied) rather than
 # in the container.
-ENV CHATTERBOX_BACKEND="pytorch"
+# vllm is what chatterbox_tts/1/model.py has always defaulted to, and its
+# prerequisites now exist in this image (/venv/vllm and the T3 export, see
+# below). It is 2.4-3.9x faster on time-to-first-audio depending on
+# concurrency -- 3.2x at the gateway's default of four sessions. Set
+# CHATTERBOX_BACKEND=pytorch to fall back to /venv/chatterbox, which is
+# kept precisely so that switch is real.
+ENV CHATTERBOX_BACKEND="vllm"
 ENV OPAL_PREFIX="/usr/local/mpi"
 
 # INSTALL STRATEGY: --no-deps against a filtered freeze.
@@ -267,6 +273,58 @@ RUN python3 -m venv /venv/chatterbox \
     && /venv/chatterbox/bin/python3 -c "import chatterbox, perth; from chatterbox.models.s3gen import s3gen; print('chatterbox + perth import OK')" \
     && /venv/chatterbox/bin/python3 -c "import glob, os, site; sp = site.getsitepackages()[0]; cu12 = [os.path.basename(p) for p in glob.glob(os.path.join(sp, 'nvidia_*_cu12-*.dist-info'))]; assert not cu12, f'CUDA 12 wheels reappeared in the chatterbox venv ({len(cu12)}, e.g. {cu12[:3]}) -- see deploy/image-exclude-chatterbox.txt'; print('no duplicate CUDA stack')"
 
+# /venv/vllm -- T3 decode through vLLM instead of eager PyTorch. This is what
+# CHATTERBOX_BACKEND=vllm needs, and it is the default the model repo has
+# always asked for; the pytorch worker stays as a fallback in
+# /venv/chatterbox.
+#
+# WORTH IT? Measured on an RTX PRO 4500, same GPU, same sentences, same
+# harness, comparing this venv's worker against /venv/chatterbox's:
+#
+#   batch   pytorch   vllm    speedup
+#     1      0.62s    0.26s     2.4x
+#     2      1.39s    0.50s     2.8x
+#     4      2.66s    0.83s     3.2x     <- GATEWAY_MAX_SESSIONS default
+#     8      6.08s    1.54s     3.9x
+#
+# The pytorch path scales linearly because chatterbox-tts==0.1.7 exposes only
+# a single-item generate() and the worker loops; vLLM's continuous batching
+# makes per-item cost FALL with batch size (0.26s -> 0.19s). Time-to-first-
+# audio under four concurrent sessions is 2.66s vs 0.83s, which is the number
+# that decides whether a voice agent feels broken. (chatterbox_worker_vllm.py
+# claims 5-5.4x; that was against a batched+CUDA-graph PyTorch path this
+# package does not expose. 2.4-3.9x is what this deployment actually gets.)
+#
+# vLLM owns the GPU stack here and chatterbox lives with its versions --
+# numpy 2.3.5 and transformers 5.17.0 rather than the freeze's 1.26.4 and
+# 5.2.0. Verified: chatterbox-tts imports and synthesizes fine against both.
+#
+# The uninstall is not an optimization afterthought, it is 2.1GB: vLLM pulls
+# cuda-toolkit's cu13 wheels (cuBLAS, cuSOLVER, cuSPARSE, cuFFT, cuRAND,
+# NVRTC...) which this base image already provides as CUDA 13.1 system
+# libraries. Removing them left the benchmark above unchanged to within noise.
+# cudnn/cusparselt/nccl/nvshmem are deliberately KEPT -- torch pins those and
+# the base ships different versions, which is exactly the bug that took
+# chatterbox_tts to UNAVAILABLE earlier (see image-exclude-chatterbox.txt).
+COPY deploy/filter_missing_requirements.py /tmp/filter_missing_requirements.py
+RUN python3 -m venv /venv/vllm \
+    && /venv/vllm/bin/pip install --no-cache-dir --no-compile vllm==0.29.0 \
+    && /venv/vllm/bin/pip uninstall -y -q \
+        cuda-toolkit nvidia-cublas nvidia-cuda-cccl nvidia-cuda-crt \
+        nvidia-cuda-cupti nvidia-cuda-nvcc nvidia-cuda-nvdisasm \
+        nvidia-cuda-nvrtc nvidia-cuda-runtime nvidia-cufft nvidia-curand \
+        nvidia-cusolver nvidia-cusparse nvidia-nvjitlink nvidia-nvtx nvidia-nvvm \
+    && python3 /tmp/filter_missing_requirements.py \
+        /tmp/requirements-chatterbox.txt /venv/vllm/bin/python3 \
+        --also-exclude /tmp/image-exclude-chatterbox.txt \
+        > /tmp/requirements-vllm-extra.txt \
+    && /venv/vllm/bin/pip install --no-cache-dir --no-compile --no-deps \
+        -r /tmp/requirements-vllm-extra.txt \
+    && /venv/vllm/bin/pip install --no-cache-dir --no-compile --no-deps chatterbox-tts==0.1.7 \
+    && /venv/vllm/bin/python3 -c "import vllm, torch; assert torch.version.cuda.startswith('13'); print('vllm', vllm.__version__, '| torch', torch.__version__)" \
+    && /venv/vllm/bin/python3 -c "import chatterbox, numpy, transformers; from chatterbox.tts_turbo import ChatterboxTurboTTS; print('chatterbox OK against numpy', numpy.__version__, 'transformers', transformers.__version__)" \
+    && /venv/vllm/bin/python3 -c "import importlib.metadata as md; banned = {'cuda-toolkit','nvidia-cublas','nvidia-cuda-nvrtc','nvidia-cuda-runtime','nvidia-cufft','nvidia-curand','nvidia-cusolver','nvidia-cusparse','nvidia-nvjitlink'}; present = {(d.metadata['Name'] or '').lower().replace('_','-') for d in md.distributions()} & banned; assert not present, f'the cu13 wheel libs came back ({sorted(present)}) -- 2.1GB the base image already provides as CUDA 13.1 system libraries'; print('no duplicate CUDA 13 stack')"
+
 # config.pbtxt files across triton_model_repo/ use absolute paths under
 # /workspace/speech-cascade-inference/... (e.g. qwen_llm's engine_dir,
 # whisper_asr's assets_dir, chatterbox_tts's reference-voice path) --
@@ -284,6 +342,8 @@ COPY triton_model_repo /workspace/speech-cascade-inference/triton_model_repo
 # container landed on -- the engines are architecture-specific, so building
 # them at first start is what lets one image serve different cards.
 COPY scripts/build_models_from_scratch.sh /opt/speech-cascade/scripts/build_models_from_scratch.sh
+# Needed by that script's T3 export step when CHATTERBOX_BACKEND=vllm.
+COPY scripts/export_chatterbox_t3_for_vllm.py /opt/speech-cascade/scripts/export_chatterbox_t3_for_vllm.py
 
 COPY docker/triton/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

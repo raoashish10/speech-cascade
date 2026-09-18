@@ -123,3 +123,31 @@ def test_checkpoint_shapes_pin_the_config_defaults():
     assert CHECKPOINT_SHAPES["tfmr.h.0.mlp.c_fc.weight"][1] == 4096   # intermediate_size
     assert CHECKPOINT_SHAPES["tfmr.h.0.attn.c_attn.weight"][1] == 3 * hidden
     assert NUM_HIDDEN_LAYERS == 24
+
+
+def test_only_gpt2s_unused_token_embedding_may_go_unfilled():
+    """wte is the one parameter allowed to receive no weight.
+
+    vLLM's GPT2Model always builds `wte`, but T3 never reads it: text goes
+    through text_emb, sampled speech tokens through speech_emb, and prompts
+    arrive as embeddings. The reference implementation deletes t3.tfmr.wte
+    outright, which is why a t3 state_dict export has 298 tensors against the
+    checkpoint's 299.
+
+    Confirmed by an actual export+load, not by reading code: exactly this one
+    parameter came back unfilled. Widening this list is how a real
+    randomly-initialized module would get waved through, so it should not grow
+    without the same kind of evidence.
+    """
+    from weight_mapping import EXPECTED_UNFILLED_PARAMS
+
+    assert EXPECTED_UNFILLED_PARAMS == ("model.wte.weight",)
+
+
+def test_the_export_is_expected_to_be_one_tensor_short():
+    """299 in the checkpoint, 298 exported -- the missing one is wte."""
+    exported_expected = [
+        n for n in CHECKPOINT_TENSOR_NAMES if n != "tfmr.wte.weight"
+    ]
+    assert len(CHECKPOINT_TENSOR_NAMES) == 299
+    assert len(exported_expected) == 298
