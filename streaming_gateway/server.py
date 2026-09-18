@@ -36,11 +36,20 @@ adding a capability this endpoint doesn't already provide end-to-end.
 Docker deployment (docker/, docker-compose.yml)
 -------------------------------------------------
 There's no Caddy edge in that deployment shape, so this process checks
-GATEWAY_AUTH_TOKEN itself (see _check_auth below) instead of trusting an
-upstream proxy to have done it -- same `?token=`/`Authorization: Bearer`
-convention as above, just enforced here rather than by Caddy. Leave
-GATEWAY_AUTH_TOKEN unset to skip the check (e.g. bare-metal-behind-Caddy,
-or your own reverse proxy already handles it).
+credentials itself instead of trusting an upstream proxy to have done it --
+same `?token=`/`Authorization: Bearer` convention as above, just enforced
+here. See streaming_gateway/auth.py; in short:
+
+  - GATEWAY_API_KEYS holds named, individually revocable keys (preferred).
+    Only their SHA-256 is stored, so the environment never holds a usable
+    credential, and sessions get an identity -- which is what makes the
+    per-key session cap below possible at all.
+  - GATEWAY_AUTH_TOKEN, the original single shared token, still works.
+  - With neither set the process REFUSES TO START. It used to accept every
+    connection in that case, so one missing environment variable published
+    an open endpoint silently. Genuinely unauthenticated operation (correct
+    only when something upstream authenticates) now has to be stated with
+    GATEWAY_ALLOW_ANONYMOUS=1.
 """
 
 import asyncio
@@ -50,6 +59,7 @@ import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+from .auth import Authenticator
 from .session import StreamingSession
 
 logging.basicConfig(level=logging.INFO)
@@ -73,31 +83,43 @@ MAX_CONCURRENT_SESSIONS = int(os.environ.get("GATEWAY_MAX_SESSIONS", "4"))
 _active_sessions = 0
 _sessions_lock = asyncio.Lock()
 
-# Shared-secret check, only meaningful when nothing upstream (Vast.ai's
-# Caddy edge, or your own reverse proxy) already does it -- see the module
-# docstring's "Docker deployment" section. Empty/unset disables the check
-# entirely, preserving today's bare-metal-behind-Caddy behavior.
-GATEWAY_AUTH_TOKEN = os.environ.get("GATEWAY_AUTH_TOKEN", "")
+# Per-client cap, on top of the global one above. The global cap protects the
+# GPU from the fleet as a whole but cannot stop ONE client taking every slot
+# and starving the others -- which is only expressible once connections carry
+# an identity, i.e. with API keys rather than one shared token. 0 disables it.
+MAX_SESSIONS_PER_KEY = int(os.environ.get("GATEWAY_MAX_SESSIONS_PER_KEY", "2"))
+_sessions_by_key: dict[str, int] = {}
+
+# Raises at import if no credentials are configured and GATEWAY_ALLOW_ANONYMOUS
+# is not set -- a missing env var should stop the process, not quietly publish
+# an open endpoint. See streaming_gateway/auth.py.
+_auth = Authenticator()
 
 
-def _check_auth(websocket: WebSocket) -> bool:
-    if not GATEWAY_AUTH_TOKEN:
-        return True
-    token = websocket.query_params.get("token")
-    if not token:
-        auth_header = websocket.headers.get("authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[len("bearer "):]
-    return token == GATEWAY_AUTH_TOKEN
+def _presented_credential(websocket: WebSocket) -> str | None:
+    """Pull the credential from the Authorization header or ?token=.
+
+    Header first: a credential in a query string ends up in proxy access logs,
+    so ?token= is only supported because a browser's WebSocket API cannot set
+    headers on the upgrade. Service-to-service clients should use the header.
+    """
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[len("bearer "):].strip()
+    return websocket.query_params.get("token")
 
 
 @app.websocket("/ws/stream")
 async def stream(websocket: WebSocket):
     global _active_sessions
 
-    if not _check_auth(websocket):
+    principal = _auth.authenticate(_presented_credential(websocket))
+    if principal is None:
         # Reject before accept() -- same as Caddy rejecting with 401 before
         # the upgrade completes, not a WS-level close after the fact.
+        # Deliberately does not distinguish "unknown key" from "wrong secret";
+        # that difference is only useful to someone guessing.
+        log.warning("rejecting unauthorized connection from %s", websocket.client)
         await websocket.close(code=1008, reason="unauthorized")
         return
 
@@ -106,14 +128,28 @@ async def stream(websocket: WebSocket):
     async with _sessions_lock:
         if _active_sessions >= MAX_CONCURRENT_SESSIONS:
             log.warning(
-                "rejecting session: %d/%d concurrent sessions already active",
-                _active_sessions, MAX_CONCURRENT_SESSIONS,
+                "rejecting session for %s: %d/%d concurrent sessions already active",
+                principal, _active_sessions, MAX_CONCURRENT_SESSIONS,
             )
             # 1013 = "Try Again Later" (RFC 6455 registry); real close codes
             # so a client can tell "server full" apart from any other error.
             await websocket.close(code=1013, reason="gateway at capacity, try again shortly")
             return
+        in_use = _sessions_by_key.get(principal.key_id, 0)
+        if MAX_SESSIONS_PER_KEY and in_use >= MAX_SESSIONS_PER_KEY:
+            log.warning(
+                "rejecting session for %s: %d/%d sessions already held by this key",
+                principal, in_use, MAX_SESSIONS_PER_KEY,
+            )
+            await websocket.close(
+                code=1013, reason="per-key session limit reached, try again shortly"
+            )
+            return
         _active_sessions += 1
+        _sessions_by_key[principal.key_id] = in_use + 1
+
+    log.info("session opened for %s (%d/%d active)", principal,
+             _active_sessions, MAX_CONCURRENT_SESSIONS)
 
     try:
         voice = websocket.query_params.get("voice", "Sofia")
@@ -150,3 +186,10 @@ async def stream(websocket: WebSocket):
     finally:
         async with _sessions_lock:
             _active_sessions -= 1
+            # Drop the key's entry at zero rather than leaving a 0 behind, so
+            # this dict tracks live sessions and not every key ever seen.
+            remaining = _sessions_by_key.get(principal.key_id, 1) - 1
+            if remaining > 0:
+                _sessions_by_key[principal.key_id] = remaining
+            else:
+                _sessions_by_key.pop(principal.key_id, None)

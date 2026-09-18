@@ -67,6 +67,59 @@ python3 scripts/test_streaming_client.py --wav your_clip.wav \
 Add `--auth-mode header` to send the token as `Authorization: Bearer …`
 instead of the default `?token=` query param.
 
+## API keys (deployments without an upstream auth edge)
+
+Everything above describes the bare-metal instance, where Caddy authenticates
+and the gateway trusts it. In the container deployments there is no Caddy, so
+the gateway checks credentials itself — see `streaming_gateway/auth.py`.
+
+**It refuses to start with no credentials configured.** The earlier behavior
+was to accept every connection when `GATEWAY_AUTH_TOKEN` was unset, which
+turned one missing environment variable into an open WebSocket endpoint with
+nothing in the logs to indicate it. Running unauthenticated is still possible
+— it is correct when something upstream already authenticates — but it now has
+to be said out loud with `GATEWAY_ALLOW_ANONYMOUS=1`.
+
+**Prefer named API keys over the shared token.** Mint one per client:
+
+```bash
+python3 -m streaming_gateway.auth --new alice
+```
+
+That prints the key to hand the client (once — it is not recoverable) and the
+entry for the gateway's environment:
+
+```
+GATEWAY_API_KEYS=a7401936:af1e7cac...b533:alice
+```
+
+Only the SHA-256 is stored, so the environment never holds a usable
+credential. Comma-separate further keys; revoke one by deleting its entry and
+redeploying. Clients authenticate exactly as before:
+
+```
+Authorization: Bearer sc_a7401936_e5SFd0g-...
+```
+
+Three things this buys that a single shared token cannot:
+
+- **revocation** — drop one client without rotating the credential every other
+  client is using.
+- **attribution** — log lines name the client (`session opened for alice
+  (a7401936)`) instead of "someone holding the token".
+- **per-key limits** — `GATEWAY_MAX_SESSIONS_PER_KEY` (default 2) caps each
+  client separately. The global `GATEWAY_MAX_SESSIONS` protects the GPU from
+  the fleet as a whole but cannot stop one client taking every slot, and a cap
+  per client is only expressible once connections have an identity.
+
+`GATEWAY_AUTH_TOKEN` still works and can coexist with keys, so nothing about
+the bare-metal deployment has to change.
+
+**Send keys in the header, not the URL.** `?token=` is still accepted because
+a browser's `WebSocket` API cannot set headers, but a credential in a query
+string ends up in proxy access logs. For service-to-service clients — the only
+kind here today — always use `Authorization: Bearer`.
+
 **Why Triton itself stays internal-only.** Triton's HTTP/gRPC/metrics ports
 (18000/18001/18002) are not exposed externally, and that's deliberate, not
 an oversight: this gateway already gives an external caller everything
