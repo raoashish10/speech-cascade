@@ -1,48 +1,65 @@
 name: build-images
 
-# Builds and pushes docker/gateway and docker/triton to GHCR with real
-# Docker/BuildKit.
+# Builds and pushes docker/gateway to GHCR with real Docker/BuildKit.
 #
-# Why this exists rather than building on a GPU host: Runpod pods (and most
-# managed GPU containers) can't run Docker-in-Docker -- the sandbox blocks
-# the unshare()/clone() syscalls nested containers need. The workaround used
-# during development was kaniko (daemonless, chroot-based), and it produced
-# a SILENTLY BROKEN image: files written by `RUN pip install ...` were
-# missing from the pushed layers, while everything inherited from the base
-# image was fine. That failure mode is invisible at build time -- the build
-# "succeeds", the pip output says "Successfully installed", the in-RUN
-# assertions pass -- and only shows up at runtime as
-# ModuleNotFoundError/missing .so for exactly the packages the Dockerfile
-# added. Confirmed by running the identical pip sequence by hand on the same
-# base image, where it produces a fully working environment. Hence: real
-# BuildKit here, not kaniko.
+# THE TRITON IMAGE IS DELIBERATELY NOT BUILT HERE. That is a decision, not
+# an omission, and it is not worth re-litigating without new information --
+# the full record is below so nobody spends another day rediscovering it.
 #
-# DISK: the triton image is large and the first attempt at this job died
-# with "No space left on device". It has since been slimmed from ~40GB
-# unpacked (~27GB compressed) to ~24GB unpacked by removing ~19GB of
-# duplicate CUDA userspace -- both pip installs were replaying `pip freeze`
-# dumps from a CUDA 12.8 box onto a CUDA 13.1 base image, so each installed
-# its own complete cu12 wheel set beside the CUDA 13 libraries the base
-# already ships. See docker/triton/Dockerfile and deploy/image-exclude-*.txt
-# for the measurements.
+# Why not on a GPU host: Runpod pods (and most managed GPU containers) can't
+# run Docker-in-Docker; the sandbox blocks the unshare()/clone() syscalls
+# nested containers need. Confirmed by trying it.
 #
-# A standard GitHub-hosted runner starts with roughly 14GB free and the
-# cleanup step below reclaims ~30GB more, so ~24GB should now fit -- with
-# little enough headroom that the "Disk after build" step is worth reading
-# on any failure. If it still dies for want of space, the remaining options
-# are (a) a larger runner, (b) a self-hosted runner, or (c) a smaller base
-# image: ~22GB of the ~24GB is the NGC base itself, so nothing else in this
-# repo can move the number much.
+# Why not kaniko (the daemonless, chroot-based workaround used during
+# development): it produces a SILENTLY BROKEN image. Files written by
+# `RUN pip install ...` are missing from the pushed layers, while everything
+# inherited from the base image is fine. The build reports success, pip says
+# "Successfully installed", the in-RUN assertions pass, and the image then
+# fails at model load with ModuleNotFoundError for exactly the packages the
+# Dockerfile added. Confirmed by running the identical pip sequence by hand
+# on the same base image, where it produces a fully working environment.
 #
-# The gateway job is ~400MB and has no such problem.
+# Why not a GitHub-hosted runner, which is what this job used to attempt:
+# disk. Measured, not estimated:
+#
+#   nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3   15.2 GB compressed
+#                                                          ~22 GB extracted
+#   everything this repo adds on top                        ~2.5 GB
+#
+# A standard runner has ~20 GB free on / (73 GB disk, ~54 GB of it
+# preinstalled tooling). The cleanup step this job used to run reclaimed
+# enough to reach the low 40s of GB, and it still died -- twice -- with
+# "System.IO.IOException: No space left on device", roughly 5 minutes in,
+# during the base image pull and before a single pip install ran. The peak
+# is the extracted base plus its compressed layers plus our layers, ~35 GB,
+# against a budget that has to also leave room for the runner's own logs.
+# When it blows, the runner dies hard enough that the job logs are
+# unrecoverable (BlobNotFound), so each failure costs a rerun to diagnose.
+#
+# The image was slimmed from ~40 GB to ~24 GB before giving up on this
+# (see deploy/image-exclude-*.txt) and it was not enough, because ~22 GB of
+# the ~24 GB is the NGC base image itself: tensorrt_llm 3.5 GB, flash_attn's
+# single 1.7 GB .so, torch, CUDA 13, Triton. None of that is fat this repo
+# can trim -- it is what serving TensorRT-LLM engines requires.
+#
+# Splitting the pipeline into per-stage images does not rescue this either:
+# whisper_asr and qwen_llm BOTH need TensorRT-LLM, so two of the three
+# images would still carry the same 22 GB base. Only chatterbox_tts could
+# use a smaller one (~6.5 GB, it needs no TRT-LLM). See docker/README.md.
+#
+# So: build the triton image by hand, on a machine with Docker and ~60 GB
+# free. docker/README.md has the command and what to verify afterwards.
+# If this ever moves back into CI it needs a larger or self-hosted runner,
+# not another round of slimming.
 
 on:
   workflow_dispatch:
-    inputs:
-      build_triton:
-        description: "Build the large triton image (~24GB unpacked, tight on a standard runner)"
-        type: boolean
-        default: true
+  push:
+    branches: [main]
+    paths:
+      - "docker/gateway/**"
+      - "streaming_gateway/**"
+      - ".github/workflows/build-images.yml"
 
 env:
   REGISTRY: ghcr.io
@@ -73,46 +90,3 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/speech-cascade-gateway:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  triton:
-    if: ${{ inputs.build_triton }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      # Reclaims ~30GB. Everything removed here is preinstalled runner
-      # tooling this build never touches.
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost /usr/local/lib/node_modules \
-                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force || true
-          df -h /
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # No cache-to here on purpose: the layer cache for an image this size
-      # would blow past the 10GB per-repo GitHub Actions cache limit and
-      # evict itself every run, costing disk for no benefit.
-      - name: Build and push triton
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/triton/Dockerfile
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/speech-cascade-triton:latest
-
-      - name: Disk after build
-        if: always()
-        run: df -h /

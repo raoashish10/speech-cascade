@@ -10,17 +10,37 @@ set -euo pipefail
 MODELS_DIR="${MODELS_DIR:-/workspace/speech-cascade-inference/models}"
 MODEL_REPO="${MODEL_REPO:-/workspace/speech-cascade-inference/triton_model_repo}"
 
-# Optional: restore weights/engines from S3 the first time the models/
-# volume is empty. Mirrors deploy/REBUILD.md step 2's `aws s3 sync`,
-# decoupled from that runbook's Vast.ai-specific assumption that
-# /workspace already has everything -- here it targets whatever
-# docker-compose.yml mounted at MODELS_DIR. Skipped entirely if
-# S3_BUCKET_URI isn't set (e.g. you're mounting an already-populated
-# volume, or built engines from scratch per deploy/REBUILD.md section 4 /
-# deploy/ansible's build_source=scratch).
-if [ -n "${S3_BUCKET_URI:-}" ] && [ ! -d "${MODELS_DIR}/Qwen3-8B-NVFP4" ]; then
-  echo "models/ looks empty -- restoring from ${S3_BUCKET_URI}"
-  aws s3 sync "${S3_BUCKET_URI}" /workspace/speech-cascade-inference/
+# Bootstrap weights/engines when models/ is empty. This runs on a plain
+# `docker run`, a compose volume's first start, or a Runpod pod created
+# straight from this image -- all three arrive here with nothing in
+# MODELS_DIR unless something was mounted.
+#
+# Two sources, in priority order:
+#
+#   S3_BUCKET_URI set -> restore a prebuilt tree (deploy/REBUILD.md step 2's
+#     `aws s3 sync`). Fastest, but needs somewhere to have built it first.
+#
+#   otherwise -> build from scratch: pull the checkpoints from the Hugging
+#     Face Hub and compile the whisper TensorRT-LLM engines HERE. That is
+#     not a fallback so much as the right default for this image: the
+#     engines are GPU-architecture-specific (see docker/README.md's "GPU
+#     portability caveat"), so compiling them at first start on the card
+#     that will actually serve them is what makes one image work across
+#     different GPUs. Nothing is baked in, and no S3 bucket is required.
+#
+# Cost of the from-scratch path, measured on an RTX PRO 4500: ~6GB of Hub
+# download for Qwen3-8B-NVFP4 plus a few seconds of trtllm-build for
+# whisper's encoder/decoder. It writes into MODELS_DIR, so mounting a
+# volume there makes it a one-time cost per volume rather than per start.
+if [ ! -d "${MODELS_DIR}/Qwen3-8B-NVFP4" ]; then
+  if [ -n "${S3_BUCKET_URI:-}" ]; then
+    echo "models/ is empty -- restoring from ${S3_BUCKET_URI}"
+    aws s3 sync "${S3_BUCKET_URI}" /workspace/speech-cascade-inference/
+  else
+    echo "models/ is empty and S3_BUCKET_URI is unset -- building from"
+    echo "scratch: Hugging Face checkpoints + whisper engines for this GPU."
+    bash "${BOOTSTRAP_SCRIPT:-/opt/speech-cascade/scripts/build_models_from_scratch.sh}"
+  fi
 fi
 
 # --http-address/--grpc-address bind 0.0.0.0 (not 127.0.0.1, unlike the

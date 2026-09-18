@@ -33,6 +33,27 @@ torchcodec
 triton
 
 # The cu12 wheel set -- the base image provides CUDA 13.1 system libraries.
+#
+# ONE EXCEPTION, found by running the thing rather than reasoning about it:
+# cuDNN is NOT excluded in practice. The Dockerfile installs
+# nvidia-cudnn-cu13 explicitly right after torch, because the base image
+# ships cuDNN 9.17.0 while torch 2.11.0+cu130 is compiled against 9.19.0,
+# and torch refuses to run its RNN kernels on a mismatch:
+#
+#   RuntimeError: cuDNN version incompatibility: PyTorch was compiled
+#   against (9, 19, 0) but found runtime version (9, 17, 0)
+#
+# which took chatterbox_tts to UNAVAILABLE ("chatterbox worker failed to
+# start") because its s3gen voice encoder uses LSTMs.
+#
+# Worth remembering WHY this was missed: `pip check` did warn that torch
+# required nvidia-cudnn-cu13, and that warning was dismissed after `ldd`
+# showed no unresolved libraries in libtorch_cuda.so. That was bad
+# evidence -- cuDNN is dlopen'd lazily at first use, so it never appears
+# in ldd output, and no amount of static inspection would have caught it.
+# The libraries below are genuinely unused by this deployment (no
+# torch.distributed, no sparse ops, no multi-GPU), but "ldd is clean" is
+# not what establishes that; running the model is.
 nvidia-cublas-cu12
 nvidia-cuda-cupti-cu12
 nvidia-cuda-nvrtc-cu12
