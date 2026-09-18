@@ -140,6 +140,16 @@ class TritonPythonModel:
         else:
             worker_env.pop("LD_LIBRARY_PATH", None)
 
+        # The worker venv's bin/ must be on PATH, not just its python. vLLM's
+        # torch.compile backend shells out to `ninja`, which pip installs as a
+        # console script inside the venv -- without this the worker gets all
+        # the way through engine init and CUDA graph capture and then dies
+        # with "FileNotFoundError: [Errno 2] No such file or directory:
+        # 'ninja'". Confirmed on a GPU pod; harmless for the pytorch backend,
+        # which needs nothing off PATH.
+        venv_bin = os.path.dirname(CHATTERBOX_PYTHON)
+        worker_env["PATH"] = venv_bin + os.pathsep + worker_env.get("PATH", "")
+
         worker_args = [CHATTERBOX_PYTHON, WORKER_SCRIPT, ref_audio_path]
         if _BACKEND == "vllm":
             # Registering our out-of-tree T3 model class only happens in

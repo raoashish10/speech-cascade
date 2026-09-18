@@ -101,5 +101,28 @@ trtllm-build --checkpoint_dir "${checkpoint_dir}/decoder" \
 mkdir -p "${output_dir}/assets"
 cp assets/multilingual.tiktoken assets/mel_filters.npz "${output_dir}/assets/"
 
+# --- chatterbox_tts (CHATTERBOX_BACKEND=vllm only) -------------------------
+# vLLM cannot load chatterbox's T3 GPT2 backbone from the package directly;
+# it needs it re-exported as a standalone HF-loadable directory for the
+# out-of-tree loader (triton_model_repo/chatterbox_tts/1/vllm_t3/). That
+# export is this step. Skipped when /venv/vllm is absent, i.e. when the image
+# was built without the vLLM backend, and skipped when the directory already
+# exists -- the weights come from the Hub and do not change.
+#
+# ~22s and 1.7GB, both measured. The pytorch backend needs none of this.
+VLLM_PYTHON="${VLLM_PYTHON:-/venv/vllm/bin/python3}"
+VLLM_T3_DIR="${VLLM_T3_DIR:-${INFERENCE_DIR}/vllm_t3_model_dir}"
+EXPORT_SCRIPT="${EXPORT_SCRIPT:-/opt/speech-cascade/scripts/export_chatterbox_t3_for_vllm.py}"
+
+if [ ! -x "${VLLM_PYTHON}" ]; then
+  echo "==> chatterbox_tts: /venv/vllm not present, skipping the T3 export"
+  echo "    (CHATTERBOX_BACKEND=pytorch needs no export)"
+elif [ -f "${VLLM_T3_DIR}/model.safetensors" ]; then
+  echo "==> chatterbox_tts: T3 export already present at ${VLLM_T3_DIR}"
+else
+  echo "==> chatterbox_tts: exporting T3 backbone for vLLM (~1.7GB)"
+  "${VLLM_PYTHON}" "${EXPORT_SCRIPT}" --output-dir "${VLLM_T3_DIR}"
+fi
+
 echo "==> done. models/ now contains:"
 ls -1 "${MODELS_DIR}"
