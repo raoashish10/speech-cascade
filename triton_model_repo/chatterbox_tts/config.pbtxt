@@ -52,9 +52,25 @@ instance_group [
   }
 ]
 
+# Reference voice clip for voice cloning. EMPTY BY DEFAULT, which means
+# "use the voice chatterbox-turbo ships" -- its checkpoint includes conds.pt,
+# loaded automatically by ChatterboxTurboTTS.from_pretrained(), so the model
+# has a working voice with no external artifact at all.
+#
+# This used to default to /workspace/speech-cascade-inference/scripts/
+# pipeline_output.wav, a file that exists in neither this repo nor the
+# container image (it is a deployment artifact). The result was that a
+# container started without it loaded the entire model and then died, taking
+# chatterbox_tts to UNAVAILABLE -- observed on a Runpod pod from the
+# published image, where the other three models reached READY.
+#
+# Set this to clone a specific voice instead. The clip must be **longer than
+# 5 seconds** (chatterbox asserts this) and a configured-but-missing path is
+# now a startup error rather than a silent fallback, so a deployment that
+# means to use a particular voice cannot quietly end up on the default one.
 parameters: {
   key: "ref_audio_path"
-  value: { string_value: "/workspace/speech-cascade-inference/scripts/pipeline_output.wav" }
+  value: { string_value: "" }
 }
 
 # vLLM T3's KV-cache reservation as a fraction of total GPU memory. 0.3 (the

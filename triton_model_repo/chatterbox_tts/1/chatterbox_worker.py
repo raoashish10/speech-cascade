@@ -43,7 +43,12 @@ import soundfile as sf
 import torch
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-REF_AUDIO = sys.argv[1]
+# Optional. chatterbox-turbo ships a built-in voice (conds.pt, one of the
+# files ChatterboxTurboTTS.from_pretrained() pulls from the Hub), and
+# from_local() loads it into self.conds automatically when present. So a
+# reference clip is only needed to override that default with a specific
+# cloned voice -- see the startup logic below.
+REF_AUDIO = sys.argv[1] if len(sys.argv) > 1 else ""
 
 PROTO = "@@PROTO@@"
 
@@ -108,9 +113,42 @@ if _PROFILE_STEPS > 0:
     )
 
 model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+
 # Embed the reference voice once; subsequent generate() calls with no
 # audio_prompt_path reuse this cached conditioning (see module docstring).
-model.prepare_conditionals(REF_AUDIO)
+#
+# Falling back to the built-in voice rather than requiring a clip is
+# deliberate. prepare_conditionals() used to be called unconditionally on a
+# path that is a DEPLOYMENT ARTIFACT -- not in this repo, not in the image --
+# so a container started without one got as far as loading the whole model
+# and then died, taking chatterbox_tts to UNAVAILABLE. Confirmed on a
+# Runpod pod from the published image: three models READY, this one not.
+# chatterbox-turbo ships conds.pt for exactly this case, so the default
+# voice costs nothing and makes the image self-sufficient.
+#
+# A configured clip still wins, so deployments that set ref_audio_path keep
+# the voice they had. Note prepare_conditionals() asserts the clip is longer
+# than 5 seconds; a shorter one is a hard failure, not a fallback, because
+# silently ignoring a clip someone deliberately configured would be worse
+# than refusing to start.
+if REF_AUDIO and os.path.exists(REF_AUDIO):
+    model.prepare_conditionals(REF_AUDIO)
+    print(f"[voice] cloned from reference clip: {REF_AUDIO}", file=sys.stderr, flush=True)
+elif REF_AUDIO:
+    raise SystemExit(
+        f"ref_audio_path is set to {REF_AUDIO!r} but that file does not exist. "
+        "Leave it empty to use chatterbox's built-in voice, or mount the clip."
+    )
+else:
+    if model.conds is None:
+        raise SystemExit(
+            "No ref_audio_path configured and this checkpoint has no built-in "
+            "conds.pt, so there is no voice to speak with. Supply a reference "
+            "clip longer than 5 seconds via ref_audio_path."
+        )
+    print("[voice] using chatterbox's built-in voice (no ref_audio_path set)",
+          file=sys.stderr, flush=True)
+
 reply("WORKER_READY")
 
 for line in sys.stdin:

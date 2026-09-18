@@ -284,20 +284,45 @@ needs somewhere to have built it first.
 (`ref_audio_path`) -- a deployment artifact you supply yourself, and it must
 be **longer than 5 seconds** or the model refuses to load.
 
-**This is the one thing a bare pod cannot do for itself.** Deploying the
-image with nothing mounted gets `qwen_llm`, `whisper_asr` and
-`voice_pipeline` to `READY`, and `chatterbox_tts` to `UNAVAILABLE`:
+**You no longer need to supply one just to get the model up.**
+`chatterbox-turbo`'s checkpoint includes `conds.pt`, a built-in voice that
+`ChatterboxTurboTTS.from_pretrained()` loads automatically, so the model has
+a working voice with no external artifact at all. `ref_audio_path` now
+defaults to empty, meaning "use that built-in voice".
+
+This was a real defect rather than a missing file. `ref_audio_path` was a
+required config parameter pointing at `scripts/pipeline_output.wav` -- which
+is in neither this repo nor the image -- so a container started without it
+loaded the entire model and then died:
 
 ```
 chatterbox_tts load request FAILED
   TritonModelException: chatterbox worker failed to start: None
 ```
 
-That message is unhelpfully opaque -- the worker's real error is swallowed,
-and the underlying cause is simply that `scripts/pipeline_output.wav` does
-not exist in the image. Mount a clip there (or bake your own in) before
-expecting TTS to come up. Improving that error to surface the worker's
-stderr would be a worthwhile small fix.
+(observed on a Runpod pod from the published image, where the other three
+models reached `READY`). That message is also unhelpfully opaque: the
+worker's real error is swallowed, which is worth fixing separately.
+
+**Set `ref_audio_path` when you want a specific cloned voice.** Reproducible
+ways to get the clip to the container, in the order I'd pick them:
+
+1. **Ship it with the weights.** Put the clip in the same Hugging Face repo
+   the checkpoints come from and fetch it in
+   `scripts/build_models_from_scratch.sh`. This is the most consistent
+   option -- it arrives exactly the way every other model artifact already
+   does, versioned with them, and needs no extra infrastructure.
+2. **Commit it to the repo** and `COPY` it in the Dockerfile. A 41s mono wav
+   is ~2MB, which git handles fine. Simplest and fully hermetic -- but only
+   if you have the rights to redistribute that recording, which is the usual
+   reason a voice clip is kept out of a repo.
+3. **`S3_BUCKET_URI`**, which `entrypoint.sh` already restores from. Reuses
+   existing machinery, at the cost of credentials.
+
+Whichever you choose, the clip must be **longer than 5 seconds** (chatterbox
+asserts this), and a configured-but-missing path is now a startup error
+rather than a silent fallback -- a deployment that means to use a particular
+voice should not quietly end up on the default one.
 
 ```bash
 cp .env.example .env   # fill in S3 creds (or skip and populate the volume yourself) + GATEWAY_AUTH_TOKEN
