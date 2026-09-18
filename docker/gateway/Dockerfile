@@ -16,8 +16,19 @@ COPY streaming_gateway/requirements.txt /app/streaming_gateway/requirements.txt
 # in VADIterator only, no GPU inference), so pulling the default (CUDA)
 # wheel here would just bloat the image for nothing this container ever
 # uses.
+# The CPU index has to be repeated on the second install, or the first one is
+# silently undone: streaming_gateway/requirements.txt lists silero-vad
+# unpinned, silero-vad depends on torch, and without the index pip
+# re-resolves torch against PyPI -- where the default wheel is the CUDA build
+# -- upgrading the CPU torch just installed and dragging ~2.5GB of
+# nvidia-*-cu12 wheels into a container that has no GPU. That is not
+# hypothetical: the identical two-step in .github/workflows/tests.yml did
+# exactly this on 2026-09-18 and ran the CI runner out of disk. It happens to
+# resolve correctly here today, which is precisely why it is worth pinning
+# before it drifts.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchaudio \
-    && pip install --no-cache-dir -r /app/streaming_gateway/requirements.txt
+    && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r /app/streaming_gateway/requirements.txt
 
 COPY streaming_gateway /app/streaming_gateway
 
