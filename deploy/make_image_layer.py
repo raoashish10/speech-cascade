@@ -16,9 +16,26 @@ the same base image, then produce the base image's flattened file listing with
 
 This then writes /tmp/layer.tgz's file lists, to be packaged with
 
-    tar -cf - -C / -T /tmp/layer-files.txt -C /tmp/wh-stage -T /tmp/layer-whiteouts.txt | pigz -1 > /tmp/layer.tgz
+    tar --hard-dereference -cf - \
+        -C / -T /tmp/layer-files.txt \
+        -C /tmp/wh-stage -T /tmp/layer-whiteouts.txt | pigz -1 > /tmp/layer.tgz
 
 and appended with `crane mutate --append`.
+
+--hard-dereference is not optional, and neither is the `-not -type d` in
+changed_files() below. Both guard the same failure: if tar emits a hardlink
+entry whose target is not itself in the archive, the layer is unregisterable
+and the image cannot even be pulled --
+
+    failed to register layer: link .../libcudnn_heuristic.so.9: no such
+    file or directory
+
+That happens when a file reaches the archive twice (e.g. a directory in the
+file list, plus that directory's own contents), because tar records the
+second occurrence as a link to the first; and it happens when a genuinely
+hardlinked file's partner is filtered out of the list. Hit for real while
+adding the cuDNN wheel, whose layer had to be rebuilt. Listing only regular
+files and dereferencing hard links makes both cases impossible.
 
 This reproduces what Docker's overlay driver would produce for those RUN
 layers. Two kinds of entry:

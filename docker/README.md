@@ -122,6 +122,14 @@ Two things make this trustworthy rather than a second kaniko:
 - **The result is tested by running it**, not by trusting the build. kaniko's
   output failed that test instantly.
 
+One trap worth knowing, hit for real here: package the layer with
+`tar --hard-dereference`, and never put a directory and its own contents in
+the same file list. If tar emits a hardlink entry whose target isn't in the
+archive, the layer cannot be registered and the image won't even pull
+(`failed to register layer: link ...: no such file or directory`). The cuDNN
+wheel triggered exactly this and its layer had to be rebuilt. The failure is
+at least loud -- unlike kaniko's.
+
 Measured: the delta is ~3.5 GB uncompressed / **1.3 GB compressed** on top of
 the base's 15.2 GB. Iterating is fast — a second push that changed only
 `entrypoint.sh` completed in about a second, because every other blob was
