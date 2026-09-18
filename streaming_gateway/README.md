@@ -142,16 +142,47 @@ the budget.
 
 **What to target, in order:**
 
-1. **Emit audio before the whole sentence is synthesised** — ~1.1-1.5s.
-   Chunking a long sentence on clause boundaries puts first audio at ~700ms
-   with no model changes; streaming S3Gen's output approaches the ~144ms
-   floor. PR #33's note that S3Gen's flow-matching vocoder still runs
-   per-item and unbatched describes exactly where this time goes.
+1. ~~Emit audio before the whole sentence is synthesised~~ — **done, see
+   below.** Streaming S3Gen's output rather than chunking its input remains
+   available and would approach the ~144ms floor; PR #33's note that S3Gen's
+   flow-matching vocoder still runs per-item and unbatched describes where
+   the remaining time goes.
 2. **`UtteranceVAD(min_silence_duration_ms=800)` → 400ms** — one config
-   value worth more than ASR, prefill and decode combined. The trade is
-   premature endpointing on hesitant speakers, so it wants testing.
-3. **Nothing else.** ASR at 88ms, prefill at 18ms and decode at 9.7ms/delta
+   value, now the single largest remaining item at 49% of perceived TTFA.
+   The trade is premature endpointing on hesitant speakers, so it wants
+   testing.
+3. **Nothing else.** ASR at 74ms, prefill at 16ms and decode at 9.6ms/delta
    are inside the noise of a single TTS chunk.
+
+### Clause chunking: measured A/B
+
+`split_for_tts()` splits a sentence at clause boundaries so TTS returns the
+first clause instead of the whole sentence. Ten warm turns per arm, **same
+pod, same GPU, same clip**, toggled with `GATEWAY_TTS_CHUNKING`:
+
+| median | whole sentence | clause-chunked | change |
+|---|---:|---:|---:|
+| `tts_first_ms` | 1686ms | **561ms** | −1125ms (3.0×) |
+| `ttfa_from_vad_end_ms` | 1970ms | **843ms** | −1127ms (2.3×) |
+| `ttfa_from_speech_end_ms` | 2770ms | **1643ms** | −1127ms (1.7×) |
+
+The measured sentence splits once, at `blue | because`. Two costs, both
+measured rather than assumed:
+
+- **The gap is 30ms.** Chunk 1 is 1.56s of audio and chunk 2 arrives 1.59s
+  after it, so playback is effectively continuous — the ~144ms fixed cost
+  plus chunk 2's synthesis finishes well inside chunk 1's playback. This is
+  the RTF-0.30 headroom doing its job, and it is why chunk size ratios did
+  not need engineering: at a clause boundary even a real gap degrades to a
+  pause a speaker would have made.
+- **The reply takes 0.40s longer to finish speaking** (5.86s → 6.26s of
+  total audio, +7%), because two utterances carry two sets of leading and
+  trailing padding. Starting 1127ms sooner for 400ms more total speech is
+  the trade, and for a conversational turn it is clearly the right one.
+
+What is *not* measured is prosody. Each chunk gets its own intonation
+contour, and whether the reset at a clause boundary is audible is a
+listening judgement, not a number. That is the reason for the env toggle.
 
 **A design assumption this disproved.** `session.py` synthesises per
 sentence so TTS for sentence 1 can overlap the LLM generating sentence 2.
