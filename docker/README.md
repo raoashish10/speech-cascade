@@ -258,9 +258,24 @@ That is the default rather than a fallback, because the engines are
 GPU-architecture-specific (see "GPU portability caveat"). Compiling them at
 first start on the card that will serve them is what lets one image work
 across different GPUs; baking them in would tie the image to one card.
-Measured on an RTX PRO 4500: ~6GB of Hub download for `Qwen3-8B-NVFP4` plus a
-few seconds of `trtllm-build` for whisper's encoder and decoder. Mounting a
-volume at that path makes it a one-time cost per volume instead of per start.
+
+**Verified** by deploying the published image as a Runpod pod with nothing
+mounted, on an RTX PRO 4500 Blackwell:
+
+```
+models/ is empty and S3_BUCKET_URI is unset -- building from
+scratch: Hugging Face checkpoints + whisper engines for this GPU.
+==> qwen_llm: downloading Qwen3-8B-NVFP4 (~6GB)
+Fetching 12 files: 100% [00:32]
+==> whisper_asr: building TensorRT-LLM encoder/decoder engines
+    encoder engine generation completed in 38.3s
+    decoder: total time of building all engines 00:00:07
+==> done. models/ now contains: Qwen3-8B-NVFP4, whisper-base-trtllm
+```
+
+**2 min 43 s** from container start to a populated `models/`, of which ~32s
+was the Hub download and ~45s the two engine builds. Mounting a volume at
+that path makes it a one-time cost per volume instead of per start.
 
 Set `S3_BUCKET_URI` instead to restore a prebuilt tree, which is faster but
 needs somewhere to have built it first.
