@@ -43,8 +43,28 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
 
       - name: Install gateway + test dependencies
+        # The CPU wheel index has to be repeated here, or the step above is
+        # silently undone. streaming_gateway/requirements.txt lists
+        # silero-vad>=6.0.0 unpinned, and silero-vad depends on torch, so
+        # without the index pip re-resolves torch against PyPI -- where the
+        # default wheel is the CUDA build -- and upgrades the CPU torch
+        # installed above, dragging the whole nvidia-*-cu12 set with it:
+        # cudnn 707MB, nccl 322MB, cusparse 288MB, cusparselt 287MB,
+        # cusolver 268MB, cufft 193MB, triton 170MB and more. That is what
+        # broke this job on 2026-09-18 with "OSError: [Errno 28] No space
+        # left on device" -- ~2.5GB of CUDA wheels on a runner that needs
+        # none of them, for unit tests that run entirely on CPU.
+        #
+        # Why --extra-index-url is enough: PyTorch's CPU index publishes
+        # torch as X.Y.Z+cpu, and a local version tag sorts ABOVE the plain
+        # X.Y.Z on PyPI, so pip prefers the CPU build whenever both indexes
+        # carry the same base version. If PyPI ever leads the CPU index by
+        # a release this will drift back, and the fix then is a constraints
+        # file pinning torch/torchaudio to +cpu builds rather than another
+        # index-url flag.
         run: |
-          pip install -r streaming_gateway/requirements.txt
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r streaming_gateway/requirements.txt
           pip install pytest pytest-asyncio
 
       - name: Run unit tests
