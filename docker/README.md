@@ -15,20 +15,163 @@ builds on one of those images instead of reassembling the toolchain by
 hand, which is what makes this portable to any GPU host with Docker +
 `nvidia-container-toolkit` — not just this one Vast.ai instance.
 
-**Build status**: both images now build successfully and are pushed to
-`ghcr.io/raoashish10/speech-cascade-gateway:latest` and
-`ghcr.io/raoashish10/speech-cascade-triton:latest` — verified by actually
-building them (not just reading the Dockerfile) on a Runpod CPU pod,
-since Runpod pods don't support Docker-in-Docker (the sandbox blocks the
-`unshare()`/`clone()` syscalls nested containers need — confirmed the hard
-way; `kaniko`, which builds via chroot instead of a daemon, was used in
-place of `docker build`). That process found and fixed 8 real bugs in
-`docker/triton/Dockerfile` — missing `--extra-index-url` for `+cu128`
-torch wheels, a `numpy`/`librosa` pip resolver conflict, a
-`resolution-too-deep` error, a genuinely broken `_ssl` module in this NGC
-image's `/usr/local/bin/python3` (bridged around with a `.pth` file), and
-a `chatterbox-tts` pin conflict, among others — see the Dockerfile's own
-inline comments for the full detail on each.
+## Build status — read this first
+
+| image | built by | status |
+|---|---|---|
+| `speech-cascade-gateway` | CI (`.github/workflows/build-images.yml`) | **good** — real BuildKit, pushed to `ghcr.io/raoashish10/speech-cascade-gateway:latest` |
+| `speech-cascade-triton` | `crane`, on a GPU pod (see below) | **good** — `ghcr.io/raoashish10/speech-cascade-triton:latest`, verified by running it |
+
+`speech-cascade-triton:latest` was, until 2026-09-18, a kaniko build that was
+**silently broken** — files written by `RUN pip install` were missing from its
+layers, so it pulled and started cleanly and then died at model load with
+`ModuleNotFoundError`. That tag now points at a verified image, so the trap is
+gone, but it is worth knowing the failure mode existed: nothing about that
+image looked wrong until the models failed to load.
+
+**Verified end to end** by deploying the published image as a Runpod pod on an
+RTX PRO 4500 Blackwell: all four models reach `READY`, and `voice_pipeline`
+round-trips speech -> ASR -> LLM -> TTS -> speech.
+
+```
+input      : 3.17s @ 16000Hz
+TRANSCRIPT : Testing 123.
+LLM REPLY  : Testing 123. Let me know if you need anything else!
+TTS AUDIO  : 3.56s @ 24000Hz
+WALL TIME  : 3.25s
+```
+
+The triton image is deliberately not built in CI. Three approaches were
+tried and all failed for reasons that are now understood and recorded:
+
+- **Docker-in-Docker on a GPU pod** — impossible. Runpod's sandbox blocks
+  the `unshare()`/`clone()` syscalls nested containers need.
+- **kaniko** (daemonless, chroot-based, the DinD workaround) — produces the
+  silently broken image above. Root-caused by running the identical pip
+  sequence by hand on the same base image, where it yields a fully working
+  environment, then comparing the two.
+- **GitHub-hosted runners** — out of disk, twice, ~5 minutes in during the
+  base image pull, before any pip install ran. The base image is 15.2 GB
+  compressed / ~22 GB extracted against a runner that starts with ~20 GB
+  free. The image was slimmed from ~40 GB to ~24 GB first (see "Image size")
+  and it did not help, because ~22 GB of the ~24 GB *is* the base image.
+
+Moving it back into CI needs a larger or self-hosted runner, not more
+slimming. See `.github/workflows/build-images.yml` for the full write-up.
+
+That work did find and fix real bugs in `docker/triton/Dockerfile` —
+missing `--extra-index-url` for `+cu128` torch wheels, a `numpy`/`librosa`
+pip resolver conflict, a `resolution-too-deep` error, a `chatterbox-tts`
+pin conflict, a metadata-only `tensorrt` wheel that deleted the base
+image's working one, and MPI's `OPAL_PREFIX`, among others — see the
+Dockerfile's own inline comments for the evidence behind each.
+
+## Building the triton image
+
+If you have an amd64 Linux host with Docker and ~60 GB free, the ordinary
+thing works and is what the Dockerfile is for:
+
+```bash
+docker build -f docker/triton/Dockerfile -t speech-cascade-triton:latest .
+```
+
+**If you don't** — which is the situation this project is actually in, since
+Runpod pods can't run Docker and GitHub runners can't fit the base image —
+the image can be assembled on a plain GPU pod with no Docker at all. This is
+how the current `:latest` was built. `crane` (from google/go-containerregistry)
+does nothing but registry HTTP: no daemon, no `unshare()`, no privileged
+syscalls, so it runs where Docker and kaniko cannot.
+
+The idea is to do by hand, verifiably, what a builder does: run the
+Dockerfile's `RUN` steps natively, then package the filesystem delta as a
+layer on top of the unmodified base.
+
+```bash
+# On a GPU pod running the SAME base image the Dockerfile builds FROM.
+curl -sSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+  | tar xz -C /usr/local/bin crane
+
+# 1. Run the Dockerfile's RUN steps natively (see its two RUN blocks), and
+#    the COPY steps by hand: triton_model_repo ->
+#    /workspace/speech-cascade-inference/, entrypoint.sh -> /usr/local/bin/,
+#    scripts/build_models_from_scratch.sh -> /opt/speech-cascade/scripts/.
+
+# 2. Compute the delta against the base image's own flattened file listing.
+crane export <base-image> - | tar -tf - > /tmp/base-files.txt
+python3 deploy/make_image_layer.py          # writes /tmp/layer.tgz
+
+# 3. Append it to the base and set the image config in one shot.
+crane mutate <base-image> --platform linux/amd64 \
+  --append /tmp/layer.tgz \
+  -e CHATTERBOX_BACKEND=pytorch -e OPAL_PREFIX=/usr/local/mpi \
+  --entrypoint /usr/local/bin/entrypoint.sh \
+  -w /workspace/speech-cascade-inference \
+  --exposed-ports 18000/tcp,18001/tcp,18002/tcp \
+  -t ghcr.io/<owner>/speech-cascade-triton:latest
+```
+
+Two things make this trustworthy rather than a second kaniko:
+
+- **The delta is explicit.** It is not inferred by a builder that might quietly
+  drop files; it is the set of paths under the touched roots whose mtime is
+  newer than the base image build, plus `.wh.` whiteouts for the files `pip`
+  *removed* when it replaced a package. Without those whiteouts the base
+  layer's copy resurfaces and `importlib.metadata` sees two versions of the
+  same package. The counts are printed before packaging (for the current
+  image: 67,538 added/modified files, 1,263 whiteouts).
+- **The result is tested by running it**, not by trusting the build. kaniko's
+  output failed that test instantly.
+
+**Check the layers before deploying anything:**
+
+```bash
+python3 deploy/check_image_layers.py ghcr.io/<owner>/speech-cascade-triton:latest
+```
+
+It streams just the layers this repo adds and fails on the two packaging
+faults below. Both were hit for real, both stop the image from pulling at
+all, and both are invisible until a pod tries to start -- so this takes
+seconds and replaces a ~15 minute pod deploy as the way you find out.
+
+**The two traps.** Loud failures, unlike kaniko's silent one, but each cost
+a pod deploy to discover:
+
+- **Hardlinks.** Package with `tar --hard-dereference`, and never put a
+  directory *and* its own contents in the same file list. If tar emits a
+  hardlink entry whose target isn't in the archive you get
+  `failed to register layer: link ...: no such file or directory`. The cuDNN
+  wheel triggered this.
+- **Build the layer on Linux, not macOS.** BSD tar attaches macOS extended
+  attributes, and the Linux runtime cannot set them:
+  `failed to register layer: lsetxattr /workspace: xattr
+  "com.apple.provenance": operation not supported`. Worse, the pull *retries*
+  rather than failing fast, so the pod sits at `runtime: null` emitting
+  "Downloading" lines that look like slow progress. If you must build on a
+  Mac, use `COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls`.
+
+Measured: the delta is ~3.5 GB uncompressed / **1.3 GB compressed** on top of
+the base's 15.2 GB. Iterating is fast — a second push that changed only
+`entrypoint.sh` completed in about a second, because every other blob was
+already in the registry.
+
+The Dockerfile asserts its own critical invariants during the build, so a
+successful build is meaningful rather than merely quiet: it checks that
+numpy has not drifted off 1.26, that `tensorrt` is the base image's real
+module and not PyPI's metadata-only stub, that torch is a CUDA 13 build,
+that the chatterbox venv's torch/torchaudio are CUDA 13 and their compiled
+ops actually run, and that no duplicate CUDA 12 wheel set has reappeared in
+either environment. A kaniko-style layer-dropping failure cannot pass those.
+
+To publish it:
+
+```bash
+docker tag speech-cascade-triton:latest ghcr.io/raoashish10/speech-cascade-triton:latest
+docker push ghcr.io/raoashish10/speech-cascade-triton:latest
+```
+
+After the first GPU deployment of a hand-built image, update the "Still
+unverified" note below — the GPU run of the *slimmed* recipe is the one
+piece of verification still outstanding.
 
 **Verified end-to-end on a real GPU** (RTX PRO 4500 Blackwell, sm_120,
 Runpod): all four models reach Triton state `READY` and the full
@@ -80,16 +223,26 @@ What's left is mostly irreducible without changing base images: ~22GB of the
 ~24GB is the NGC base itself (`tensorrt_llm` 3.5GB, `flash_attn`'s single
 1.7GB `.so`, torch, CUDA 13, Triton).
 
-**Still unverified**: the slimmed install has not been run on a GPU. Every
-check that doesn't need `libcuda.so.1` was run against the base image on a
-Runpod CPU pod -- the filtered installs succeed, `tensorrt` resolves to the
-base image's real 10.14.1.48 (not PyPI's metadata-only stub), the chatterbox
-venv's `torch`/`torchaudio` are CUDA 13 builds with zero unresolved shared
-libraries under `ldd`, and `torchaudio`'s compiled ops, `chatterbox`, `perth`
-and `s3gen` all import -- but a CPU host can't import `tensorrt_llm` or run a
-CUDA kernel, so the four-model GPU run that validated the earlier, fatter
-recipe has not been repeated. Treat the next GPU deployment as that
-verification.
+**The slimmed install is GPU-verified.** On an RTX PRO 4500 Blackwell:
+`tensorrt_llm 1.2.0` imports (it needs `libcuda.so.1` *and* working MPI, so a
+CPU host cannot check it at all), `tensorrt` resolves to the base image's real
+10.14.1.48 rather than PyPI's metadata-only stub, both environments run CUDA
+matmuls, `torchaudio`'s compiled ops run on-device, `build_models_from_scratch.sh`
+downloads the Hub checkpoints and compiles the whisper engines, and all four
+models load and serve a request.
+
+**One bug the slimming introduced, caught only by running it.** Excluding the
+bundled cuDNN from `/venv/chatterbox` on the grounds that the base image
+provides one was wrong: the base ships cuDNN 9.17.0 and `torch 2.11.0+cu130`
+is compiled against 9.19.0, so torch refuses to run RNN kernels
+(`cuDNN version incompatibility`) and `chatterbox_tts` goes `UNAVAILABLE`,
+since its s3gen voice encoder uses LSTMs. `pip check` had warned about exactly
+this and the warning was dismissed because `ldd` showed nothing unresolved --
+bad evidence, since cuDNN is `dlopen`'d lazily and never appears in `ldd`
+output. Fixed by installing `nvidia-cudnn-cu13` (+519MB, so the venv is
+~3.0GB rather than 2.1GB). The lesson is recorded in
+`deploy/image-exclude-chatterbox.txt`: static inspection cannot establish that
+a lazily-loaded library is unused.
 
 Also still unverified, unchanged from before: the `vllm` chatterbox backend
 (~5x faster per its own docstring) -- see
@@ -109,23 +262,124 @@ doesn't ship.
 
 ## Quick start
 
-Weights and compiled engines are **not** in the image -- they live in the
-`inference-data` volume `docker-compose.yml` mounts at
-`/workspace/speech-cascade-inference/models`. Populate it either by
-restoring from S3 (set `S3_BUCKET_URI`, see `docker/triton/entrypoint.sh`)
-or from scratch with no S3 at all:
+Weights and compiled engines are **not** in the image -- they live at
+`/workspace/speech-cascade-inference/models`, which `docker-compose.yml`
+mounts as the `inference-data` volume.
 
-```bash
-docker compose run --rm triton bash /workspace/speech-cascade/scripts/build_models_from_scratch.sh
+**You don't have to populate it yourself.** `docker/triton/entrypoint.sh`
+bootstraps on first start when that directory is empty: it pulls the
+checkpoints from the Hugging Face Hub and compiles whisper's TensorRT-LLM
+engines on whatever GPU the container landed on. No S3 bucket and no
+pre-built artifacts are required, which is what makes the image usable
+directly as a Runpod pod template with nothing mounted at all.
+
+That is the default rather than a fallback, because the engines are
+GPU-architecture-specific (see "GPU portability caveat"). Compiling them at
+first start on the card that will serve them is what lets one image work
+across different GPUs; baking them in would tie the image to one card.
+
+**Verified** by deploying the published image as a Runpod pod with nothing
+mounted, on an RTX PRO 4500 Blackwell:
+
+```
+models/ is empty and S3_BUCKET_URI is unset -- building from
+scratch: Hugging Face checkpoints + whisper engines for this GPU.
+==> qwen_llm: downloading Qwen3-8B-NVFP4 (~6GB)
+Fetching 12 files: 100% [00:32]
+==> whisper_asr: building TensorRT-LLM encoder/decoder engines
+    encoder engine generation completed in 38.3s
+    decoder: total time of building all engines 00:00:07
+==> done. models/ now contains: Qwen3-8B-NVFP4, whisper-base-trtllm
 ```
 
-That script downloads the Qwen NVFP4 checkpoint and builds whisper's
-TensorRT-LLM engines on whatever GPU it runs on -- verified end-to-end on
-an RTX PRO 4500 (both models reached Triton state `READY`). Engines stay
-out of the image on purpose: they're GPU-architecture-specific, so baking
-them in would tie the image to one card. `chatterbox_tts` additionally
-needs its reference voice clip (`ref_audio_path`), which is a deployment
-artifact you supply yourself.
+**2 min 43 s** from container start to a populated `models/`, of which ~32s
+was the Hub download and ~45s the two engine builds. Mounting a volume at
+that path makes it a one-time cost per volume instead of per start.
+
+### Startup cost, measured
+
+| | cold (new pod) | warm (stop -> start) |
+|---|---|---|
+| image pull + extract | 4-11 min | **skipped** |
+| HF bootstrap | 2m43s | **skipped** |
+| four models to `READY` | ~4 min | ~4 min |
+| **total** | **11-18 min** | **4m07s** |
+
+Two things worth knowing about those numbers:
+
+- **The pull dominates cold start and is almost entirely the base image.**
+  It varies by datacenter: the same image pulled in 4m14s in `EU-RO-1` and
+  was still retrying after 25 minutes in `EUR-IS-1`. Pin
+  `dataCenterIds` to somewhere you have pulled before; that is worth more
+  than any further image slimming, since ~22 of the ~24GB is the NGC base.
+- **A stopped pod keeps its container disk**, at least across a
+  `stop` -> `start` on the same machine: the warm restart above did *not*
+  re-run the bootstrap (Triton began loading 115s in, less than the 163s the
+  bootstrap alone takes) and `models/` was still populated. Runpod's API
+  describes container disk as "ephemeral, wiped on restart", so do not rely
+  on this surviving a reschedule onto a different host -- but stopping
+  rather than terminating clearly does avoid both the pull and the bootstrap.
+
+The remaining ~4 min is the models themselves and is not container overhead:
+TensorRT-LLM's import, qwen's engine build (~32s) and 6.1GB engine load,
+whisper's two engines, and chatterbox's ~3GB model. The bare-metal
+deployment pays the same cost -- `README.md` documents "~5-6 min" for a
+supervisor restart. `entrypoint.sh` loads the four serially on purpose (see
+its own comment about an OOM-killed stub); parallelising is the obvious
+lever if this ever needs to be faster, and has not been tried against this
+image.
+
+Set `S3_BUCKET_URI` instead to restore a prebuilt tree, which is faster but
+needs somewhere to have built it first.
+
+`chatterbox_tts` additionally needs its reference voice clip
+(`ref_audio_path`) -- a deployment artifact you supply yourself, and it must
+be **longer than 5 seconds** or the model refuses to load.
+
+**Verified**: a pod from the published image with no clip and nothing
+mounted reaches all four models `READY`, including `chatterbox_tts`, and
+round-trips the pipeline (`"Testing 123."` -> LLM reply -> 3.40s of 24kHz
+audio). The voice is chatterbox's built-in one.
+
+**You no longer need to supply one just to get the model up.**
+`chatterbox-turbo`'s checkpoint includes `conds.pt`, a built-in voice that
+`ChatterboxTurboTTS.from_pretrained()` loads automatically, so the model has
+a working voice with no external artifact at all. `ref_audio_path` now
+defaults to empty, meaning "use that built-in voice".
+
+This was a real defect rather than a missing file. `ref_audio_path` was a
+required config parameter pointing at `scripts/pipeline_output.wav` -- which
+is in neither this repo nor the image -- so a container started without it
+loaded the entire model and then died:
+
+```
+chatterbox_tts load request FAILED
+  TritonModelException: chatterbox worker failed to start: None
+```
+
+(observed on a Runpod pod from the published image, where the other three
+models reached `READY`). That message is also unhelpfully opaque: the
+worker's real error is swallowed, which is worth fixing separately.
+
+**Set `ref_audio_path` when you want a specific cloned voice.** Reproducible
+ways to get the clip to the container, in the order I'd pick them:
+
+1. **Ship it with the weights.** Put the clip in the same Hugging Face repo
+   the checkpoints come from and fetch it in
+   `scripts/build_models_from_scratch.sh`. This is the most consistent
+   option -- it arrives exactly the way every other model artifact already
+   does, versioned with them, and needs no extra infrastructure.
+2. **Commit it to the repo** and `COPY` it in the Dockerfile. A 41s mono wav
+   is ~2MB, which git handles fine. Simplest and fully hermetic -- but only
+   if you have the rights to redistribute that recording, which is the usual
+   reason a voice clip is kept out of a repo.
+3. **`S3_BUCKET_URI`**, which `entrypoint.sh` already restores from. Reuses
+   existing machinery, at the cost of credentials.
+
+Whichever you choose, the clip must be **longer than 5 seconds** (chatterbox
+asserts this), and a configured-but-missing path is now a startup error
+rather than a silent fallback -- a deployment that means to use a particular
+voice should not quietly end up on the default one.
 
 ```bash
 cp .env.example .env   # fill in S3 creds (or skip and populate the volume yourself) + GATEWAY_AUTH_TOKEN
@@ -189,19 +443,23 @@ solves the toolchain-matching problem, not the engine-portability one.
   the alert-notifier and Triton-state-exporter supervisor services) isn't
   containerized here yet — still only documented for the bare-metal/
   supervisor deployment.
-- The triton image has never been built by a tool that produces a *correct*
-  image. kaniko (used during development, because Runpod pods can't run
-  Docker-in-Docker) silently drops files written by `RUN pip install` --
-  the build reports success, in-`RUN` assertions pass, and the pushed image
-  is missing exactly the packages the Dockerfile added. The recipe itself is
-  verified: running its identical pip sequence by hand on the same base
-  image produces a working environment, and that environment ran the full
-  pipeline end to end. `.github/workflows/build-images.yml` builds with real
-  BuildKit instead. Its first triton run died with "No space left on
-  device"; the image has since been slimmed from ~40GB to ~24GB unpacked
-  (see "Image size" above), which should fit a standard runner, but that
-  build has not been re-run yet -- so there is still no confirmed-good
-  triton image in GHCR.
+- **The triton image build is manual.** It is no longer *unverified* -- the
+  published image was built with `crane` on a pod and confirmed by running
+  it -- but it is a procedure a person follows, not a pipeline. See
+  "Building the triton image". Automating it would mean running that same
+  procedure on a scheduled GPU pod, which is a real option and simply
+  hasn't been done.
+- **`chatterbox_tts` needs a reference voice clip you supply.** It is read
+  from `ref_audio_path` (`scripts/pipeline_output.wav`) and is a deployment
+  artifact, not something reproducible from public sources, so it is not in
+  the image or the repo. Concretely: chatterbox asserts the clip is
+  **longer than 5 seconds** (`Audio prompt must be longer than 5 seconds!`)
+  and the model goes `UNAVAILABLE` without a usable one. The end-to-end run
+  above used a tiled copy of `tests/fixtures/vad_sample_16k.wav` as a
+  stand-in purely to exercise the path -- it is not a real voice and the
+  output quality means nothing.
+- **`gateway` has still never been run against a live `triton`.** Only the
+  triton half has been exercised directly.
 - `docker/triton/entrypoint.sh`'s sequential model-load order carries over
   the bare-metal OOM workaround (see its own comments) without
   re-verifying the memory ceiling that caused it against this image/host.

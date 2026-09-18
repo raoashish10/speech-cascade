@@ -116,7 +116,12 @@ class TritonPythonModel:
     def initialize(self, args):
         model_config = json.loads(args["model_config"])
         params = model_config.get("parameters", {})
-        ref_audio_path = params["ref_audio_path"]["string_value"]
+        # Optional: chatterbox-turbo ships a built-in voice (conds.pt), so an
+        # unset or empty ref_audio_path means "use the default voice" rather
+        # than a failure. This used to be params["ref_audio_path"], which made
+        # a deployment artifact that is in neither this repo nor the image a
+        # hard startup requirement -- see chatterbox_worker.py's own comment.
+        ref_audio_path = params.get("ref_audio_path", {}).get("string_value", "")
 
         # Strip PYTHONHOME/PYTHONPATH: Triton's supervisor script sets these
         # globally for /venv/main (see deploy/supervisor/speech-cascade-triton.sh),

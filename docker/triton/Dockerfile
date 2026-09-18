@@ -258,6 +258,9 @@ RUN python3 -m venv /venv/chatterbox \
         --index-url https://download.pytorch.org/whl/cu130 \
         torch==2.11.0+cu130 torchaudio==2.11.0+cu130 \
     && /venv/chatterbox/bin/pip install --no-cache-dir --no-compile --no-deps \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        --extra-index-url https://pypi.org/simple nvidia-cudnn-cu13 \
+    && /venv/chatterbox/bin/pip install --no-cache-dir --no-compile --no-deps \
         cuda-bindings==13.0.3 cuda-toolkit==13.0.2 cuda-pathfinder==1.6.1 \
     && /venv/chatterbox/bin/python3 -c "import torch, torchaudio; assert torch.version.cuda.startswith('13'), f'chatterbox venv got a non-CUDA-13 torch ({torch.version.cuda}); it would need its own 4.7GB cu12 wheel set'; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__)" \
     && /venv/chatterbox/bin/python3 -c "import torch, torchaudio.compliance.kaldi as kaldi; from torchaudio.transforms import Spectrogram, InverseSpectrogram, TimeStretch; assert Spectrogram()(torch.randn(16000)).shape[0] == 201; assert kaldi.fbank(torch.randn(1, 16000)).shape[1] == 23; print('torchaudio compiled ops OK')" \
@@ -273,6 +276,14 @@ RUN python3 -m venv /venv/chatterbox \
 # path -- see docker/triton/entrypoint.sh for the optional S3 restore.
 RUN mkdir -p /workspace/speech-cascade-inference
 COPY triton_model_repo /workspace/speech-cascade-inference/triton_model_repo
+
+# entrypoint.sh runs this when MODELS_DIR is empty and no S3_BUCKET_URI is
+# set, which is what happens on a bare `docker run` or a Runpod pod created
+# directly from this image. It pulls the checkpoints from the Hugging Face
+# Hub and compiles whisper's TensorRT-LLM engines on whatever GPU the
+# container landed on -- the engines are architecture-specific, so building
+# them at first start is what lets one image serve different cards.
+COPY scripts/build_models_from_scratch.sh /opt/speech-cascade/scripts/build_models_from_scratch.sh
 
 COPY docker/triton/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
