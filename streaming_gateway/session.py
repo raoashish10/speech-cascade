@@ -24,7 +24,6 @@ from .timings import (
     ASR_DONE,
     FIRST_AUDIO,
     FIRST_SENTENCE,
-    LLM_FIRST_DELTA,
     TURN_END,
     TURN_START,
     TurnTimings,
@@ -133,7 +132,9 @@ class StreamingSession:
 
             worker = asyncio.create_task(tts_worker())
             async for delta in tc.generate_stream(transcript):
-                timings.mark(LLM_FIRST_DELTA)
+                # Records the arrival time AND marks LLM_FIRST_DELTA, so TTFT
+                # and time-between-tokens come from the same observation point.
+                timings.record_llm_delta()
                 await self._send_json({"type": "llm_delta", "text": delta})
                 for sentence in accumulator.push(delta):
                     timings.mark(FIRST_SENTENCE)
