@@ -57,7 +57,27 @@ from chatterbox.tts_turbo import ChatterboxTurboTTS
 from chatterbox.models.s3gen.const import S3GEN_SIL
 
 model = ChatterboxTurboTTS.from_pretrained(device="cuda")
-model.prepare_conditionals(REF_AUDIO)
+
+# Same ref-audio handling as chatterbox_worker.py -- see its comment for why.
+# In short: chatterbox-turbo ships a built-in voice (conds.pt), so a clip is
+# needed to OVERRIDE the default, never to have one, and requiring it turned a
+# deployment artifact into a hard startup dependency.
+if REF_AUDIO and os.path.exists(REF_AUDIO):
+    model.prepare_conditionals(REF_AUDIO)
+    print(f"[voice] cloned from reference clip: {REF_AUDIO}", file=sys.stderr, flush=True)
+elif REF_AUDIO:
+    raise SystemExit(
+        f"ref_audio_path is set to {REF_AUDIO!r} but that file does not exist. "
+        "Leave it empty to use chatterbox's built-in voice, or mount the clip."
+    )
+else:
+    if model.conds is None:
+        raise SystemExit(
+            "No ref_audio_path configured and this checkpoint has no built-in "
+            "conds.pt, so there is no voice to speak with."
+        )
+    print("[voice] using chatterbox's built-in voice (no ref_audio_path set)",
+          file=sys.stderr, flush=True)
 
 # Free the redundant GPT2 backbone -- vLLM loads its own copy of the same
 # weights below, and prepare_input_embeds() only touches cond_enc/text_emb/
