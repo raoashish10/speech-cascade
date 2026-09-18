@@ -284,6 +284,21 @@ needs somewhere to have built it first.
 (`ref_audio_path`) -- a deployment artifact you supply yourself, and it must
 be **longer than 5 seconds** or the model refuses to load.
 
+**This is the one thing a bare pod cannot do for itself.** Deploying the
+image with nothing mounted gets `qwen_llm`, `whisper_asr` and
+`voice_pipeline` to `READY`, and `chatterbox_tts` to `UNAVAILABLE`:
+
+```
+chatterbox_tts load request FAILED
+  TritonModelException: chatterbox worker failed to start: None
+```
+
+That message is unhelpfully opaque -- the worker's real error is swallowed,
+and the underlying cause is simply that `scripts/pipeline_output.wav` does
+not exist in the image. Mount a clip there (or bake your own in) before
+expecting TTS to come up. Improving that error to surface the worker's
+stderr would be a worthwhile small fix.
+
 ```bash
 cp .env.example .env   # fill in S3 creds (or skip and populate the volume yourself) + GATEWAY_AUTH_TOKEN
 docker compose up --build
