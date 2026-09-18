@@ -67,6 +67,46 @@ python3 scripts/test_streaming_client.py --wav your_clip.wav \
 Add `--auth-mode header` to send the token as `Authorization: Bearer …`
 instead of the default `?token=` query param.
 
+## Turn latency breakdown
+
+Every `turn_end` message carries a `timings` object, and the same figures go
+to the log as one line per turn:
+
+```
+turn timings: vad_silence=800ms asr=400ms llm_ttft=250ms llm_to_sentence=400ms
+              tts_first=260ms ttfa_from_vad_end=1310ms
+              ttfa_from_speech_end=2110ms turn_total=2500ms
+```
+
+This exists because every latency discussion about this project has been
+conducted on inferred numbers. TTS is measured (0.26s per sentence with
+`CHATTERBOX_BACKEND=vllm`, 0.81s with pytorch) and the whole warm
+`voice_pipeline` round-trip is measured (~3.25s), but the ASR and LLM halves
+of the remainder have only ever been estimated by subtracting one from the
+other — and 2.0s ASR + 0.4s LLM points at completely different work than the
+reverse.
+
+**Two TTFA clocks, and they differ by most of a second:**
+
+- `ttfa_from_vad_end_ms` — from end-of-speech detection. What the pipeline
+  can influence.
+- `ttfa_from_speech_end_ms` — from when the user actually stopped talking.
+  What the user perceives. Larger by `vad_silence_ms`, because that much
+  trailing silence must elapse before end-of-speech can be declared at all.
+
+Reporting only the first flatters the system by 800ms and hides the largest
+single tunable in the stack (`UtteranceVAD(min_silence_duration_ms=...)`);
+reporting only the second makes pipeline work look futile. Both are emitted.
+
+`llm_to_sentence_ms` is worth watching separately: it is time after the LLM's
+first token before a *complete sentence* exists for TTS, and it is governed by
+`sentence.py`'s boundary rules rather than by model speed. If it is large, a
+faster model will not help — emitting on clause boundaries would.
+
+Turns that end early or fail report the stages they reached, so a partial
+breakdown is still in the log. Fine-grained per-token profiling is a different
+tool — see `deploy/PROFILING.md` for the nsys/torch.profiler flow.
+
 ## API keys (deployments without an upstream auth edge)
 
 Everything above describes the bare-metal instance, where Caddy authenticates

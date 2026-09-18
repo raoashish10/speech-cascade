@@ -44,6 +44,13 @@ class UtteranceVAD:
     """Streaming speech-start/speech-end detector for one connection."""
 
     def __init__(self, threshold: float = 0.5, min_silence_duration_ms: int = 800):
+        # Kept as an attribute because it is not just a VAD tuning knob: it is
+        # dead time on the user's clock. End-of-speech cannot be declared
+        # until this much trailing silence has elapsed, so every turn's
+        # perceived time-to-first-audio includes it in full. The turn timing
+        # breakdown reports it separately for exactly that reason -- see
+        # streaming_gateway/timings.py.
+        self.min_silence_duration_ms = min_silence_duration_ms
         from silero_vad import VADIterator
         self._iterator = VADIterator(
             _get_model(),

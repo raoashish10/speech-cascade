@@ -13,13 +13,25 @@ self.turn_task below.
 """
 
 import asyncio
+import logging
 import time
 
 import numpy as np
 
 from . import triton_client as tc
 from .sentence import SentenceAccumulator
+from .timings import (
+    ASR_DONE,
+    FIRST_AUDIO,
+    FIRST_SENTENCE,
+    LLM_FIRST_DELTA,
+    TURN_END,
+    TURN_START,
+    TurnTimings,
+)
 from .vad import SAMPLE_RATE, UtteranceVAD
+
+log = logging.getLogger(__name__)
 
 BYTES_PER_SAMPLE = 4  # float32
 
@@ -88,9 +100,14 @@ class StreamingSession:
                 self.turn_task = asyncio.create_task(self._run_turn(pcm))
 
     async def _run_turn(self, pcm_bytes: bytes):
+        # Started here, not inside the try, so the clock covers everything
+        # this turn does -- including a failure.
+        timings = TurnTimings(vad_silence_ms=self.vad.min_silence_duration_ms)
+        timings.mark(TURN_START)
         try:
             audio = np.frombuffer(pcm_bytes, dtype=np.float32)
             transcript = await tc.transcribe(audio, sample_rate=SAMPLE_RATE)
+            timings.mark(ASR_DONE)
             if not transcript.strip():
                 return
             await self._send_json({"type": "transcript", "text": transcript})
@@ -104,6 +121,9 @@ class StreamingSession:
                     if sentence is None:
                         break
                     audio_out, sr = await tc.synthesize(sentence, voice=self.voice)
+                    # First write wins inside this loop, so this stays
+                    # time-to-FIRST-audio rather than time-to-last.
+                    timings.mark(FIRST_AUDIO)
                     await self._send_json({
                         "type": "tts_chunk",
                         "sentence": sentence,
@@ -113,16 +133,28 @@ class StreamingSession:
 
             worker = asyncio.create_task(tts_worker())
             async for delta in tc.generate_stream(transcript):
+                timings.mark(LLM_FIRST_DELTA)
                 await self._send_json({"type": "llm_delta", "text": delta})
                 for sentence in accumulator.push(delta):
+                    timings.mark(FIRST_SENTENCE)
                     await tts_queue.put(sentence)
             trailing = accumulator.flush()
             if trailing:
+                # A short reply with no sentence punctuation reaches TTS only
+                # here, via the flush -- mark it so those turns still report a
+                # sentence boundary instead of a hole in the breakdown.
+                timings.mark(FIRST_SENTENCE)
                 await tts_queue.put(trailing)
             await tts_queue.put(None)
             await worker
-            await self._send_json({"type": "turn_end"})
+            timings.mark(TURN_END)
+            log.info("turn timings: %s", timings.summary())
+            await self._send_json({"type": "turn_end", "timings": timings.breakdown()})
         except Exception as e:
+            timings.mark(TURN_END)
+            # Log the partial breakdown too: knowing how far a failing turn
+            # got, and how long it took to get there, is most of diagnosing it.
+            log.warning("turn failed after %s: %s", timings.summary(), e)
             await self._send_json({"type": "error", "message": str(e)})
 
 
