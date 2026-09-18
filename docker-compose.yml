@@ -66,12 +66,23 @@ services:
     environment:
       TRITON_URL: triton:18001
       GATEWAY_MAX_SESSIONS: "${GATEWAY_MAX_SESSIONS:-4}"
-      # Required in this deployment shape -- there's no Vast.ai Caddy auth
-      # edge in front of the gateway here. See docs/DOCKER.md "Auth"
-      # section and streaming_gateway/server.py. Leave empty only if
-      # something else in front of this (your own reverse proxy, a
-      # provider's own auth edge) is already handling it.
+      GATEWAY_MAX_SESSIONS_PER_KEY: "${GATEWAY_MAX_SESSIONS_PER_KEY:-2}"
+      # Credentials for /ws/stream. Required in this deployment shape --
+      # there's no Vast.ai Caddy auth edge in front of the gateway here, so
+      # the process checks them itself. It REFUSES TO START if none of the
+      # three below is set, rather than silently accepting anonymous
+      # connections; see streaming_gateway/auth.py.
+      #
+      # Prefer API keys: individually revocable, named in the logs, and what
+      # makes the per-key cap above meaningful. Mint one with
+      # `python3 -m streaming_gateway.auth --new <name>`.
+      GATEWAY_API_KEYS: "${GATEWAY_API_KEYS:-}"
+      # Legacy single shared token. Still honored so the bare-metal
+      # deployment's convention keeps working; prefer GATEWAY_API_KEYS.
       GATEWAY_AUTH_TOKEN: "${GATEWAY_AUTH_TOKEN:-}"
+      # Set to 1 ONLY when something upstream (your own reverse proxy, a
+      # provider auth edge) already authenticates every connection.
+      GATEWAY_ALLOW_ANONYMOUS: "${GATEWAY_ALLOW_ANONYMOUS:-}"
     ports:
       - "${GATEWAY_PORT:-18010}:18010"
     restart: unless-stopped
