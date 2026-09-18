@@ -73,18 +73,16 @@ Every `turn_end` message carries a `timings` object, and the same figures go
 to the log as one line per turn:
 
 ```
-turn timings: vad_silence=800ms asr=400ms llm_ttft=250ms llm_to_sentence=400ms
-              tts_first=260ms ttfa_from_vad_end=1310ms
-              ttfa_from_speech_end=2110ms turn_total=2500ms
+turn timings: vad_silence=800ms asr=88ms llm_ttft=18ms llm_deltas=20
+              llm_tbt_p50=10ms llm_tbt_p95=10ms llm_tbt_max=12ms
+              llm_to_sentence=194ms tts_first=1812ms
+              ttfa_from_vad_end=2209ms ttfa_from_speech_end=3009ms
+              turn_total=2272ms
 ```
 
-This exists because every latency discussion about this project has been
-conducted on inferred numbers. TTS is measured (0.26s per sentence with
-`CHATTERBOX_BACKEND=vllm`, 0.81s with pytorch) and the whole warm
-`voice_pipeline` round-trip is measured (~3.25s), but the ASR and LLM halves
-of the remainder have only ever been estimated by subtracting one from the
-other — and 2.0s ASR + 0.4s LLM points at completely different work than the
-reverse.
+This exists because every latency discussion about this project was
+conducted on inferred numbers. It has now been run, and the inference was
+wrong — see the measured breakdown below.
 
 **Two TTFA clocks, and they differ by most of a second:**
 
@@ -106,6 +104,64 @@ faster model will not help — emitting on clause boundaries would.
 Turns that end early or fail report the stages they reached, so a partial
 breakdown is still in the log. Fine-grained per-token profiling is a different
 tool — see `deploy/PROFILING.md` for the nsys/torch.profiler flow.
+
+### What it measured: TTS is 82% of the budget
+
+22 warm turns through the public gateway of the two-pod Runpod deployment
+(RTX PRO 4500 Blackwell for Triton, `CHATTERBOX_BACKEND=vllm`), medians:
+
+| stage | median | share of TTFA |
+|---|---:|---:|
+| `asr_ms` — whisper, 3.5s of input audio | 88ms | 4.0% |
+| `llm_ttft_ms` — Qwen3-8B-NVFP4 prefill | 18ms | 0.8% |
+| `llm_to_sentence_ms` — decode until a complete sentence exists | 194ms | 8.8% |
+| `tts_first_ms` — chatterbox synthesising that sentence | **1812ms** | **82.0%** |
+| **`ttfa_from_vad_end_ms`** | **2209ms** | |
+| `vad_silence_ms` | 800ms | |
+| **`ttfa_from_speech_end_ms`** — what the user waits | **3009ms** | |
+
+**Time between tokens needs no work**: 9.7ms median, 11.6ms max over 30
+turns, ~103 deltas/s, no stalls and no tail. Neither the LLM's prefill nor
+its decode loop is worth optimising.
+
+**TTS is linear in output length.** Across replies producing 2.26s, 5.92s
+and 6.00s of audio, real-time factor held at ~0.30, fitting:
+
+```
+tts_first_ms  ~=  144ms  +  278ms per second of output audio
+```
+
+The pipeline waits for all 6.0s of audio to exist before sending any of it,
+at a cost of 1812ms, when the first 500ms of it could be ready in ~280ms.
+
+This makes the earlier recommendation against within-sentence TTS streaming
+wrong. That call was made against a remembered "0.26s per sentence", which
+appears to have been a real-time factor rather than per-sentence wall time.
+At the measured 1812ms, TTS is not a rounding error on the budget, it *is*
+the budget.
+
+**What to target, in order:**
+
+1. **Emit audio before the whole sentence is synthesised** — ~1.1-1.5s.
+   Chunking a long sentence on clause boundaries puts first audio at ~700ms
+   with no model changes; streaming S3Gen's output approaches the ~144ms
+   floor. PR #33's note that S3Gen's flow-matching vocoder still runs
+   per-item and unbatched describes exactly where this time goes.
+2. **`UtteranceVAD(min_silence_duration_ms=800)` → 400ms** — one config
+   value worth more than ASR, prefill and decode combined. The trade is
+   premature endpointing on hesitant speakers, so it wants testing.
+3. **Nothing else.** ASR at 88ms, prefill at 18ms and decode at 9.7ms/delta
+   are inside the noise of a single TTS chunk.
+
+**A design assumption this disproved.** `session.py` synthesises per
+sentence so TTS for sentence 1 can overlap the LLM generating sentence 2.
+Every reply across all 22 turns was a *single sentence*, so
+`llm_to_sentence_ms` (194ms) is essentially the whole decode
+(`llm_decode_ms`, 184ms) and the pipelining never engages. It still helps on
+long answers, but it cannot be counted on to hide TTS latency — only
+sub-sentence emission does that.
+
+Reproduce with `scripts/test_streaming_client.py --turns N --timings-json`.
 
 ## API keys (deployments without an upstream auth edge)
 

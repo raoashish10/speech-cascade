@@ -1,13 +1,16 @@
 """Per-turn latency breakdown for the voice pipeline.
 
-Exists because every latency discussion about this project so far has been
-conducted on inferred numbers. The TTS stage is measured (0.26s per sentence
-with CHATTERBOX_BACKEND=vllm, 0.81s with pytorch, both on an RTX PRO 4500),
-and the whole warm `voice_pipeline` round-trip is measured (~3.25s), but the
-ASR and LLM halves of the remainder have only ever been estimated by
-subtracting one from the other. That is not good enough to decide what to
-optimise: it is entirely possible that ASR is 2s and the LLM is 0.4s, or the
-reverse, and those point at completely different work.
+Exists because every latency discussion about this project was conducted on
+inferred numbers -- the ASR and LLM halves of the budget had only ever been
+estimated by subtracting one measured figure from another.
+
+It has since been run against the two-pod deployment, and the inference was
+wrong in a way worth recording here so nobody re-derives it: ASR is 88ms and
+LLM prefill is 18ms, together under 5% of time-to-first-audio, while TTS is
+1812ms, or 82%. Time between deltas is 9.7ms with an 11.6ms worst case over
+30 turns. streaming_gateway/README.md has the full table and what it implies
+about what to optimise; the short version is that everything except TTS (and
+the VAD silence window) is inside the noise.
 
 WHAT TTFA MEANS HERE. Two different clocks matter and they differ by most of
 a second:
