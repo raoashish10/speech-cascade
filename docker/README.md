@@ -122,9 +122,19 @@ Two things make this trustworthy rather than a second kaniko:
 - **The result is tested by running it**, not by trusting the build. kaniko's
   output failed that test instantly.
 
-**Two packaging traps, both hit for real, both of which stop the image from
-pulling at all.** Loud failures, unlike kaniko's silent one -- but they cost
-a pod deploy each to discover, so:
+**Check the layers before deploying anything:**
+
+```bash
+python3 deploy/check_image_layers.py ghcr.io/<owner>/speech-cascade-triton:latest
+```
+
+It streams just the layers this repo adds and fails on the two packaging
+faults below. Both were hit for real, both stop the image from pulling at
+all, and both are invisible until a pod tries to start -- so this takes
+seconds and replaces a ~15 minute pod deploy as the way you find out.
+
+**The two traps.** Loud failures, unlike kaniko's silent one, but each cost
+a pod deploy to discover:
 
 - **Hardlinks.** Package with `tar --hard-dereference`, and never put a
   directory *and* its own contents in the same file list. If tar emits a
