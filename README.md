@@ -7,8 +7,14 @@ Triton BLS python-backend models wrapping each stage, all GPU-accelerated.
 
 A containerized alternative to this bare-metal deployment (portable to any
 GPU host with Docker + `nvidia-container-toolkit`, not tied to Vast.ai) is
-in [`docker/`](docker/README.md) — UNVERIFIED end-to-end, see that
-directory's README before relying on it.
+in [`docker/`](docker/README.md). It has since been **verified end-to-end on
+a real GPU** (RTX PRO 4500 Blackwell, sm_120): all four models reach Triton
+state `READY` and the full `voice_pipeline` ensemble round-trips speech ->
+ASR -> LLM -> TTS -> speech, with weights and engines built from scratch (no
+S3) per `scripts/build_models_from_scratch.sh`. Engines are deliberately not
+baked into the image — they're GPU-architecture-specific. What is still
+open there is the CI image build itself, plus the `vllm` chatterbox backend
+and the gateway container; see that directory's README, which tracks each.
 
 GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell, sm_120, 16GB VRAM), driver 595.84
 (CUDA 13.2 max). CUDA 12.8 and 13.2 toolkits are both installed system-wide.
@@ -18,11 +24,11 @@ GPU: NVIDIA GeForce RTX 5070 Ti (Blackwell, sm_120, 16GB VRAM), driver 595.84
 ```
 speech-cascade-inference/
   models/                          Downloaded/built model weights
-    Llama-3.1-Nemotron-Nano-4B-v1.1/   HF BF16 checkpoint (source for the LLM)
-    llama_nemotron_fp8_ckpt/           TensorRT-LLM checkpoint (FP8, post-quantize)
-    llama_nemotron_engine/             Compiled TensorRT .engine (what's actually served)
-    whisper-base/                      ONNX Whisper (encoder + merged decoder)
-    trtllm_build_timing_cache.bin      trtllm-build's timing cache (speeds up rebuilds)
+    Qwen3-8B-NVFP4/                    qwen_llm's engine_dir AND tokenizer_dir (pre-quantized, pulled from the Hub)
+    Qwen3-8B-hf/                       Unquantized Qwen3-8B, only read when QWEN_BACKEND=pytorch (the no-TensorRT-LLM comparison path)
+    whisper-base-trtllm/               whisper_asr's engine_dir: TensorRT-LLM encoder/ + decoder/ engines
+      assets/                            multilingual.tiktoken + mel_filters.npz (whisper_asr's assets_dir)
+    whisper-base-hf/                   Plain HF whisper-base, only read when WHISPER_BACKEND=pytorch
   triton_model_repo/                 Triton model repository (4 models, see below)
   triton_server/
     extracted/tritonserver/            Redistributable no-Docker Triton server build
@@ -33,10 +39,26 @@ speech-cascade-inference/
     Nemotron-3-Nano-4B-FP8/            Abandoned model, see "Why not Nemotron-3-Nano" below
 ```
 
+This listing used to show `Llama-3.1-Nemotron-Nano-4B-v1.1/`,
+`llama_nemotron_fp8_ckpt/`, `llama_nemotron_engine/` and an ONNX
+`whisper-base/`. None of those are served any more: the LLM is
+`Qwen3-8B-NVFP4` and ASR runs TensorRT-LLM engines, per the model table
+below. Those paths still appear in `scripts/quantize_fp8.py`,
+`scripts/quantize_nvfp4.py`, `scripts/build_engine.sh`,
+`scripts/measure_vram_classic.py` and `deploy/REBUILD.md` as the record of
+how the earlier checkpoints were built — they describe history, not the
+current deployment.
+
+Every path above is exactly what `triton_model_repo/*/config.pbtxt` points
+at, so this is the layout both the bare-metal deployment and
+`docker/`'s image/volume reproduce.
+
 `chatterbox_tts`'s own weights aren't under `models/` -- `ChatterboxTurboTTS.from_pretrained()`
 pulls them from the HF cache (`HF_HOME`) the first time it's run, same as any
 other `from_pretrained()`-based HF model, rather than a locally-checked-in
-`.nemo`/ONNX-style checkpoint.
+`.nemo`/ONNX-style checkpoint. Its `ref_audio_path` reference voice clip
+(`scripts/pipeline_output.wav`) is a deployment artifact, not something
+reproducible from public sources.
 
 `/opt/supervisor-scripts/speech-cascade-triton.sh` and
 `/etc/supervisor/conf.d/speech-cascade-triton.conf` run the server as a
@@ -104,19 +126,22 @@ Where the stub's own VRAM number lands depends on the model:
 - **`whisper_asr`**: now TensorRT-LLM-based (`WhisperTRTLLM`, see the model
   table above) rather than the ONNX Runtime path this section originally
   described — whether it also spawns a separate MPI worker like
-  `nemotron_llm` below, or stays in-process, hasn't been re-verified since
+  `qwen_llm` below, or stays in-process, hasn't been re-verified since
   that migration.
-- **`nemotron_llm`**: architecturally different. TensorRT-LLM's executor
+- **`qwen_llm`**: architecturally different. TensorRT-LLM's executor
   spawns a *separate* MPI worker subprocess to actually run the engine (the
   `MpiPoolSession` mechanism — see the "Environment quirks" section above,
   fix #1). That worker shows up in `ps aux` as a plain
   `/venv/main/bin/python3` process, **not** `triton_python_backend_stub`,
-  and holds essentially all of the LLM's real footprint (~7.5GB: FP8 weights
-  + KV cache pool + framework overhead). The `nemotron_llm` stub itself
-  only holds ~290MiB — it's just relaying requests to the MPI worker over
-  shared memory, not running inference itself.
+  and holds essentially all of the LLM's real footprint (KV cache pool +
+  weights + framework overhead). The `qwen_llm` stub itself only holds
+  ~290MiB — it's just relaying requests to the MPI worker over shared
+  memory, not running inference itself. (The ~7.5GB FP8 figure this bullet
+  used to quote was measured against the old 4B Nemotron checkpoint on the
+  RTX 5070 Ti; the current model is the 8B `Qwen3-8B-NVFP4`, and its
+  footprint has not been re-measured — see the VRAM table below.)
 
-This split matters for capacity planning: bumping `nemotron_llm`'s
+This split matters for capacity planning: bumping `qwen_llm`'s
 `instance_group.count` doesn't add a cheap extra Python object the way it
 does for `voice_pipeline` — each additional instance spawns its own MPI
 worker, i.e. its own full ~7.5GB copy of the engine + KV cache. See below
@@ -124,17 +149,23 @@ for what happened when this was actually tried.
 
 ## VRAM budget (measured)
 
+**Stale — kept as the record, do not plan against it.** These numbers were
+measured on the RTX 5070 Ti (16GB) with the old 4B Nemotron FP8 LLM and the
+ONNX ASR path. Both have since been replaced (`Qwen3-8B-NVFP4`, TensorRT-LLM
+Whisper engines), so the LLM is now twice the parameter count at a different
+quantization, and nothing below has been re-measured against it.
+
 | Stage | VRAM |
 |---|---|
 | Baseline (nothing loaded) | ~0 MiB / 16303 MiB |
-| `nemotron_llm` loaded alone | ~8185 MiB |
-| All three models loaded together | ~9933 MiB (5910 MiB free) |
+| LLM (then `nemotron_llm`) loaded alone | ~8185 MiB |
+| All three GPU models loaded together | ~9933 MiB (5910 MiB free) |
 
-The LLM's KV cache pool is capped at `free_gpu_memory_fraction: 0.2` in
-`nemotron_llm/1/model.py` — without that cap, TensorRT-LLM greedily claims
-most of the free VRAM for KV cache by default, which isn't appropriate on a
-GPU shared with two other models. `max_seq_len` is set by the engine's build
-config (4096 tokens).
+What is still current is the shape of the constraint. The LLM's KV cache
+pool is capped at `free_gpu_memory_fraction: 0.2` in `qwen_llm/1/model.py`
+and whisper_asr uses `kv_cache_free_gpu_memory_fraction=0.05` — without
+those caps TensorRT-LLM greedily claims most of the free VRAM for KV cache
+by default, which isn't appropriate on a GPU shared with two other models.
 
 ## Why the LLM is Llama-3.1-Nemotron-Nano-4B, not Nemotron-3-Nano-4B
 
@@ -168,8 +199,16 @@ classic path can't represent, and this model doesn't need it.
 ## Environment quirks fixed to make this run bare-metal
 
 None of this is needed inside NVIDIA's NGC containers, which ship a
-consistent, matched toolchain. Building it manually on this base image
-required:
+consistent, matched toolchain — that claim has now been exercised rather
+than asserted: `docker/` builds on `nvcr.io/nvidia/tritonserver:26.03-trtllm-python-py3`
+and needed none of fixes 2-9 below. It is not quite "zero quirks" either;
+fix #1 (MPI) reappears inside the container in a different form, as
+`OPAL_PREFIX` — see `docker/triton/Dockerfile`.
+
+Fixes **7, 8 and 9 are historical**: they were for the ONNX Runtime ASR
+path and the Kokoro TTS, both of which are gone (see the model table
+above). They are kept as the record of how that setup was made to work,
+not as steps to repeat. Building it manually on this base image required:
 
 1. **OpenMPI wasn't installed.** TensorRT-LLM's executor uses MPI-based
    worker process spawning even for a single GPU. Fixed with
@@ -335,7 +374,7 @@ isn't reliable, so replicating this repo elsewhere means rerunning this
 script there, not copying `models/llama_nemotron_engine/`.
 
 `scripts/quantize_nvfp4.py` reconstructs the NVFP4 quantization step that
-actually produced what `nemotron_llm` serves today (see `deploy/REBUILD.md`
+actually produced what `qwen_llm` serves today (see `deploy/REBUILD.md`
 "4b") — the FP8 path above was superseded, not deleted; it's kept for
 reference and any future re-quantization on hardware/versions where NVFP4
 isn't the right call. Unlike `quantize_fp8.py`, this wraps NVIDIA's own
@@ -377,7 +416,7 @@ and the exporter stay internal-only.
 gRPC binary protocol (see "Two further optimizations" below for why not
 JSON-over-HTTP), records client-side latency percentiles, and diffs Triton's
 own metrics before/after to report per-model exec counts and average
-compute/queue time. With no `--model`, it runs `whisper_asr`, `nemotron_llm`,
+compute/queue time. With no `--model`, it runs `whisper_asr`, `qwen_llm`,
 `chatterbox_tts`, and `voice_pipeline` in turn (each isolated, same concurrency)
 for a clean per-stage p50 breakdown:
 
