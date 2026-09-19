@@ -244,19 +244,29 @@ the published image, all three of its assertions passed, the T3 export ran
 | S3Gen (unchanged) | 141.1ms | 139.2ms |
 | **TTS total** | **480.3ms** (from 1539.7ms) | **273.4ms** (from 655.6ms) |
 
-So TTS goes 1540ms -> 480ms, which through the gateway's ~146ms of transport
-and wav round-trip puts `tts_first_ms` near 630ms and
-`ttfa_from_speech_end_ms` near **1.3s** at the 400ms VAD window — inside the
-band commercial voice agents target, from a rebuild of an image whose
-Dockerfile already says to do this.
+**This is now the deployed image** (`speech-cascade-triton:latest`,
+`sha256:c86c3b17`), and the end-to-end numbers were measured through the
+gateway on the two-pod deployment, 6 warm turns:
 
-**What is still required: republishing the image.** That needs a GHCR token
-with `write:packages`, which is a credential rather than a code change.
-Until then, a pod can be started with an `entrypoint` override that builds
-`/venv/vllm` before calling the normal entrypoint — it costs ~4-5 minutes on
-every pod start, because Runpod's container disk does NOT survive a restart
-(verified here: `/venv/vllm` and the whole bootstrap were gone after one
-restart, contrary to an earlier note in this repo claiming it persisted).
+| median | pytorch | **vLLM, deployed** | change |
+|---|---:|---:|---:|
+| `asr_ms` | 74ms | 76ms | — |
+| `llm_ttft_ms` | 16ms | 18ms | — |
+| `llm_tbt_p50_ms` | 9.6ms | 9.6ms | — |
+| `llm_to_sentence_ms` | 193ms | 193ms | — |
+| **`tts_first_ms`** | **1686ms** | **579ms** | **2.9x** |
+| `ttfa_from_vad_end_ms` | 1970ms | **865ms** | 2.3x |
+| `vad_silence_ms` | 800ms | 400ms | halved |
+| **`ttfa_from_speech_end_ms`** | **2770ms** | **1265ms** | **2.2x** |
+
+Perceived time-to-first-audio therefore went 3009ms -> 1265ms across the
+whole investigation: TTS via the vLLM backend, and the VAD window halved.
+That is at the edge of the 800-1200ms band commercial voice agents target,
+against roughly 600ms at the fast end of that market.
+
+Cold start is unchanged and still disqualifying for scale-to-zero: the first
+turn after a pod comes up measured 12.9s, almost all of it the vLLM worker's
+compile.
 
 One caveat on the harness: the RMS join-discontinuity proxy it reports is
 uninformative, because chunk boundaries land in near-silence and the ratio

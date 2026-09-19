@@ -113,6 +113,21 @@ crane mutate <base-image> --platform linux/amd64 \
   -t ghcr.io/<owner>/speech-cascade-triton:latest
 ```
 
+**THE IMAGE'S `triton_model_repo` GOES STALE THE SAME WAY, and that is
+worse, because nothing announces it.** The env at least shows up in
+`crane config`. The model code is just files in a layer, and when the
+published image is rebuilt from an older checkout the repo silently ships
+old model code. This bit for real: the published image's
+`chatterbox_worker_vllm.py` predated the built-in-voice fallback and called
+`prepare_conditionals()` unconditionally, so it died on
+`FileNotFoundError: ''` with no ref clip configured. The pytorch worker had
+the fallback, so the bug stayed invisible until `CHATTERBOX_BACKEND=vllm`
+was switched on, and it surfaced only as Triton's opaque
+`chatterbox_tts has no available versions`. **Re-COPY `triton_model_repo`
+from the current checkout on every rebuild, and verify a model actually
+serves a turn rather than just that Triton reported it loaded** — three of
+four models loading is not a working pipeline.
+
 **These `-e` flags are the image's only source of truth for its env, and
 that is a trap this project already fell into.** `crane mutate` does not read
 the Dockerfile; every `ENV` line in it has to be repeated here by hand. This
