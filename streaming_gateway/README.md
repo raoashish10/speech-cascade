@@ -222,15 +222,41 @@ fit. The "~144ms fixed cost" in that fit is S3Gen plus watermarking. The
 earlier model was numerically right and causally wrong, which is exactly why
 it pointed at the wrong component.
 
-**The fix already exists in this repo and is not deployed.** `qwen_llm`'s
-vLLM T3 backend (`CHATTERBOX_BACKEND=vllm`) replaces that decode loop and
-was merged in #41 — but the triton image is hand-built with `crane`, not by
-CI, so merging it never rebuilt the image. The published
+**The fix already exists in this repo and is not deployed.** The vLLM T3
+backend (`CHATTERBOX_BACKEND=vllm`) replaces that decode loop and was merged
+in #41 — but the triton image is hand-built with `crane`, not by CI, so
+merging it never rebuilt the image. The published
 `speech-cascade-triton:latest` has no `/venv/vllm` at all and ships
 `CHATTERBOX_BACKEND=pytorch`. **Every latency figure on this page was
 therefore measured on the PyTorch backend**, including the ones above.
-Rebuilding the image is the entire remaining task; at the ~5x that backend
-was profiled at, T3 goes 1473ms -> ~295ms and TTS goes 1540ms -> ~420ms.
+
+### The vLLM backend, built and measured on a GPU
+
+`/venv/vllm` was built from the Dockerfile's own RUN block on a pod running
+the published image, all three of its assertions passed, the T3 export ran
+(1.6GB, 298 tensors), and the same measurement was repeated:
+
+| | 151 tok / 6.16s audio | 66 tok / 2.76s audio |
+|---|---:|---:|
+| T3 decode, PyTorch | 1472.9ms | 561.9ms |
+| T3 decode, **vLLM** | **339.2ms** | **134.3ms** |
+| | **4.34x** | **4.19x** |
+| S3Gen (unchanged) | 141.1ms | 139.2ms |
+| **TTS total** | **480.3ms** (from 1539.7ms) | **273.4ms** (from 655.6ms) |
+
+So TTS goes 1540ms -> 480ms, which through the gateway's ~146ms of transport
+and wav round-trip puts `tts_first_ms` near 630ms and
+`ttfa_from_speech_end_ms` near **1.3s** at the 400ms VAD window — inside the
+band commercial voice agents target, from a rebuild of an image whose
+Dockerfile already says to do this.
+
+**What is still required: republishing the image.** That needs a GHCR token
+with `write:packages`, which is a credential rather than a code change.
+Until then, a pod can be started with an `entrypoint` override that builds
+`/venv/vllm` before calling the normal entrypoint — it costs ~4-5 minutes on
+every pod start, because Runpod's container disk does NOT survive a restart
+(verified here: `/venv/vllm` and the whole bootstrap were gone after one
+restart, contrary to an earlier note in this repo claiming it persisted).
 
 One caveat on the harness: the RMS join-discontinuity proxy it reports is
 uninformative, because chunk boundaries land in near-silence and the ratio
