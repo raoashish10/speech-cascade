@@ -108,7 +108,9 @@ tool — see `deploy/PROFILING.md` for the nsys/torch.profiler flow.
 ### What it measured: TTS is 82% of the budget
 
 22 warm turns through the public gateway of the two-pod Runpod deployment
-(RTX PRO 4500 Blackwell for Triton, `CHATTERBOX_BACKEND=vllm`), medians:
+(RTX PRO 4500 Blackwell for Triton). Note `CHATTERBOX_BACKEND=pytorch` --
+the published image has no vLLM venv despite #41; see "Where the TTS time
+actually goes" below. Medians:
 
 | stage | median | share of TTFA |
 |---|---:|---:|
@@ -131,22 +133,22 @@ and 6.00s of audio, real-time factor held at ~0.30, fitting:
 tts_first_ms  ~=  144ms  +  278ms per second of output audio
 ```
 
-The pipeline waits for all 6.0s of audio to exist before sending any of it,
-at a cost of 1812ms, when the first 500ms of it could be ready in ~280ms.
+That fit is numerically good and was causally misread at the time — the
+slope is T3's decode loop, not synthesis as a whole, and the intercept is
+S3Gen plus watermarking. "Where the TTS time actually goes" below has the
+per-stage measurement; read it before acting on this fit.
 
-This makes the earlier recommendation against within-sentence TTS streaming
-wrong. That call was made against a remembered "0.26s per sentence", which
-appears to have been a real-time factor rather than per-sentence wall time.
-At the measured 1812ms, TTS is not a rounding error on the budget, it *is*
-the budget.
+It does establish that the earlier recommendation against within-sentence
+TTS streaming was wrong. That call was made against a remembered "0.26s per
+sentence", which appears to have been a real-time factor rather than
+per-sentence wall time. At the measured 1812ms, TTS is not a rounding error
+on the budget, it *is* the budget.
 
 **What to target, in order:**
 
-1. **Emit audio before the whole sentence is synthesised** — ~1.1s, and
-   still the largest item. **Do this by streaming S3Gen's output, not by
-   chunking its input**: input chunking was tried, measured and reverted,
-   see below. PR #33's note that S3Gen's flow-matching vocoder still runs
-   per-item and unbatched describes exactly where the time goes.
+1. **Deploy the vLLM T3 backend that is already merged but not in the
+   image** — see "Where the TTS time actually goes" below. S3Gen is *not*
+   the bottleneck; T3's autoregressive decode is 96% of TTS.
 2. ~~`UtteranceVAD(min_silence_duration_ms=800)` → 400ms~~ — **done**, and
    it is arithmetic rather than a measurement: the window is dead time
    before the pipeline may start, so halving it removes 400ms from perceived
@@ -187,11 +189,88 @@ latency numbers cannot show:
   argument for why the intonation reset and the playback gap are acceptable
   goes with it — and neither of those failures shows up in `tts_first_ms`.
 
-The right version of this optimisation is upstream: have chatterbox emit
-audio as S3Gen produces it, which is language-agnostic, needs no boundary
-detection, and approaches the measured ~144ms fixed floor rather than
-stopping at 561ms. The measurements above stand as evidence for how much is
-there to win.
+The plan after reverting was to do this upstream instead, by streaming
+S3Gen's output. **That was measured and it is the wrong target** — see the
+next section. The latency figures above still stand as evidence of how much
+is available; only the proposed mechanism was wrong.
+
+### Where the TTS time actually goes
+
+Measured on the GPU, inside the worker's own venv, by timing the stages of
+`ChatterboxTurboTTS` separately (`scripts/measure_s3gen_streaming.py`):
+
+| | 159 tokens / 6.48s audio | 47 tokens / 2.0s audio |
+|---|---:|---:|
+| T3 autoregressive decode | **1472.9ms (96%)** | **561.9ms (86%)** |
+| S3Gen (flow matching + vocoder) | 100.5ms | 97.6ms |
+| watermarking | 25.2ms | 11.9ms |
+| `model.generate()` end to end | 1539.7ms | 655.6ms |
+
+Two things fall out of this, and both contradict what was believed before:
+
+**S3Gen is not the bottleneck and streaming it is worthless.** It costs
+~100ms and — note this — *the same ~100ms for 2.0s of audio as for 6.48s*.
+It is essentially a fixed cost, not a length-proportional one. Chunking its
+input makes things strictly worse, measured: first chunk 116ms against
+100ms for the whole thing, and total 228ms (2 chunks), 396ms (4) or 819ms
+(7) against 100ms unchunked. There is nothing there to win.
+
+**The 278ms-per-second-of-audio slope fitted earlier was T3, not TTS.** T3
+decodes at ~100 speech tokens/s and S3Gen consumes 25 tokens per second of
+audio, so 250ms of decode per second of output — which is the slope that
+fit. The "~144ms fixed cost" in that fit is S3Gen plus watermarking. The
+earlier model was numerically right and causally wrong, which is exactly why
+it pointed at the wrong component.
+
+**The fix already exists in this repo and is not deployed.** The vLLM T3
+backend (`CHATTERBOX_BACKEND=vllm`) replaces that decode loop and was merged
+in #41 — but the triton image is hand-built with `crane`, not by CI, so
+merging it never rebuilt the image. The published
+`speech-cascade-triton:latest` has no `/venv/vllm` at all and ships
+`CHATTERBOX_BACKEND=pytorch`. **Every latency figure on this page was
+therefore measured on the PyTorch backend**, including the ones above.
+
+### The vLLM backend, built and measured on a GPU
+
+`/venv/vllm` was built from the Dockerfile's own RUN block on a pod running
+the published image, all three of its assertions passed, the T3 export ran
+(1.6GB, 298 tensors), and the same measurement was repeated:
+
+| | 151 tok / 6.16s audio | 66 tok / 2.76s audio |
+|---|---:|---:|
+| T3 decode, PyTorch | 1472.9ms | 561.9ms |
+| T3 decode, **vLLM** | **339.2ms** | **134.3ms** |
+| | **4.34x** | **4.19x** |
+| S3Gen (unchanged) | 141.1ms | 139.2ms |
+| **TTS total** | **480.3ms** (from 1539.7ms) | **273.4ms** (from 655.6ms) |
+
+**This is now the deployed image** (`speech-cascade-triton:latest`,
+`sha256:c86c3b17`), and the end-to-end numbers were measured through the
+gateway on the two-pod deployment, 6 warm turns:
+
+| median | pytorch | **vLLM, deployed** | change |
+|---|---:|---:|---:|
+| `asr_ms` | 74ms | 76ms | — |
+| `llm_ttft_ms` | 16ms | 18ms | — |
+| `llm_tbt_p50_ms` | 9.6ms | 9.6ms | — |
+| `llm_to_sentence_ms` | 193ms | 193ms | — |
+| **`tts_first_ms`** | **1686ms** | **579ms** | **2.9x** |
+| `ttfa_from_vad_end_ms` | 1970ms | **865ms** | 2.3x |
+| `vad_silence_ms` | 800ms | 400ms | halved |
+| **`ttfa_from_speech_end_ms`** | **2770ms** | **1265ms** | **2.2x** |
+
+Perceived time-to-first-audio therefore went 3009ms -> 1265ms across the
+whole investigation: TTS via the vLLM backend, and the VAD window halved.
+That is at the edge of the 800-1200ms band commercial voice agents target,
+against roughly 600ms at the fast end of that market.
+
+Cold start is unchanged and still disqualifying for scale-to-zero: the first
+turn after a pod comes up measured 12.9s, almost all of it the vLLM worker's
+compile.
+
+One caveat on the harness: the RMS join-discontinuity proxy it reports is
+uninformative, because chunk boundaries land in near-silence and the ratio
+divides by ~0. It says nothing about audibility either way.
 
 **A design assumption this disproved.** `session.py` synthesises per
 sentence so TTS for sentence 1 can overlap the LLM generating sentence 2.

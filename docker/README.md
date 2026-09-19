@@ -91,10 +91,13 @@ layer on top of the unmodified base.
 curl -sSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
   | tar xz -C /usr/local/bin crane
 
-# 1. Run the Dockerfile's RUN steps natively (see its two RUN blocks), and
-#    the COPY steps by hand: triton_model_repo ->
-#    /workspace/speech-cascade-inference/, entrypoint.sh -> /usr/local/bin/,
-#    scripts/build_models_from_scratch.sh -> /opt/speech-cascade/scripts/.
+# 1. Run the Dockerfile's RUN steps natively (ALL THREE of them: the main
+#    env, /venv/chatterbox, and /venv/vllm), and the COPY steps by hand:
+#    triton_model_repo -> /workspace/speech-cascade-inference/,
+#    entrypoint.sh -> /usr/local/bin/, and BOTH scripts from scripts/ ->
+#    /opt/speech-cascade/scripts/ (build_models_from_scratch.sh and
+#    export_chatterbox_t3_for_vllm.py -- the bootstrap calls the second one
+#    and silently skips the T3 export if it is missing).
 
 # 2. Compute the delta against the base image's own flattened file listing.
 crane export <base-image> - | tar -tf - > /tmp/base-files.txt
@@ -103,12 +106,37 @@ python3 deploy/make_image_layer.py          # writes /tmp/layer.tgz
 # 3. Append it to the base and set the image config in one shot.
 crane mutate <base-image> --platform linux/amd64 \
   --append /tmp/layer.tgz \
-  -e CHATTERBOX_BACKEND=pytorch -e OPAL_PREFIX=/usr/local/mpi \
+  -e CHATTERBOX_BACKEND=vllm -e OPAL_PREFIX=/usr/local/mpi \
   --entrypoint /usr/local/bin/entrypoint.sh \
   -w /workspace/speech-cascade-inference \
   --exposed-ports 18000/tcp,18001/tcp,18002/tcp \
   -t ghcr.io/<owner>/speech-cascade-triton:latest
 ```
+
+**THE IMAGE'S `triton_model_repo` GOES STALE THE SAME WAY, and that is
+worse, because nothing announces it.** The env at least shows up in
+`crane config`. The model code is just files in a layer, and when the
+published image is rebuilt from an older checkout the repo silently ships
+old model code. This bit for real: the published image's
+`chatterbox_worker_vllm.py` predated the built-in-voice fallback and called
+`prepare_conditionals()` unconditionally, so it died on
+`FileNotFoundError: ''` with no ref clip configured. The pytorch worker had
+the fallback, so the bug stayed invisible until `CHATTERBOX_BACKEND=vllm`
+was switched on, and it surfaced only as Triton's opaque
+`chatterbox_tts has no available versions`. **Re-COPY `triton_model_repo`
+from the current checkout on every rebuild, and verify a model actually
+serves a turn rather than just that Triton reported it loaded** — three of
+four models loading is not a working pipeline.
+
+**These `-e` flags are the image's only source of truth for its env, and
+that is a trap this project already fell into.** `crane mutate` does not read
+the Dockerfile; every `ENV` line in it has to be repeated here by hand. This
+recipe said `CHATTERBOX_BACKEND=pytorch` while the Dockerfile said `vllm`,
+and since the triton image is built by this recipe rather than by CI,
+merging the vLLM backend (#41) changed nothing about what was deployed. The
+published image had no `/venv/vllm` at all and ran the PyTorch backend for
+every measurement taken against it. **After any change to the Dockerfile's
+`ENV` or `RUN` blocks, diff them against this command before publishing.**
 
 Two things make this trustworthy rather than a second kaniko:
 
