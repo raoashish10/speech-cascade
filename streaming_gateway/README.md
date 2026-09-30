@@ -67,6 +67,274 @@ python3 scripts/test_streaming_client.py --wav your_clip.wav \
 Add `--auth-mode header` to send the token as `Authorization: Bearer …`
 instead of the default `?token=` query param.
 
+## Turn latency breakdown
+
+Every `turn_end` message carries a `timings` object, and the same figures go
+to the log as one line per turn:
+
+```
+turn timings: vad_silence=800ms asr=88ms llm_ttft=18ms llm_deltas=20
+              llm_tbt_p50=10ms llm_tbt_p95=10ms llm_tbt_max=12ms
+              llm_to_sentence=194ms tts_first=1812ms
+              ttfa_from_vad_end=2209ms ttfa_from_speech_end=3009ms
+              turn_total=2272ms
+```
+
+This exists because every latency discussion about this project was
+conducted on inferred numbers. It has now been run, and the inference was
+wrong — see the measured breakdown below.
+
+**Two TTFA clocks, and they differ by most of a second:**
+
+- `ttfa_from_vad_end_ms` — from end-of-speech detection. What the pipeline
+  can influence.
+- `ttfa_from_speech_end_ms` — from when the user actually stopped talking.
+  What the user perceives. Larger by `vad_silence_ms`, because that much
+  trailing silence must elapse before end-of-speech can be declared at all.
+
+Reporting only the first flatters the system by 800ms and hides the largest
+single tunable in the stack (`UtteranceVAD(min_silence_duration_ms=...)`);
+reporting only the second makes pipeline work look futile. Both are emitted.
+
+`llm_to_sentence_ms` is worth watching separately: it is time after the LLM's
+first token before a *complete sentence* exists for TTS, and it is governed by
+`sentence.py`'s boundary rules rather than by model speed. If it is large, a
+faster model will not help — emitting on clause boundaries would.
+
+Turns that end early or fail report the stages they reached, so a partial
+breakdown is still in the log. Fine-grained per-token profiling is a different
+tool — see `deploy/PROFILING.md` for the nsys/torch.profiler flow.
+
+### What it measured: TTS is 82% of the budget
+
+22 warm turns through the public gateway of the two-pod Runpod deployment
+(RTX PRO 4500 Blackwell for Triton). Note `CHATTERBOX_BACKEND=pytorch` --
+the published image has no vLLM venv despite #41; see "Where the TTS time
+actually goes" below. Medians:
+
+| stage | median | share of TTFA |
+|---|---:|---:|
+| `asr_ms` — whisper, 3.5s of input audio | 88ms | 4.0% |
+| `llm_ttft_ms` — Qwen3-8B-NVFP4 prefill | 18ms | 0.8% |
+| `llm_to_sentence_ms` — decode until a complete sentence exists | 194ms | 8.8% |
+| `tts_first_ms` — chatterbox synthesising that sentence | **1812ms** | **82.0%** |
+| **`ttfa_from_vad_end_ms`** | **2209ms** | |
+| `vad_silence_ms` | 800ms | |
+| **`ttfa_from_speech_end_ms`** — what the user waits | **3009ms** | |
+
+**Time between tokens needs no work**: 9.7ms median, 11.6ms max over 30
+turns, ~103 deltas/s, no stalls and no tail. Neither the LLM's prefill nor
+its decode loop is worth optimising.
+
+**TTS is linear in output length.** Across replies producing 2.26s, 5.92s
+and 6.00s of audio, real-time factor held at ~0.30, fitting:
+
+```
+tts_first_ms  ~=  144ms  +  278ms per second of output audio
+```
+
+That fit is numerically good and was causally misread at the time — the
+slope is T3's decode loop, not synthesis as a whole, and the intercept is
+S3Gen plus watermarking. "Where the TTS time actually goes" below has the
+per-stage measurement; read it before acting on this fit.
+
+It does establish that the earlier recommendation against within-sentence
+TTS streaming was wrong. That call was made against a remembered "0.26s per
+sentence", which appears to have been a real-time factor rather than
+per-sentence wall time. At the measured 1812ms, TTS is not a rounding error
+on the budget, it *is* the budget.
+
+**What to target, in order:**
+
+1. **Deploy the vLLM T3 backend that is already merged but not in the
+   image** — see "Where the TTS time actually goes" below. S3Gen is *not*
+   the bottleneck; T3's autoregressive decode is 96% of TTS.
+2. ~~`UtteranceVAD(min_silence_duration_ms=800)` → 400ms~~ — **done**, and
+   it is arithmetic rather than a measurement: the window is dead time
+   before the pipeline may start, so halving it removes 400ms from perceived
+   TTFA directly. What is *not* established is the cost; see below.
+3. **Nothing else.** ASR at 74ms, prefill at 16ms and decode at 9.6ms/delta
+   are inside the noise of a single TTS call.
+
+### Clause chunking: tried, measured, reverted
+
+Splitting a sentence at clause boundaries before synthesis worked, and the
+numbers were good. Ten warm turns per arm, same pod, same GPU, same clip:
+
+| median | whole sentence | clause-chunked | change |
+|---|---:|---:|---:|
+| `tts_first_ms` | 1686ms | 561ms | −1125ms (3.0×) |
+| `ttfa_from_vad_end_ms` | 1970ms | 843ms | −1127ms (2.3×) |
+| `ttfa_from_speech_end_ms` | 2770ms | 1643ms | −1127ms (1.7×) |
+
+The measured costs were also small: the inter-chunk gap was 30ms (chunk 1
+was 1.56s of audio, chunk 2 arrived 1.59s later), and total spoken audio
+grew 5.86s → 6.26s, +7%, from two sets of utterance padding.
+
+**It was reverted anyway, because the mechanism does not generalise.**
+Finding clause boundaries without a parser meant a hand-maintained list of
+English clause-introducing words, and that approach fails in ways the
+latency numbers cannot show:
+
+- **It cannot distinguish homographs.** `so` and `yet` are clause
+  connectors *and* degree adverbs — "was **so** long that everyone fell
+  asleep", "I haven't seen him **yet**". Cutting before those lands
+  mid-phrase, which is the one thing the design promised never to do. Both
+  had to be removed from the list after the fact, which is the tell: the
+  list was not derivable, only patchable.
+- **It is English-only**, and a per-language word list is a maintenance
+  burden that grows with every locale.
+- **The safety argument rested entirely on the cut points being genuine
+  clause boundaries.** Once the boundary detector is unreliable, the
+  argument for why the intonation reset and the playback gap are acceptable
+  goes with it — and neither of those failures shows up in `tts_first_ms`.
+
+The plan after reverting was to do this upstream instead, by streaming
+S3Gen's output. **That was measured and it is the wrong target** — see the
+next section. The latency figures above still stand as evidence of how much
+is available; only the proposed mechanism was wrong.
+
+### Where the TTS time actually goes
+
+Measured on the GPU, inside the worker's own venv, by timing the stages of
+`ChatterboxTurboTTS` separately (`scripts/measure_s3gen_streaming.py`):
+
+| | 159 tokens / 6.48s audio | 47 tokens / 2.0s audio |
+|---|---:|---:|
+| T3 autoregressive decode | **1472.9ms (96%)** | **561.9ms (86%)** |
+| S3Gen (flow matching + vocoder) | 100.5ms | 97.6ms |
+| watermarking | 25.2ms | 11.9ms |
+| `model.generate()` end to end | 1539.7ms | 655.6ms |
+
+Two things fall out of this, and both contradict what was believed before:
+
+**S3Gen is not the bottleneck and streaming it is worthless.** It costs
+~100ms and — note this — *the same ~100ms for 2.0s of audio as for 6.48s*.
+It is essentially a fixed cost, not a length-proportional one. Chunking its
+input makes things strictly worse, measured: first chunk 116ms against
+100ms for the whole thing, and total 228ms (2 chunks), 396ms (4) or 819ms
+(7) against 100ms unchunked. There is nothing there to win.
+
+**The 278ms-per-second-of-audio slope fitted earlier was T3, not TTS.** T3
+decodes at ~100 speech tokens/s and S3Gen consumes 25 tokens per second of
+audio, so 250ms of decode per second of output — which is the slope that
+fit. The "~144ms fixed cost" in that fit is S3Gen plus watermarking. The
+earlier model was numerically right and causally wrong, which is exactly why
+it pointed at the wrong component.
+
+**The fix already exists in this repo and is not deployed.** The vLLM T3
+backend (`CHATTERBOX_BACKEND=vllm`) replaces that decode loop and was merged
+in #41 — but the triton image is hand-built with `crane`, not by CI, so
+merging it never rebuilt the image. The published
+`speech-cascade-triton:latest` has no `/venv/vllm` at all and ships
+`CHATTERBOX_BACKEND=pytorch`. **Every latency figure on this page was
+therefore measured on the PyTorch backend**, including the ones above.
+
+### The vLLM backend, built and measured on a GPU
+
+`/venv/vllm` was built from the Dockerfile's own RUN block on a pod running
+the published image, all three of its assertions passed, the T3 export ran
+(1.6GB, 298 tensors), and the same measurement was repeated:
+
+| | 151 tok / 6.16s audio | 66 tok / 2.76s audio |
+|---|---:|---:|
+| T3 decode, PyTorch | 1472.9ms | 561.9ms |
+| T3 decode, **vLLM** | **339.2ms** | **134.3ms** |
+| | **4.34x** | **4.19x** |
+| S3Gen (unchanged) | 141.1ms | 139.2ms |
+| **TTS total** | **480.3ms** (from 1539.7ms) | **273.4ms** (from 655.6ms) |
+
+**This is now the deployed image** (`speech-cascade-triton:latest`,
+`sha256:c86c3b17`), and the end-to-end numbers were measured through the
+gateway on the two-pod deployment, 6 warm turns:
+
+| median | pytorch | **vLLM, deployed** | change |
+|---|---:|---:|---:|
+| `asr_ms` | 74ms | 76ms | — |
+| `llm_ttft_ms` | 16ms | 18ms | — |
+| `llm_tbt_p50_ms` | 9.6ms | 9.6ms | — |
+| `llm_to_sentence_ms` | 193ms | 193ms | — |
+| **`tts_first_ms`** | **1686ms** | **579ms** | **2.9x** |
+| `ttfa_from_vad_end_ms` | 1970ms | **865ms** | 2.3x |
+| `vad_silence_ms` | 800ms | 400ms | halved |
+| **`ttfa_from_speech_end_ms`** | **2770ms** | **1265ms** | **2.2x** |
+
+Perceived time-to-first-audio therefore went 3009ms -> 1265ms across the
+whole investigation: TTS via the vLLM backend, and the VAD window halved.
+That is at the edge of the 800-1200ms band commercial voice agents target,
+against roughly 600ms at the fast end of that market.
+
+Cold start is unchanged and still disqualifying for scale-to-zero: the first
+turn after a pod comes up measured 12.9s, almost all of it the vLLM worker's
+compile.
+
+One caveat on the harness: the RMS join-discontinuity proxy it reports is
+uninformative, because chunk boundaries land in near-silence and the ratio
+divides by ~0. It says nothing about audibility either way.
+
+**A design assumption this disproved.** `session.py` synthesises per
+sentence so TTS for sentence 1 can overlap the LLM generating sentence 2.
+Every reply across all 22 turns was a *single sentence*, so
+`llm_to_sentence_ms` (194ms) is essentially the whole decode
+(`llm_decode_ms`, 184ms) and the pipelining never engages. It still helps on
+long answers, but it cannot be counted on to hide TTS latency — only
+sub-sentence emission does that.
+
+Reproduce with `scripts/test_streaming_client.py --turns N --timings-json`.
+
+## API keys (deployments without an upstream auth edge)
+
+Everything above describes the bare-metal instance, where Caddy authenticates
+and the gateway trusts it. In the container deployments there is no Caddy, so
+the gateway checks credentials itself — see `streaming_gateway/auth.py`.
+
+**It refuses to start with no credentials configured.** The earlier behavior
+was to accept every connection when `GATEWAY_AUTH_TOKEN` was unset, which
+turned one missing environment variable into an open WebSocket endpoint with
+nothing in the logs to indicate it. Running unauthenticated is still possible
+— it is correct when something upstream already authenticates — but it now has
+to be said out loud with `GATEWAY_ALLOW_ANONYMOUS=1`.
+
+**Prefer named API keys over the shared token.** Mint one per client:
+
+```bash
+python3 -m streaming_gateway.auth --new alice
+```
+
+That prints the key to hand the client (once — it is not recoverable) and the
+entry for the gateway's environment:
+
+```
+GATEWAY_API_KEYS=a7401936:af1e7cac...b533:alice
+```
+
+Only the SHA-256 is stored, so the environment never holds a usable
+credential. Comma-separate further keys; revoke one by deleting its entry and
+redeploying. Clients authenticate exactly as before:
+
+```
+Authorization: Bearer sc_a7401936_e5SFd0g-...
+```
+
+Three things this buys that a single shared token cannot:
+
+- **revocation** — drop one client without rotating the credential every other
+  client is using.
+- **attribution** — log lines name the client (`session opened for alice
+  (a7401936)`) instead of "someone holding the token".
+- **per-key limits** — `GATEWAY_MAX_SESSIONS_PER_KEY` (default 2) caps each
+  client separately. The global `GATEWAY_MAX_SESSIONS` protects the GPU from
+  the fleet as a whole but cannot stop one client taking every slot, and a cap
+  per client is only expressible once connections have an identity.
+
+`GATEWAY_AUTH_TOKEN` still works and can coexist with keys, so nothing about
+the bare-metal deployment has to change.
+
+**Send keys in the header, not the URL.** `?token=` is still accepted because
+a browser's `WebSocket` API cannot set headers, but a credential in a query
+string ends up in proxy access logs. For service-to-service clients — the only
+kind here today — always use `Authorization: Bearer`.
+
 **Why Triton itself stays internal-only.** Triton's HTTP/gRPC/metrics ports
 (18000/18001/18002) are not exposed externally, and that's deliberate, not
 an oversight: this gateway already gives an external caller everything

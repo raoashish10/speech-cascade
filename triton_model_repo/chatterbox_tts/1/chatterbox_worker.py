@@ -43,7 +43,12 @@ import soundfile as sf
 import torch
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-REF_AUDIO = sys.argv[1]
+# Optional. chatterbox-turbo ships a built-in voice (conds.pt, one of the
+# files ChatterboxTurboTTS.from_pretrained() pulls from the Hub), and
+# from_local() loads it into self.conds automatically when present. So a
+# reference clip is only needed to override that default with a specific
+# cloned voice -- see the startup logic below.
+REF_AUDIO = sys.argv[1] if len(sys.argv) > 1 else ""
 
 PROTO = "@@PROTO@@"
 
@@ -108,9 +113,42 @@ if _PROFILE_STEPS > 0:
     )
 
 model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+
 # Embed the reference voice once; subsequent generate() calls with no
 # audio_prompt_path reuse this cached conditioning (see module docstring).
-model.prepare_conditionals(REF_AUDIO)
+#
+# Falling back to the built-in voice rather than requiring a clip is
+# deliberate. prepare_conditionals() used to be called unconditionally on a
+# path that is a DEPLOYMENT ARTIFACT -- not in this repo, not in the image --
+# so a container started without one got as far as loading the whole model
+# and then died, taking chatterbox_tts to UNAVAILABLE. Confirmed on a
+# Runpod pod from the published image: three models READY, this one not.
+# chatterbox-turbo ships conds.pt for exactly this case, so the default
+# voice costs nothing and makes the image self-sufficient.
+#
+# A configured clip still wins, so deployments that set ref_audio_path keep
+# the voice they had. Note prepare_conditionals() asserts the clip is longer
+# than 5 seconds; a shorter one is a hard failure, not a fallback, because
+# silently ignoring a clip someone deliberately configured would be worse
+# than refusing to start.
+if REF_AUDIO and os.path.exists(REF_AUDIO):
+    model.prepare_conditionals(REF_AUDIO)
+    print(f"[voice] cloned from reference clip: {REF_AUDIO}", file=sys.stderr, flush=True)
+elif REF_AUDIO:
+    raise SystemExit(
+        f"ref_audio_path is set to {REF_AUDIO!r} but that file does not exist. "
+        "Leave it empty to use chatterbox's built-in voice, or mount the clip."
+    )
+else:
+    if model.conds is None:
+        raise SystemExit(
+            "No ref_audio_path configured and this checkpoint has no built-in "
+            "conds.pt, so there is no voice to speak with. Supply a reference "
+            "clip longer than 5 seconds via ref_audio_path."
+        )
+    print("[voice] using chatterbox's built-in voice (no ref_audio_path set)",
+          file=sys.stderr, flush=True)
+
 reply("WORKER_READY")
 
 for line in sys.stdin:
@@ -123,19 +161,35 @@ for line in sys.stdin:
             raise ValueError(f"expected a non-empty JSON array of texts, got {line!r}")
 
         t0 = time.time()
-        # ChatterboxTurboTTS.generate_batch() (chatterbox/tts_turbo.py)
-        # builds no autograd graph on purpose -- it's inference-only -- but
-        # never wraps itself in torch.no_grad()/inference_mode(), so PyTorch
+        # The installed chatterbox-tts==0.1.7 (PyPI) release's ChatterboxTurboTTS
+        # exposes only a single-item generate(text, ...) -- no generate_batch,
+        # no use_cuda_graph -- unlike what an earlier revision of this worker
+        # assumed (whatever venv that was validated against had a patched/
+        # forked build with those extras; the public package doesn't). Loops
+        # single-item generate() calls instead: strictly more "unaccelerated"
+        # than a hypothetical batched-eager path anyway, which is the whole
+        # point of this backend for the soak-test comparison (see
+        # chatterbox_tts/1/model.py's CHATTERBOX_BACKEND comment).
+        #
+        # generate() builds no autograd graph on purpose -- it's inference-only --
+        # but never wraps itself in torch.no_grad()/inference_mode(), so PyTorch
         # still tracks every intermediate tensor's grad-fn through the T3
-        # backbone and S3Gen vocoder by default. Measured live (docs/
-        # chatterbox-host-ram-leak.md) for the old single-item generate():
-        # host RSS grows ~3.6MB/request, unbounded, with no plateau across
-        # 200+ requests, inside generate() specifically. Wrapping just this
-        # call in inference_mode() cuts steady-state growth to ~0.1MB/request
-        # and it plateaus within ~100 requests, instead of growing forever --
-        # same reasoning applies here, just per-batch instead of per-item.
-        with torch.inference_mode(), nvtx_range("chatterbox.generate_batch"):
-            wavs = model.generate_batch(texts, use_cuda_graph=_USE_CUDA_GRAPH)
+        # backbone, S3Gen vocoder, AND the internal watermarker call by
+        # default. Measured live (docs/chatterbox-host-ram-leak.md, and
+        # independently rediscovered in chatterbox_worker_vllm.py's own fix):
+        # host RSS grows unbounded per request without this wrapper. Wrapping
+        # the whole loop in inference_mode() covers every one of those calls
+        # (thread-local context, inherited by everything generate() calls
+        # internally) and cuts steady-state growth to a small, plateauing
+        # amount instead of growing forever.
+        wavs = []
+        with torch.inference_mode(), nvtx_range("chatterbox.generate"):
+            for text in texts:
+                try:
+                    wav = model.generate(text)
+                    wavs.append(wav.squeeze(0).detach().cpu().numpy())
+                except Exception:
+                    wavs.append(None)
         elapsed = time.time() - t0
 
         results = []

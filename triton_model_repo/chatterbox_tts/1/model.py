@@ -72,7 +72,21 @@ _BACKEND = os.environ.get("CHATTERBOX_BACKEND", "vllm")
 if _BACKEND == "vllm":
     CHATTERBOX_PYTHON = "/venv/vllm/bin/python3"
     WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker_vllm.py")
-    CHATTERBOX_NPP_LIB = None  # vLLM's own nvidia-*-cu12 wheels are self-contained; no torchcodec dependency here
+    # Instance-specific quirk (this deployment, not upstream): this base image
+    # ships a system-wide libcudnn9 (9.10.2, predates this deployment) at
+    # /usr/lib/x86_64-linux-gnu/libcudnn.so.9. With LD_LIBRARY_PATH unset,
+    # the dynamic linker's default cache resolves libcudnn.so.9 there instead
+    # of vLLM's own bundled, newer cuDNN (torch's cudnn backend then raises
+    # "cuDNN version incompatibility: PyTorch was compiled against (9,20,0)
+    # but found runtime version (9,10,2)" the moment ChatterboxTurboTTS's
+    # voice-encoder LSTM calls flatten_parameters()). Point LD_LIBRARY_PATH
+    # at vLLM's own venv-bundled cudnn/cublas so they take priority over the
+    # system copy -- same pattern the pytorch backend below already uses for
+    # its own NPP dependency, just a different library.
+    CHATTERBOX_WORKER_LD_LIBRARY_PATH = (
+        "/venv/vllm/lib/python3.12/site-packages/nvidia/cudnn/lib:"
+        "/venv/vllm/lib/python3.12/site-packages/nvidia/cublas/lib"
+    )
 else:
     CHATTERBOX_PYTHON = "/venv/chatterbox/bin/python3"
     WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "chatterbox_worker.py")
@@ -82,7 +96,7 @@ else:
     # /venv/main's TensorRT-LLM libs) -- it needs its own venv's NPP library
     # path for torchcodec's audio-save dependency. Every turn's generation
     # would succeed while the final save silently failed if this were wrong.
-    CHATTERBOX_NPP_LIB = "/venv/chatterbox/lib/python3.12/site-packages/nvidia/npp/lib"
+    CHATTERBOX_WORKER_LD_LIBRARY_PATH = "/venv/chatterbox/lib/python3.12/site-packages/nvidia/npp/lib"
 PROTO = "@@PROTO@@"
 
 
@@ -102,7 +116,12 @@ class TritonPythonModel:
     def initialize(self, args):
         model_config = json.loads(args["model_config"])
         params = model_config.get("parameters", {})
-        ref_audio_path = params["ref_audio_path"]["string_value"]
+        # Optional: chatterbox-turbo ships a built-in voice (conds.pt), so an
+        # unset or empty ref_audio_path means "use the default voice" rather
+        # than a failure. This used to be params["ref_audio_path"], which made
+        # a deployment artifact that is in neither this repo nor the image a
+        # hard startup requirement -- see chatterbox_worker.py's own comment.
+        ref_audio_path = params.get("ref_audio_path", {}).get("string_value", "")
 
         # Strip PYTHONHOME/PYTHONPATH: Triton's supervisor script sets these
         # globally for /venv/main (see deploy/supervisor/speech-cascade-triton.sh),
@@ -116,10 +135,20 @@ class TritonPythonModel:
         worker_env = dict(os.environ)
         worker_env.pop("PYTHONHOME", None)
         worker_env.pop("PYTHONPATH", None)
-        if CHATTERBOX_NPP_LIB is not None:
-            worker_env["LD_LIBRARY_PATH"] = CHATTERBOX_NPP_LIB
+        if CHATTERBOX_WORKER_LD_LIBRARY_PATH is not None:
+            worker_env["LD_LIBRARY_PATH"] = CHATTERBOX_WORKER_LD_LIBRARY_PATH
         else:
             worker_env.pop("LD_LIBRARY_PATH", None)
+
+        # The worker venv's bin/ must be on PATH, not just its python. vLLM's
+        # torch.compile backend shells out to `ninja`, which pip installs as a
+        # console script inside the venv -- without this the worker gets all
+        # the way through engine init and CUDA graph capture and then dies
+        # with "FileNotFoundError: [Errno 2] No such file or directory:
+        # 'ninja'". Confirmed on a GPU pod; harmless for the pytorch backend,
+        # which needs nothing off PATH.
+        venv_bin = os.path.dirname(CHATTERBOX_PYTHON)
+        worker_env["PATH"] = venv_bin + os.pathsep + worker_env.get("PATH", "")
 
         worker_args = [CHATTERBOX_PYTHON, WORKER_SCRIPT, ref_audio_path]
         if _BACKEND == "vllm":

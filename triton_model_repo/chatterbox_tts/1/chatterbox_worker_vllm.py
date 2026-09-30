@@ -57,7 +57,27 @@ from chatterbox.tts_turbo import ChatterboxTurboTTS
 from chatterbox.models.s3gen.const import S3GEN_SIL
 
 model = ChatterboxTurboTTS.from_pretrained(device="cuda")
-model.prepare_conditionals(REF_AUDIO)
+
+# Same ref-audio handling as chatterbox_worker.py -- see its comment for why.
+# In short: chatterbox-turbo ships a built-in voice (conds.pt), so a clip is
+# needed to OVERRIDE the default, never to have one, and requiring it turned a
+# deployment artifact into a hard startup dependency.
+if REF_AUDIO and os.path.exists(REF_AUDIO):
+    model.prepare_conditionals(REF_AUDIO)
+    print(f"[voice] cloned from reference clip: {REF_AUDIO}", file=sys.stderr, flush=True)
+elif REF_AUDIO:
+    raise SystemExit(
+        f"ref_audio_path is set to {REF_AUDIO!r} but that file does not exist. "
+        "Leave it empty to use chatterbox's built-in voice, or mount the clip."
+    )
+else:
+    if model.conds is None:
+        raise SystemExit(
+            "No ref_audio_path configured and this checkpoint has no built-in "
+            "conds.pt, so there is no voice to speak with."
+        )
+    print("[voice] using chatterbox's built-in voice (no ref_audio_path set)",
+          file=sys.stderr, flush=True)
 
 # Free the redundant GPT2 backbone -- vLLM loads its own copy of the same
 # weights below, and prepare_input_embeds() only touches cond_enc/text_emb/
@@ -129,7 +149,25 @@ for line in sys.stdin:
                         speech_tokens=speech_tokens, ref_dict=model.conds.gen, n_cfm_timesteps=2,
                     )
                 wav = wav.squeeze(0).detach().cpu().numpy()
-                watermarked_wav = model.watermarker.apply_watermark(wav, sample_rate=model.sr)
+                # Host-RAM leak fix (found via this soak test -- see
+                # docs/accelerated-chatterbox-vllm-fresh-deploy-and-soak-test.md):
+                # PerthImplicitWatermarker.apply_watermark() defaults to
+                # device="cpu" and runs a real nn.Module forward pass
+                # (self.perth_net.encoder(...)) with no torch.no_grad()/
+                # inference_mode() of its own. Called here outside any such
+                # context (unlike every other tensor op in this file), it
+                # built a full CPU-resident autograd graph on every single
+                # request -- reclaimable only by Python's cyclic GC, not
+                # plain refcounting, which under sustained load couldn't
+                # keep pace with the allocation rate. Measured: ~5.4-5.5 MB
+                # of host RAM leaked per request, constant across
+                # concurrency 1 and 4, that drove this container from a
+                # healthy baseline to its actual ~45GiB cgroup ceiling
+                # within about 25 minutes of sustained load. GPU memory
+                # stayed completely flat throughout -- consistent with this
+                # being a host-only (CPU autograd), not GPU, leak.
+                with torch.inference_mode():
+                    watermarked_wav = model.watermarker.apply_watermark(wav, sample_rate=model.sr)
 
                 fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="chatterbox_")
                 os.close(fd)

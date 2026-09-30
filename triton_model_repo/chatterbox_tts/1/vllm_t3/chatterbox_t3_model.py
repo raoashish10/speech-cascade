@@ -29,6 +29,11 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from configuration_chatterbox import ChatterboxTurboConfig
+from weight_mapping import (
+    EXPECTED_UNFILLED_PARAMS,
+    EXPECTED_UNUSED_PREFIXES,
+    ORIG_TO_NEW_PREFIX,
+)
 
 SPEECH_VOCAB_SIZE = 6561  # excludes SOS/EOS
 EOS_TOKEN = 6562
@@ -62,7 +67,16 @@ class ChatterboxTurboT3ForGeneration(nn.Module):
 
         self.text_emb = nn.Embedding(config.vocab_size, hidden_size)
         self.speech_emb = nn.Embedding(config.speech_vocab_size, hidden_size)
-        self.speech_head = ParallelLMHead(config.speech_vocab_size, hidden_size)
+        # bias=True is load-bearing. ParallelLMHead defaults to bias=False and
+        # then does register_parameter("bias", None), so the module has no
+        # `bias` entry in named_parameters() -- and load_weights() below skips
+        # any checkpoint key with no matching parameter. The real checkpoint
+        # DOES carry speech_head.bias (shape [6563], confirmed by reading
+        # t3_turbo_v1.safetensors' header), matching the reference
+        # implementation's nn.Linear speech head. Without this the bias is
+        # silently dropped and every speech-token logit is off by a
+        # per-token constant: the model loads, runs, and sounds wrong.
+        self.speech_head = ParallelLMHead(config.speech_vocab_size, hidden_size, bias=True)
         self.logits_processor = LogitsProcessor(config.speech_vocab_size)
 
         self.cond_enc_spkr_enc = nn.Linear(config.speaker_embed_size, hidden_size)
@@ -93,28 +107,41 @@ class ChatterboxTurboT3ForGeneration(nn.Module):
             return None
         return logits.masked_fill(~self._speech_allowed_mask, float("-inf"))
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "tfmr.": "model.",
-            "text_emb.": "text_emb.",
-            "speech_emb.": "speech_emb.",
-            "speech_head.": "speech_head.",
-            "cond_enc.spkr_enc.": "cond_enc_spkr_enc.",  # FIX: real checkpoint key, not speaker_proj
-        }
-    )
+    # Single source of truth, in a module with no vLLM imports so it can be
+    # unit-tested against the real checkpoint's key list without a GPU --
+    # see weight_mapping.py for why that matters.
+    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix=dict(ORIG_TO_NEW_PREFIX))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load T3 weights, refusing to half-load.
+
+        The original version of this method silently `continue`d past any key
+        with no matching parameter. That is the worst possible failure mode
+        here: an unmapped prefix leaves a module randomly initialized, and the
+        model then loads, runs, and produces confident nonsense rather than
+        raising. The upstream PR this was adapted from had exactly that bug
+        (cond_enc.speaker_proj vs the real cond_enc.spkr_enc), and the
+        ParallelLMHead bias above was a second instance of it.
+
+        So both directions are now checked: every checkpoint key must be
+        consumed (or be explicitly expected-unused), and every parameter must
+        be filled. Failing loudly on an unrecognised checkpoint is much
+        cheaper than shipping a model that merely sounds slightly off.
+        """
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        skipped: list[str] = []
         for name, loaded_weight in weights:
             if ".attn.bias" in name or ".attn.masked_bias" in name:
-                continue
+                continue  # HF GPT2 causal-mask buffers, not weights
             mapped_name = name
             for old_prefix, new_prefix in self.hf_to_vllm_mapper.orig_to_new_prefix.items():
                 if name.startswith(old_prefix):
                     mapped_name = new_prefix + name[len(old_prefix):]
                     break
             if mapped_name not in params_dict:
+                if not name.startswith(EXPECTED_UNUSED_PREFIXES):
+                    skipped.append(f"{name} -> {mapped_name}")
                 continue
             param = params_dict[mapped_name]
             for conv1d_name in ["c_attn", "c_proj", "c_fc"]:
@@ -127,4 +154,26 @@ class ChatterboxTurboT3ForGeneration(nn.Module):
             else:
                 param.data.copy_(loaded_weight)
             loaded_params.add(mapped_name)
+
+        if skipped:
+            raise ValueError(
+                f"{len(skipped)} checkpoint tensor(s) matched no parameter in "
+                f"{type(self).__name__} and would have been silently dropped: "
+                f"{skipped[:8]}{' ...' if len(skipped) > 8 else ''}. Either "
+                "hf_to_vllm_mapper is wrong for this checkpoint, or the module "
+                "is missing something the checkpoint carries (e.g. a bias). Do "
+                "not 'fix' this by widening EXPECTED_UNUSED_PREFIXES without "
+                "establishing that the weight really is unused."
+            )
+        unfilled = sorted(
+            set(params_dict) - loaded_params - set(EXPECTED_UNFILLED_PARAMS)
+        )
+        if unfilled:
+            raise ValueError(
+                f"{len(unfilled)} parameter(s) in {type(self).__name__} got no "
+                f"weight and would be left randomly initialized: "
+                f"{unfilled[:8]}{' ...' if len(unfilled) > 8 else ''}. The "
+                "model would still run and would still emit audio; it would "
+                "just be wrong."
+            )
         return loaded_params

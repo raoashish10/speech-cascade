@@ -8,10 +8,16 @@ GPU-accelerated.
 
 - An NVIDIA GPU with enough VRAM to hold all four models concurrently
   (tested on a 16GB card).
-- CUDA 12.8+ and a matching driver.
-- Runs bare-metal (no Docker) in this deployment; see `deploy/REBUILD.md`
-  for the environment fixes that requires on a plain Ubuntu 24.04 base
-  image, and `.gitignore`/`deploy/REBUILD.md` for where model weights and
+- CUDA 12.8+ and a matching driver — or Docker + `nvidia-container-toolkit`.
+  [`docker/`](docker/README.md) is a containerized alternative to the
+  bare-metal deployment, **verified end-to-end on a real GPU** (Runpod pod,
+  RTX PRO 4500 Blackwell): all four models reach Triton state `READY` and
+  the full `voice_pipeline` ensemble round-trips speech -> ASR -> LLM -> TTS
+  -> speech. See that directory's README for build status and what's still
+  open there.
+- Runs either bare-metal (see `deploy/REBUILD.md` for the environment fixes
+  that requires on a plain Ubuntu 24.04 base image) or via the Docker images
+  above; `.gitignore`/`deploy/REBUILD.md` cover where model weights and
   compiled engines live (they're not part of this git repo).
 
 ## Architecture

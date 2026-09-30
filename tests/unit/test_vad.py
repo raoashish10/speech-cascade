@@ -17,6 +17,7 @@ speech model; a short real speech clip does. See
 tests/fixtures/README.md for regeneration instructions.
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -76,7 +77,7 @@ def test_start_event_lands_near_actual_speech_onset():
 
 def test_end_event_lands_after_min_silence_duration():
     """The fixture appends 1.2s of trailing silence after speech, comfortably
-    longer than the default min_silence_duration_ms (800ms), so the end
+    longer than the default min_silence_duration_ms (400ms), so the end
     event must fire only after speech actually stops, not during it."""
     audio = _load_fixture()
     vad = UtteranceVAD()
@@ -120,3 +121,30 @@ def test_process_bytes_handles_multi_frame_chunks():
     big_chunk = FRAME_SAMPLES * 8  # feed 8 native frames at a time
     events = _feed(vad, audio, chunk_samples=big_chunk)
     assert [e for _, e in events] == ["start", "end"]
+
+
+def test_default_silence_window_is_the_halved_value():
+    """800 -> 400ms. This lands one-for-one on perceived time-to-first-audio
+    (see streaming_gateway/timings.py), so the default is load-bearing rather
+    than a tuning detail, and a silent change to it would move every latency
+    number this project reports."""
+    assert UtteranceVAD().min_silence_duration_ms == 400
+
+
+def test_the_silence_window_is_overridable_without_a_rebuild():
+    """The right value is a property of the speakers, not of the code: a
+    deployment hearing truncated turns needs to raise it, and should not need
+    a new image to do so."""
+    assert UtteranceVAD(min_silence_duration_ms=800).min_silence_duration_ms == 800
+
+    import importlib
+
+    import streaming_gateway.vad as vad_module
+    os.environ["GATEWAY_VAD_SILENCE_MS"] = "650"
+    try:
+        importlib.reload(vad_module)
+        assert vad_module.DEFAULT_MIN_SILENCE_MS == 650
+        assert vad_module.UtteranceVAD().min_silence_duration_ms == 650
+    finally:
+        del os.environ["GATEWAY_VAD_SILENCE_MS"]
+        importlib.reload(vad_module)
