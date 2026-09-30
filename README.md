@@ -28,26 +28,14 @@ GPU-accelerated.
   <img alt="voice_pipeline chains whisper_asr, qwen_llm, and chatterbox_tts inside one Triton BLS call, adding a batch dimension before calling whisper_asr and chatterbox_tts and stripping it from their replies, while qwen_llm (unbatched, streaming) takes and returns no batch dimension at all." src="assets/architecture-light.svg">
 </picture>
 
-| Model | Backend | What it wraps | Input -> Output |
-|---|---|---|---|
-| `qwen_llm` | python | Qwen3-8B-NVFP4, loaded via TensorRT-LLM's `LLM` API (classic backend, JIT graph build at load time — not an AOT-compiled `.engine`). Decoupled/streaming (`generate_async`, one per request on a bounded thread pool), with an admission gate (`admission.py`) that rejects fast once too many requests are in flight/queued instead of queueing unboundedly | `PROMPT` (string) -> `GENERATED_TEXT` (string), streamed |
-| `whisper_asr` | python | `WhisperTRTLLM` (vendored TensorRT-LLM Whisper runtime under `triton_model_repo/whisper_asr/1/trtllm_whisper/`, compiled encoder+decoder engines — see `deploy/REBUILD.md` 4c) | `AUDIO_SAMPLES` (float32[]) + optional `SAMPLE_RATE` (int32) -> `TRANSCRIPT` (string) |
-| `chatterbox_tts` | python | ResembleAI's Chatterbox-Turbo (`ChatterboxTurboTTS`), run as a subprocess in its own isolated venv (`/venv/chatterbox`). T3's autoregressive decode is batched across concurrent requests and served via vLLM by default (`CHATTERBOX_BACKEND=vllm`; `pytorch` kept as an instant rollback); S3Gen's flow-matching vocoder still runs per-item in plain PyTorch, unbatched — see `deploy/PROFILING.md` and the `config.pbtxt` comments for why | `TEXT` (string) + optional `VOICE` (string, currently ignored — single fixed reference voice) -> `AUDIO_SAMPLES` (float32[]) + `SAMPLE_RATE` (int32) |
-| `voice_pipeline` | python | Calls the three above via Triton's in-process BLS API (`pb_utils.InferenceRequest`), turning any downstream admission rejection into a clean per-request error instead of a crash | `AUDIO_SAMPLES` + optional `SAMPLE_RATE`/`VOICE` -> `TRANSCRIPT`, `GENERATED_TEXT`, `AUDIO_SAMPLES`, `SAMPLE_RATE` |
+| Model | Runtime | Input -> Output |
+|---|---|---|
+| `whisper_asr` | TensorRT-LLM Whisper (compiled encoder + decoder) | `AUDIO_SAMPLES` -> `TRANSCRIPT` |
+| `qwen_llm` | Qwen3-8B-NVFP4 on TensorRT-LLM, streaming | `PROMPT` -> `GENERATED_TEXT` |
+| `chatterbox_tts` | Chatterbox-Turbo (vLLM decode + PyTorch vocoder) | `TEXT` -> `AUDIO_SAMPLES` |
+| `voice_pipeline` | Triton BLS orchestrator, no weights of its own | audio in -> transcript, reply text, audio out |
 
-- The first three use Triton's **python backend** as a thin wrapper around a
-  Python-level runtime (TensorRT-LLM's `LLM` API, vendored TensorRT-LLM
-  Whisper runtime, a subprocess running ResembleAI's `ChatterboxTurboTTS`)
-  rather than Triton's native `onnxruntime`/`tensorrt` backends directly.
-- `voice_pipeline` is pure orchestration — no model weights of its own, no
-  GPU instance needed — chaining the other three into one audio-in/audio-out
-  request/response. That's what "Triton BLS" means: business-logic-scripting
-  models, either wrapping a runtime or orchestrating other models.
-- One gotcha when working on `voice_pipeline`: it has to manually add a
-  batch dimension to every tensor it sends to the other three models, and
-  manually strip it back off every tensor it gets back — Triton doesn't do
-  this for you here. See the comments in
-  `triton_model_repo/voice_pipeline/1/model.py` for details.
+All four are Triton python-backend models.
 
 ## Project layout
 
@@ -80,10 +68,36 @@ target rather than copied.
 
 ## Running the service
 
+### Docker
+
+```bash
+cp .env.example .env   # fill in GATEWAY_AUTH_TOKEN/GATEWAY_API_KEYS at minimum
+docker compose pull    # ghcr.io/raoashish10/speech-cascade-{triton,gateway}:latest
+docker compose up -d
+```
+
+Pulls the published, GPU-verified images rather than building locally (see
+[`docker/README.md`](docker/README.md)'s "Build status" table). Requires a
+host with an NVIDIA GPU and `nvidia-container-toolkit`. `triton` bootstraps
+its own weights/engines from the Hugging Face Hub on first start if nothing
+is mounted — see `docker/README.md`'s "Quick start" for timing and the S3
+alternative. To build the images locally instead (e.g. while developing
+either Dockerfile):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+### Bare metal
+
 ```bash
 supervisorctl status speech-cascade-triton
 supervisorctl restart speech-cascade-triton   # full restart, ~5-6 min (LLM import + engine load)
 ```
+
+See `deploy/REBUILD.md` for the full fresh-instance runbook this assumes.
+
+### Either way
 
 The server runs in **explicit model control mode**: all four models load at
 startup, and individual models can be reloaded without restarting the
@@ -94,8 +108,11 @@ curl -X POST http://localhost:18000/v2/repository/models/whisper_asr/load -d '{}
 curl -X POST http://localhost:18000/v2/repository/index   # list loaded models + state
 ```
 
-Triton itself binds to `127.0.0.1` only (18000 HTTP / 18001 GRPC / 18002
-metrics) and is never exposed externally. The streaming gateway
+Triton itself (18000 HTTP / 18001 GRPC / 18002 metrics) is never exposed
+externally: bare metal binds it to `127.0.0.1`, and Docker keeps it off the
+host entirely (`expose`, not `ports`), so under Docker run these commands
+inside the container instead — e.g. `docker compose exec triton curl -X POST
+http://localhost:18000/v2/repository/index`. The streaming gateway
 (`streaming_gateway/`) is the sanctioned external surface — it gives a
 client everything Triton would (transcript, LLM text, TTS audio) without
 handing them raw access to run/reload models. See
