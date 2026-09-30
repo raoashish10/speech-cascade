@@ -411,7 +411,18 @@ voice should not quietly end up on the default one.
 
 ```bash
 cp .env.example .env   # fill in S3 creds (or skip and populate the volume yourself) + GATEWAY_AUTH_TOKEN
-docker compose up --build
+docker compose pull
+docker compose up -d
+```
+
+That pulls the published images from the "Build status" table above rather
+than building locally -- the triton image in particular needs ~60GB free
+disk to build (see "Building the triton image" below), so pulling the
+already-verified one is the default. To build locally instead (e.g. while
+iterating on either Dockerfile), use the override file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 Requires a host with an NVIDIA GPU and `nvidia-container-toolkit` installed
