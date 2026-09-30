@@ -23,6 +23,60 @@ Clients connect through the **streaming gateway** (`streaming_gateway/`), a
 WebSocket service in front of Triton that handles auth, voice-activity
 detection, and streaming responses. Triton itself is never exposed directly.
 
+## Results
+
+### Optimized vs. Hugging Face baseline
+
+The same three models, first run as plain Hugging Face / PyTorch
+implementations, then with every optimization in place: TensorRT-LLM
+engines for Whisper and Qwen3-8B (NVFP4), vLLM for Chatterbox's decoder,
+and dynamic batching. Both runs used the same RTX 5070 Ti (16GB) and the
+same Grafana dashboard. The figures are means over each run.
+
+| Metric | HF baseline | Optimized | Change |
+|---|---:|---:|---:|
+| Pipeline compute per request | 12.9 s | 791 ms | **16x faster** |
+| Pipeline queue time | 5.20 s | 255 ms | **20x shorter** |
+| TTS throughput | 0.15 req/s | 1.33 req/s | **8.6x** |
+| ASR throughput | 0.15 req/s | 1.33 req/s | **8.8x** |
+| LLM throughput | 0.22 req/s | 3.31 req/s | **15x** |
+| TTS latency | 2.16 s (p50) | 649 ms (p99) | — |
+| ASR latency | 130 ms (p50) | 43.7 ms (p99) | — |
+| Failed requests | 0 | 0 | |
+
+The optimized p99 latencies sit below the baseline's p50 medians.
+
+| HF baseline | Optimized |
+|---|---|
+| ![Grafana dashboard, Hugging Face baseline](assets/grafana-baseline-hf.png) | ![Grafana dashboard, optimized stack](assets/grafana-optimized.png) |
+
+### Time to first audio
+
+How long a user waits after they stop speaking until they hear the reply
+begin. Measured through the public gateway on the Runpod deployment (RTX
+PRO 4500), one warm session, median of 6 turns:
+
+| Stage | Median |
+|---|---:|
+| Speech recognition (ASR) | 76 ms |
+| LLM time to first token | 18 ms |
+| First audio from TTS | 579 ms |
+| **Time to first audio, from end of speech** | **1265 ms** |
+
+That total includes a 400ms silence window the gateway waits for before
+deciding the speaker has finished (tunable via `GATEWAY_VAD_SILENCE_MS`). It began at 3009ms; most of the
+2.4x gain came from moving Chatterbox's decoder onto vLLM. The LLM then
+streams at 9.6ms per token.
+
+### Reliability
+
+On the RTX 5070 Ti, 16 simultaneous pipelines from 4 independent clients
+completed 160/160 requests with no failures. A 30-minute, 5,600-request
+soak test exposed a host-memory leak in the TTS worker (about 3.6MB per
+request). After a one-line fix, a 1,840-request run grew memory by only
+27MB in total, with zero failures. Details are in
+[`docs/concurrent-stress-campaign.md`](docs/concurrent-stress-campaign.md).
+
 ## Quick start
 
 Requires a Linux host with an NVIDIA GPU (16GB+ VRAM), Docker, and
