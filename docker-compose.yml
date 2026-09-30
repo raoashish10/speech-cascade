@@ -1,23 +1,33 @@
 # Two services, matching the two isolated processes README.md already
 # describes (Triton + the streaming gateway) -- just containerized and
 # talking over the Docker network instead of both binding 127.0.0.1 on the
-# same bare-metal box. See docs/DOCKER.md for the full rundown, including
+# same bare-metal box. See docker/README.md for the full rundown, including
 # what this deliberately does NOT replace (a GPU host + nvidia-container-toolkit
-# still has to exist under this).
+# still has to exist under this) and the alternative two-pod Runpod shape
+# that skips Compose entirely.
 #
-# UNVERIFIED end-to-end (no GPU / no Docker-in-Docker in the environment
-# this was written in) -- see docker/triton/Dockerfile's header.
+# Defaults to the PUBLISHED, verified images (docker/README.md's "Build
+# status" table: gateway built by CI, triton built by hand via crane on a
+# GPU pod -- both confirmed working by actually running them). This is
+# deliberate: the triton image needs ~60GB free disk and a real Docker host
+# to build locally (see docker/README.md "Building the triton image"), so
+# defaulting to a local rebuild would force that cost on everyone just to
+# start the service.
+#
+#   docker compose pull && docker compose up -d      # published images (default)
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#                                                      # build locally instead (dev)
 
 services:
   triton:
-    build:
-      context: .
-      dockerfile: docker/triton/Dockerfile
-    image: speech-cascade-triton
+    image: ghcr.io/raoashish10/speech-cascade-triton:${IMAGE_TAG:-latest}
     # Not published to the host on purpose -- reachable only from other
     # containers on this compose network (i.e. `gateway`, by service name
     # `triton`), the same "internal-only" property README.md describes for
-    # the bare-metal deployment's 127.0.0.1-bound ports.
+    # the bare-metal deployment's 127.0.0.1-bound ports. docker/README.md's
+    # "Two-pod deployment on Runpod" section explains why this matters:
+    # Triton itself has no authentication of any kind and relies entirely
+    # on being unreachable.
     expose:
       - "18000"
       - "18001"
@@ -34,8 +44,8 @@ services:
     # provider from the "which provider" discussion (RunPod, SaladCloud,
     # Lambda Labs, ...) either preinstalls on their Docker-native
     # images/templates or documents as a setup step. `count: 1` assumes a
-    # single-GPU host, matching the current RTX 5070 Ti instance -- bump
-    # this (or switch to `device_ids`) for a multi-GPU box.
+    # single-GPU host -- bump this (or switch to `device_ids`) for a
+    # multi-GPU box.
     deploy:
       resources:
         reservations:
@@ -45,21 +55,20 @@ services:
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:18000/v2/health/ready"]
-      # Triton takes ~5-6 minutes to become ready (TensorRT-LLM import +
-      # sequential engine load across all 4 models) -- README.md's
-      # "Managing the service" section gives this same number for the
-      # bare-metal deployment.
+      # Triton takes ~5-6 minutes to become ready once models/ is already
+      # populated (TensorRT-LLM import + sequential engine load across all
+      # 4 models) -- README.md's "Managing the service" section gives this
+      # same number for the bare-metal deployment. On a first start with an
+      # empty inference-data volume, add the entrypoint's from-scratch
+      # bootstrap time on top (~2-3 min, see docker/README.md "Quick start").
       interval: 15s
       timeout: 5s
-      retries: 40
+      retries: 80
       start_period: 60s
     restart: unless-stopped
 
   gateway:
-    build:
-      context: .
-      dockerfile: docker/gateway/Dockerfile
-    image: speech-cascade-gateway
+    image: ghcr.io/raoashish10/speech-cascade-gateway:${IMAGE_TAG:-latest}
     depends_on:
       triton:
         condition: service_healthy
@@ -88,11 +97,10 @@ services:
     restart: unless-stopped
 
 volumes:
-  # Holds models/ (weights + compiled TensorRT engines) -- restored from S3
-  # by the triton container's entrypoint on first boot if S3_BUCKET_URI is
-  # set, or populate it yourself (e.g. `docker compose run --rm triton
-  # bash` and copy files in, or an from-scratch build per
-  # deploy/REBUILD.md section 4). Deliberately a named volume, not baked
-  # into the image -- these are large, GPU-arch-pinned artifacts you don't
-  # want in an image layer.
+  # Holds models/ (weights + compiled TensorRT engines) -- bootstrapped from
+  # the Hugging Face Hub by the triton container's entrypoint on first start
+  # if empty (see docker/README.md "Quick start"), or restored from S3 if
+  # S3_BUCKET_URI is set, or populate it yourself. Deliberately a named
+  # volume, not baked into the image -- these are large, GPU-arch-pinned
+  # artifacts you don't want in an image layer.
   inference-data:

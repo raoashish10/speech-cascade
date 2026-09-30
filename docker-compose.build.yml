@@ -1,0 +1,26 @@
+# Override for docker-compose.yml: build the images locally instead of
+# pulling the published ghcr.io ones. Use when iterating on
+# docker/triton/Dockerfile or docker/gateway/Dockerfile.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+#
+# Building the triton image locally needs an amd64 Linux host with Docker
+# and ~60GB free -- see docker/README.md "Building the triton image" for
+# the full story (why it's not built in CI, the alternative crane-based
+# build for hosts that can't run Docker at all, and known traps).
+#
+# `image:` is inherited from docker-compose.yml, so the result is still
+# tagged as the same ghcr.io reference -- `docker compose push` after
+# building here publishes over the tag docker-compose.yml pulls by default.
+
+services:
+  triton:
+    build:
+      context: .
+      dockerfile: docker/triton/Dockerfile
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
