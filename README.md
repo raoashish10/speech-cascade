@@ -22,6 +22,12 @@ GPU-accelerated.
 
 ## Architecture
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg">
+  <img alt="voice_pipeline chains whisper_asr, qwen_llm, and chatterbox_tts inside one Triton BLS call, adding a batch dimension before calling whisper_asr and chatterbox_tts and stripping it from their replies, while qwen_llm (unbatched, streaming) takes and returns no batch dimension at all." src="assets/architecture-light.svg">
+</picture>
+
 | Model | Backend | What it wraps | Input -> Output |
 |---|---|---|---|
 | `qwen_llm` | python | Qwen3-8B-NVFP4, loaded via TensorRT-LLM's `LLM` API (classic backend, JIT graph build at load time — not an AOT-compiled `.engine`). Decoupled/streaming (`generate_async`, one per request on a bounded thread pool), with an admission gate (`admission.py`) that rejects fast once too many requests are in flight/queued instead of queueing unboundedly | `PROMPT` (string) -> `GENERATED_TEXT` (string), streamed |
