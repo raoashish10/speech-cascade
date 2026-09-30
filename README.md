@@ -64,6 +64,29 @@ curl -s -X POST http://localhost:18000/v2/models/qwen_llm/infer \
 
 For load testing: `python3 scripts/load_test.py --concurrency 4 --total-requests 20`.
 
+## Viewing metrics in Grafana
+
+A pre-built dashboard, **Speech Cascade — Triton Monitoring**, shows
+per-model throughput, failures, queue and compute time, GPU utilization and
+memory, and whether each model is `READY`. Prometheus feeds it by scraping
+Triton every 2 seconds.
+
+Grafana listens on port `13000` of the GPU host, localhost only, so open an
+SSH tunnel and browse to the dashboard:
+
+```bash
+ssh -L 13000:localhost:13000 <gpu-host>
+# then open http://localhost:13000/d/speech-cascade-triton
+```
+
+Viewing needs no login. To edit, sign in as `admin` with the password from
+`GRAFANA_ADMIN_PASSWORD` (default `speechcascade` — set your own).
+
+Grafana and Prometheus currently run as supervisor services in the
+bare-metal deployment only. With Docker, import
+`monitoring/grafana/dashboards/speech-cascade.json` into your own Grafana,
+backed by a Prometheus that scrapes Triton's metrics port (`18002`).
+
 ## Project layout
 
 ```
