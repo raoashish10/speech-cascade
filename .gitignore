@@ -28,8 +28,6 @@ deploy/ansible/inventory.ini
 # Personal Claude Code permission overrides -- not shared with the team.
 .claude/settings.local.json
 
-# Investigation/narrative docs -- archived to S3 instead of git going
-# forward (see docs/README.md and scripts/archive_docs_to_s3.sh). Only the
-# pointer README stays tracked.
-docs/*.md
-!docs/README.md
+# Investigation/narrative docs -- kept out of the repo (archived to S3, see
+# scripts/archive_docs_to_s3.sh).
+docs/
