@@ -13,8 +13,7 @@ instead of inventing flags nobody has actually verified.
 This project deliberately runs bare-metal (no Docker -- this container
 can't do Docker-in-Docker), which is *why* this runbook is long: none of
 this is needed inside NVIDIA's NGC containers, which ship a matched
-toolchain. See the main `README.md`'s "Environment quirks fixed to make
-this run bare-metal" for the full list this runbook builds on.
+toolchain.
 
 ## 0. Layout recap
 
@@ -32,10 +31,11 @@ Two directories, two different persistence stories:
   `speech-cascade-inference/reports/session-report.md`, "The runtime was
   gone").
 
-## 1. Fresh instance: system packages
+## 1. Fresh instance: system packages and environment fixes
 
-All of this is already-validated, copied verbatim from the main
-`README.md`'s "Environment quirks" section (numbered to match):
+None of this is needed inside NVIDIA's NGC containers, which ship a
+consistent, matched toolchain. Building it manually on a bare Ubuntu 24.04
+base image required the following, all already-validated:
 
 ```bash
 # 1. MPI (TensorRT-LLM's executor uses MPI-based worker spawning even for
@@ -44,8 +44,7 @@ apt-get install -y openmpi-bin libopenmpi-dev
 
 # 2. CUDA 13 runtime libraries (the tensorrt-llm wheel pulls CUDA 13
 #    bindings but not the runtime libs) -- install a toolkit-only package,
-#    never the `cuda` metapackage (see the top-level agent guide's CUDA
-#    section: never let apt touch the driver)
+#    never the `cuda` metapackage (never let apt touch the driver)
 apt-get install -y cuda-libraries-13-2 cuda-toolkit-13-2
 
 # 5. Ubuntu 24.04 doesn't ship libssl.so.1.1, which the Triton server
@@ -67,15 +66,22 @@ dpkg-deb -x libssl1.1_1.1.1f-1ubuntu2_amd64.deb extracted/
 #    Triton fails with a deterministic, misleading-looking crash at startup
 #    ("undefined symbol: errorString" in libtritonserver.so, downstream of
 #    a python-backend stub reporting "not healthy" first) that has nothing
-#    to do with whatever model was loading at the time. Full writeup:
-#    docs/qwen-llm-migration.md, section 1.
+#    to do with whatever model was loading at the time.
 apt-get install -y datacenter-gpu-manager-4-cuda13
 ```
 
-Steps 3, 4, 7, 8, 9, 10 in the main README are runtime/environment fixes
-(PYTHONHOME, PATH, LD_LIBRARY_PATH, specific package choices), not one-time
-package installs -- they're already baked into
-`deploy/supervisor/speech-cascade-triton.sh` (see step 6 below).
+Two further fixes are runtime/environment issues, not one-time package
+installs -- baked into `deploy/supervisor/speech-cascade-triton.sh` (see
+step 6 below) rather than run here:
+
+3. **Triton's Python-backend stub resolves the wrong `sys.prefix`,**
+   picking up system Python's stdlib C-extensions instead of the venv's
+   matching build, causing a numpy import crash. Fixed with
+   `PYTHONHOME=/venv/main` in the supervisor script.
+4. **TensorRT-LLM's MPI worker-spawn resolves `python3` via `PATH`,**
+   landing on system Python instead of the venv's, loading
+   ABI-mismatched compiled extensions. Fixed by prepending
+   `/venv/main/bin` to `PATH`.
 
 ## 2. Restore weights, engines, and the Triton binary from S3
 
@@ -97,13 +103,12 @@ letting pip/uv re-resolve latest (that's the whole point of capturing
 these):
 
 ```bash
-# Main serving venv -- tensorrt_llm, torch, onnxruntime-gpu.
+# Main serving venv -- tensorrt_llm, torch.
 # FRAGILE: numpy is pinned <2 (TensorRT-LLM's compiled bindings are built
-# against numpy 1.x; several packages in this list silently upgrade numpy
-# if installed carelessly -- see main README quirk #10). Installing from
-# this frozen list preserves the pin; do not add new packages to this venv
-# without re-checking `python -c "import numpy; print(numpy.__version__)"`
-# afterward.
+# against numpy 1.x; some packages silently upgrade numpy if installed
+# carelessly). Installing from this frozen list preserves the pin; do not
+# add new packages to this venv without re-checking
+# `python -c "import numpy; print(numpy.__version__)"` afterward.
 python3.12 -m venv /venv/main
 /venv/main/bin/pip install -r deploy/requirements-main.txt
 
@@ -256,8 +261,7 @@ references this exact `max_seq_len 114`):
 ```bash
 cd /workspace/tensorrt_llm_repo/examples/models/core/whisper
 
-# whisper-base weights (not large-v3 -- this deployment uses the base
-# model, see main README's model choice)
+# whisper-base weights (not large-v3 -- this deployment uses the base model)
 wget --directory-prefix=assets https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/multilingual.tiktoken
 wget --directory-prefix=assets https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz
 wget --directory-prefix=assets https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt
@@ -312,7 +316,7 @@ for the full record.
 Already done in this repo (`triton_model_repo/*/config.pbtxt` `parameters`
 blocks) -- if you rebuilt an engine to a different path, update the
 matching `engine_dir`/`tokenizer_dir`/`assets_dir`/`model_path` there and
-reload just that model (see main README's "Managing the service" for the
+reload just that model (see main README's "Running the service" for the
 reload API), not the whole server.
 
 ## 6. Install and start supervisor services
