@@ -22,6 +22,12 @@ GPU-accelerated.
 
 ## Architecture
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg">
+  <img alt="voice_pipeline chains whisper_asr, qwen_llm, and chatterbox_tts inside one Triton BLS call, adding a batch dimension before calling whisper_asr and chatterbox_tts and stripping it from their replies, while qwen_llm (unbatched, streaming) takes and returns no batch dimension at all." src="assets/architecture-light.svg">
+</picture>
+
 | Model | Backend | What it wraps | Input -> Output |
 |---|---|---|---|
 | `qwen_llm` | python | Qwen3-8B-NVFP4, loaded via TensorRT-LLM's `LLM` API (classic backend, JIT graph build at load time — not an AOT-compiled `.engine`). Decoupled/streaming (`generate_async`, one per request on a bounded thread pool), with an admission gate (`admission.py`) that rejects fast once too many requests are in flight/queued instead of queueing unboundedly | `PROMPT` (string) -> `GENERATED_TEXT` (string), streamed |
@@ -157,15 +163,3 @@ Systems support) and `scripts/profile_nsys.sh`.
   it does not run in CI: `python -m pytest tests/integration -v`.
 
 See `tests/README.md` for which venv each tier needs.
-
-## Roadmap
-
-- **S3Gen** (the flow-matching vocoder half of `chatterbox_tts`) has no
-  TensorRT/ONNX/compiled acceleration path yet. T3 (the autoregressive
-  half) already moved to vLLM; S3Gen still runs per-item in plain PyTorch.
-- `chatterbox_tts` and `qwen_llm` both stay at `instance_group.count: 1` —
-  replicating either costs a full extra copy of the model on a
-  VRAM-constrained GPU; not yet revisited for the current checkpoints.
-- `whisper_asr`'s compiled TensorRT-LLM engines still use near-default
-  build flags (`reduce_fusion`, `multiple_profiles` disabled) — unexplored
-  optimization headroom.
