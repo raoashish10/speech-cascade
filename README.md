@@ -73,9 +73,10 @@ streams at 9.6ms per token.
 On the RTX 5070 Ti, 16 simultaneous pipelines from 4 independent clients
 completed 160/160 requests with no failures. A 30-minute, 5,600-request
 soak test exposed a host-memory leak in the TTS worker (about 3.6MB per
-request). After a one-line fix, a 1,840-request run grew memory by only
-27MB in total, with zero failures. Details are in
-[`docs/concurrent-stress-campaign.md`](docs/concurrent-stress-campaign.md).
+request). After a one-line fix (running generation under
+`torch.inference_mode()` in
+`triton_model_repo/chatterbox_tts/1/chatterbox_worker.py`), a 1,840-request
+run grew memory by only 27MB in total, with zero failures.
 
 ## Quick start
 
