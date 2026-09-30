@@ -1,182 +1,88 @@
 # Speech Cascade Inference
 
-A voice pipeline (ASR -> LLM -> TTS) served through NVIDIA Triton Inference
-Server: four Triton BLS python-backend models, chained end to end, all
-GPU-accelerated.
-
-## Requirements
-
-- An NVIDIA GPU with enough VRAM to hold all four models concurrently
-  (tested on a 16GB card).
-- CUDA 12.8+ and a matching driver — or Docker + `nvidia-container-toolkit`.
-  [`docker/`](docker/README.md) is a containerized alternative to the
-  bare-metal deployment, **verified end-to-end on a real GPU** (Runpod pod,
-  RTX PRO 4500 Blackwell): all four models reach Triton state `READY` and
-  the full `voice_pipeline` ensemble round-trips speech -> ASR -> LLM -> TTS
-  -> speech. See that directory's README for build status and what's still
-  open there.
-- Runs either bare-metal (see `deploy/REBUILD.md` for the environment fixes
-  that requires on a plain Ubuntu 24.04 base image) or via the Docker images
-  above; `.gitignore`/`deploy/REBUILD.md` cover where model weights and
-  compiled engines live (they're not part of this git repo).
+A real-time voice pipeline — speech in, speech out — served through NVIDIA
+Triton Inference Server. Audio is transcribed (Whisper), answered by an LLM
+(Qwen3-8B), and spoken back (Chatterbox TTS), all GPU-accelerated.
 
 ## Architecture
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg">
-  <img alt="voice_pipeline chains whisper_asr, qwen_llm, and chatterbox_tts inside one Triton BLS call, adding a batch dimension before calling whisper_asr and chatterbox_tts and stripping it from their replies, while qwen_llm (unbatched, streaming) takes and returns no batch dimension at all." src="assets/architecture-light.svg">
+  <img alt="voice_pipeline chains whisper_asr, qwen_llm, and chatterbox_tts inside one Triton call and returns the transcript, reply text, and synthesized audio to the client." src="assets/architecture-light.svg">
 </picture>
 
 | Model | Runtime | Input -> Output |
 |---|---|---|
-| `whisper_asr` | TensorRT-LLM Whisper (compiled encoder + decoder) | `AUDIO_SAMPLES` -> `TRANSCRIPT` |
+| `whisper_asr` | TensorRT-LLM Whisper | `AUDIO_SAMPLES` -> `TRANSCRIPT` |
 | `qwen_llm` | Qwen3-8B-NVFP4 on TensorRT-LLM, streaming | `PROMPT` -> `GENERATED_TEXT` |
-| `chatterbox_tts` | Chatterbox-Turbo (vLLM decode + PyTorch vocoder) | `TEXT` -> `AUDIO_SAMPLES` |
-| `voice_pipeline` | Triton BLS orchestrator, no weights of its own | audio in -> transcript, reply text, audio out |
+| `chatterbox_tts` | Chatterbox-Turbo (vLLM + PyTorch) | `TEXT` -> `AUDIO_SAMPLES` |
+| `voice_pipeline` | Orchestrates the three above | audio in -> transcript, reply, audio out |
 
-All four are Triton python-backend models.
+Clients connect through the **streaming gateway** (`streaming_gateway/`), a
+WebSocket service in front of Triton that handles auth, voice-activity
+detection, and streaming responses. Triton itself is never exposed directly.
+
+## Quick start
+
+Requires a Linux host with an NVIDIA GPU (16GB+ VRAM), Docker, and
+`nvidia-container-toolkit`.
+
+```bash
+cp .env.example .env    # set GATEWAY_API_KEYS (or GATEWAY_AUTH_TOKEN)
+docker compose pull     # pulls ghcr.io/raoashish10/speech-cascade-{triton,gateway}
+docker compose up -d
+```
+
+On first start, the Triton container downloads the model weights and builds
+the engines for your GPU (a few minutes). The gateway then listens on port
+`18010` — connect with `scripts/test_streaming_client.py`.
+
+More detail — deploying on Runpod, building images yourself, startup
+timings — is in [`docker/README.md`](docker/README.md).
+
+### Bare-metal alternative
+
+To run without Docker, follow [`deploy/REBUILD.md`](deploy/REBUILD.md) (or
+automate it with `deploy/ansible/`). The service then runs under supervisor:
+
+```bash
+supervisorctl restart speech-cascade-triton
+```
+
+## Checking it works
+
+```bash
+# Model status (Docker: prefix with `docker compose exec triton`)
+curl -X POST http://localhost:18000/v2/repository/index
+
+# Try the LLM on its own
+curl -s -X POST http://localhost:18000/v2/models/qwen_llm/infer \
+  -H "Content-Type: application/json" \
+  -d '{"inputs":[{"name":"PROMPT","shape":[1,1],"datatype":"BYTES","data":["Hello, my name is"]}]}'
+```
+
+For load testing: `python3 scripts/load_test.py --concurrency 4 --total-requests 20`.
 
 ## Project layout
 
 ```
-triton_model_repo/          Triton model repository (4 models above):
-                             each model's model.py + config.pbtxt
-scripts/                    Standalone validation/quantization/load-testing scripts
-tests/                      pytest suite (tests/unit/, tests/integration/)
-deploy/                     Infra as code: requirements files, supervisor
-                             configs, REBUILD.md, ansible/
-streaming_gateway/          The external-facing WebSocket gateway in front of Triton
-monitoring/                 Grafana dashboards + Prometheus alert rules
-docs/                       A few narrative/investigation docs
-                             (see docs/README.md for the rest of the story)
-.github/workflows/          CI (tests.yml)
+triton_model_repo/   The four Triton models (model.py + config.pbtxt each)
+streaming_gateway/   WebSocket gateway clients connect to
+docker/              Dockerfiles and container deployment guide
+deploy/              Bare-metal setup: runbook, supervisor configs, Ansible
+monitoring/          Grafana dashboard + Prometheus alert rules
+scripts/             Load testing, profiling, and model-build scripts
+tests/               Unit tests (run in CI) and GPU integration tests
 ```
-
-## Setup
-
-Building the model weights and compiled engines this deployment needs, and
-installing the three isolated Python venvs it runs across, is a multi-step
-process specific to the target GPU/TensorRT-LLM version — see
-`deploy/REBUILD.md` for the full runbook (fresh instance -> working
-deployment) and `deploy/README.md` for what's in `deploy/`. Quantizing/
-compiling a TensorRT-LLM engine from a different checkpoint uses the same
-generic `scripts/quantize_fp8.py`/`quantize_nvfp4.py` -> `trtllm-build`
-pipeline; only the resulting `.engine` file is tied to the exact GPU
-architecture and TensorRT-LLM version it was built on, so it's rebuilt per
-target rather than copied.
-
-## Running the service
-
-### Docker
-
-```bash
-cp .env.example .env   # fill in GATEWAY_AUTH_TOKEN/GATEWAY_API_KEYS at minimum
-docker compose pull    # ghcr.io/raoashish10/speech-cascade-{triton,gateway}:latest
-docker compose up -d
-```
-
-Pulls the published, GPU-verified images rather than building locally (see
-[`docker/README.md`](docker/README.md)'s "Build status" table). Requires a
-host with an NVIDIA GPU and `nvidia-container-toolkit`. `triton` bootstraps
-its own weights/engines from the Hugging Face Hub on first start if nothing
-is mounted — see `docker/README.md`'s "Quick start" for timing and the S3
-alternative. To build the images locally instead (e.g. while developing
-either Dockerfile):
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-```
-
-### Bare metal
-
-```bash
-supervisorctl status speech-cascade-triton
-supervisorctl restart speech-cascade-triton   # full restart, ~5-6 min (LLM import + engine load)
-```
-
-See `deploy/REBUILD.md` for the full fresh-instance runbook this assumes.
-
-### Either way
-
-The server runs in **explicit model control mode**: all four models load at
-startup, and individual models can be reloaded without restarting the
-others or paying the LLM's cold-start cost again:
-
-```bash
-curl -X POST http://localhost:18000/v2/repository/models/whisper_asr/load -d '{}'
-curl -X POST http://localhost:18000/v2/repository/index   # list loaded models + state
-```
-
-Triton itself (18000 HTTP / 18001 GRPC / 18002 metrics) is never exposed
-externally: bare metal binds it to `127.0.0.1`, and Docker keeps it off the
-host entirely (`expose`, not `ports`), so under Docker run these commands
-inside the container instead — e.g. `docker compose exec triton curl -X POST
-http://localhost:18000/v2/repository/index`. The streaming gateway
-(`streaming_gateway/`) is the sanctioned external surface — it gives a
-client everything Triton would (transcript, LLM text, TTS audio) without
-handing them raw access to run/reload models. See
-`streaming_gateway/README.md` for how it's exposed and authenticated.
-
-### Testing each stage directly
-
-```bash
-curl -s -X POST http://localhost:18000/v2/models/qwen_llm/infer \
-  -H "Content-Type: application/json" \
-  -d '{"inputs":[{"name":"PROMPT","shape":[1,1],"datatype":"BYTES","data":["Hello, my name is"]}]}'
-
-curl -s -X POST http://localhost:18000/v2/models/chatterbox_tts/infer \
-  -H "Content-Type: application/json" \
-  -d '{"inputs":[{"name":"TEXT","shape":[1,1],"datatype":"BYTES","data":["Hello there."]}]}'
-```
-
-`scripts/test_asr.py` covers ASR (needs a float32 audio array, awkward to
-pass via raw curl). `scripts/` also has the other standalone scripts used
-to validate each stage outside Triton (`test_tts.py`, `measure_vram.py`,
-`measure_vram_classic.py`, quantization scripts above) if something breaks.
-
-## Configuration
-
-Key per-model tuning knobs, all in each model's `config.pbtxt`:
-
-| Model | Knob | What it controls |
-|---|---|---|
-| `qwen_llm` | `kv_cache_config.free_gpu_memory_fraction` (`model.py`) | Caps how much free VRAM the LLM's KV cache pool claims — without a cap, TensorRT-LLM grabs most of it by default. |
-| `qwen_llm` | `MAX_ADMITTED` (`model.py`) | Admission-gate ceiling on in-flight + queued requests before fast-rejecting instead of queueing unboundedly. |
-| `chatterbox_tts` | `vllm_gpu_mem_util` | vLLM's own KV-cache VRAM reservation for T3's decode. |
-| `chatterbox_tts` / `whisper_asr` | `max_batch_size` + `dynamic_batching` | Batches concurrent requests through one shared model call instead of serializing them. |
-| every model | `instance_group.count` | Replicas per model — cheap for `voice_pipeline` (no weights), expensive for the GPU-resident models (a full extra copy each). |
-
-Rerun `scripts/measure_vram.py` / `scripts/measure_vram_classic.py` (or
-`nvidia-smi` while the service is up) for current VRAM numbers on your
-hardware rather than trusting a stale table.
-
-## Monitoring
-
-Triton exposes per-model Prometheus metrics at `/metrics` (port 18002,
-localhost only). A Prometheus server scrapes it, and a Grafana dashboard
-(`monitoring/grafana/`) + alert rules (`monitoring/alert_rules.yml`) sit on
-top, along with a custom exporter for Triton's model READY/UNAVAILABLE
-state. Grafana is the externally-reachable surface for this data (same
-Caddy-authed pattern as the streaming gateway).
-
-`scripts/load_test.py` fires concurrent requests via `tritonclient`'s
-native gRPC protocol and reports per-stage latency/throughput:
-
-```bash
-python3 scripts/load_test.py --concurrency 4 --total-requests 20
-```
-
-For *why* a stage is slow rather than just *how much* time it takes, see
-[`deploy/PROFILING.md`](deploy/PROFILING.md) (`torch.profiler` + Nsight
-Systems support) and `scripts/profile_nsys.sh`.
 
 ## Development
 
-- `tests/unit/` — pure-logic tests, no live server or GPU needed. Runs in
-  GitHub Actions CI on every push/PR.
-- `tests/integration/` — real gRPC calls against a live Triton server (all
-  four models + `voice_pipeline` end-to-end). Needs a live GPU server, so
-  it does not run in CI: `python -m pytest tests/integration -v`.
+```bash
+python -m pytest tests/unit -v          # no GPU needed; runs in CI
+python -m pytest tests/integration -v   # needs a running server
+```
 
-See `tests/README.md` for which venv each tier needs.
+Tuning knobs (VRAM limits, batching, concurrency caps) live in each model's
+`config.pbtxt`. Profiling guidance is in
+[`deploy/PROFILING.md`](deploy/PROFILING.md).
