@@ -157,15 +157,3 @@ Systems support) and `scripts/profile_nsys.sh`.
   it does not run in CI: `python -m pytest tests/integration -v`.
 
 See `tests/README.md` for which venv each tier needs.
-
-## Roadmap
-
-- **S3Gen** (the flow-matching vocoder half of `chatterbox_tts`) has no
-  TensorRT/ONNX/compiled acceleration path yet. T3 (the autoregressive
-  half) already moved to vLLM; S3Gen still runs per-item in plain PyTorch.
-- `chatterbox_tts` and `qwen_llm` both stay at `instance_group.count: 1` —
-  replicating either costs a full extra copy of the model on a
-  VRAM-constrained GPU; not yet revisited for the current checkpoints.
-- `whisper_asr`'s compiled TensorRT-LLM engines still use near-default
-  build flags (`reduce_fusion`, `multiple_profiles` disabled) — unexplored
-  optimization headroom.
